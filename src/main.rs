@@ -117,6 +117,7 @@ fn dep_names(value: &str) -> Vec<String> {
 #[derive(Default)]
 struct Namespace {
     exports: Vec<String>,
+    patterns: Vec<String>,
     export_patterns: usize,
     s3_methods: usize,
     export_classes: usize,
@@ -153,7 +154,10 @@ fn parse_namespace(src: &str, parser: &mut Parser) -> Namespace {
                     .unwrap_or_default();
                 match name {
                     "export" => ns.exports.extend(arg_idents),
-                    "exportPattern" => ns.export_patterns += 1,
+                    "exportPattern" => {
+                        ns.export_patterns += 1;
+                        ns.patterns.extend(arg_idents);
+                    }
                     "S3method" => ns.s3_methods += 1,
                     "exportClasses" => ns.export_classes += 1,
                     "exportMethods" => ns.export_methods += 1,
@@ -611,6 +615,147 @@ fn metrics_tests(
     }
 }
 
+// ---- functions (surface) ----------------------------------------------------
+
+struct Functions {
+    n_exports: Option<i64>,
+    n_internal: Option<i64>,
+    nse_surface_n: Option<i64>,
+    nse_surface_frac: Option<f64>,
+    triple_colon_count: i64,
+    triple_colon_pkgs: i64,
+}
+
+/// Top-level R/ function definitions via the regex; first occurrence wins.
+/// Returns (name, file, 1-based line) in discovery order.
+fn build_fn_lookup(root: &Path, r_files: &[&str]) -> Vec<(String, String, usize)> {
+    let re = regex::Regex::new(r"^([A-Za-z.][A-Za-z0-9_.]*)\s*(?:<<?-|=)\s*function\s*\(").unwrap();
+    let mut lookup = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for f in r_files {
+        let Some(content) = read(root, f) else { continue };
+        for (i, ln) in content.lines().enumerate() {
+            if let Some(c) = re.captures(ln) {
+                let nm = c[1].to_string();
+                if seen.insert(nm.clone()) {
+                    lookup.push((nm, f.to_string(), i + 1));
+                }
+            }
+        }
+    }
+    lookup
+}
+
+/// Approximate function body via brace-depth from the definition line (cap 200).
+fn extract_body(lines: &[&str], start_idx: usize) -> String {
+    let n = lines.len();
+    if start_idx > n {
+        return String::new();
+    }
+    let mut depth: i64 = 0;
+    let mut seen_open = false;
+    let limit = (start_idx + 199).min(n);
+    for i in start_idx..=limit {
+        let ln = lines[i - 1];
+        depth += ln.matches('{').count() as i64 - ln.matches('}').count() as i64;
+        if ln.contains('{') {
+            seen_open = true;
+        }
+        if seen_open && depth <= 0 {
+            return lines[start_idx - 1..i].join("\n");
+        }
+    }
+    let end = (start_idx + 2).min(n);
+    lines[start_idx - 1..end].join("\n")
+}
+
+fn metrics_functions(root: &Path, files: &[String], ns: &Namespace, has_ns: bool, package: &str) -> Functions {
+    let r_files = find_files(files, r"^R/.*\.[Rr]$");
+    let explicit: &[String] = &ns.exports;
+    let pattern_res: Vec<regex::Regex> =
+        ns.patterns.iter().filter_map(|p| regex::Regex::new(p).ok()).collect();
+    let is_exported =
+        |nm: &str| explicit.iter().any(|e| e == nm) || pattern_res.iter().any(|re| re.is_match(nm));
+
+    let lookup = build_fn_lookup(root, &r_files);
+    let r_fn_names: Vec<&String> = lookup.iter().map(|(n, _, _)| n).collect();
+
+    let n_exports = if !has_ns {
+        None
+    } else if explicit.is_empty() && ns.patterns.is_empty() {
+        Some(0)
+    } else if !explicit.is_empty() {
+        let extra = if ns.patterns.is_empty() {
+            0
+        } else {
+            r_fn_names
+                .iter()
+                .filter(|nm| is_exported(nm) && !explicit.iter().any(|e| e == **nm))
+                .count() as i64
+        };
+        Some(explicit.len() as i64 + extra)
+    } else {
+        Some(r_fn_names.iter().filter(|nm| is_exported(nm)).count() as i64)
+    };
+
+    let n_exp_in_r = r_fn_names.iter().filter(|nm| is_exported(nm)).count() as i64;
+    let n_internal = Some(r_fn_names.len() as i64 - n_exp_in_r);
+
+    let nse_re =
+        regex::Regex::new(r"\b(eval|substitute|quote|bquote|match\.call|sys\.call)\s*\(").unwrap();
+    let (nse_surface_n, nse_surface_frac) = if !has_ns {
+        (None, None)
+    } else {
+        let mut names: Vec<String> = explicit.to_vec();
+        for (nm, _, _) in &lookup {
+            if is_exported(nm) && !names.contains(nm) {
+                names.push(nm.clone());
+            }
+        }
+        let mut seen = std::collections::HashSet::new();
+        names.retain(|n| seen.insert(n.clone()));
+        let mut file_lines: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        let mut nse_count = 0i64;
+        for nm in &names {
+            let Some((_, file, line)) = lookup.iter().find(|(n, _, _)| n == nm) else { continue };
+            let cached = file_lines.entry(file.clone()).or_insert_with(|| {
+                read(root, file).unwrap_or_default().lines().map(String::from).collect()
+            });
+            let refs: Vec<&str> = cached.iter().map(String::as_str).collect();
+            if nse_re.is_match(&extract_body(&refs, *line)) {
+                nse_count += 1;
+            }
+        }
+        let frac = match n_exports {
+            Some(ne) if ne > 0 => Some(nse_count as f64 / ne as f64),
+            _ => None,
+        };
+        (Some(nse_count), frac)
+    };
+
+    let all_content: String =
+        r_files.iter().filter_map(|f| read(root, f)).collect::<Vec<_>>().join("\n");
+    let tc_re =
+        regex::Regex::new(r"([A-Za-z.][A-Za-z0-9.]*):::([A-Za-z.][A-Za-z0-9._]*)").unwrap();
+    let mut triple_colon_count = 0i64;
+    let mut ext_pkgs = std::collections::HashSet::new();
+    for c in tc_re.captures_iter(&all_content) {
+        triple_colon_count += 1;
+        if &c[1] != package {
+            ext_pkgs.insert(c[1].to_string());
+        }
+    }
+
+    Functions {
+        n_exports,
+        n_internal,
+        nse_surface_n,
+        nse_surface_frac,
+        triple_colon_count,
+        triple_colon_pkgs: ext_pkgs.len() as i64,
+    }
+}
+
 // ---- main -------------------------------------------------------------------
 
 fn main() {
@@ -628,7 +773,6 @@ fn main() {
     let (mut loc_r, mut loc_src, mut loc_tests, mut loc_docs, mut loc_vignettes) = (0, 0, 0, 0, 0);
     let mut lang: BTreeMap<String, usize> = BTreeMap::new();
     let mut has_src = false;
-    let mut r_fn_defs = 0usize;
 
     for f in &files {
         let in_r = f.starts_with("R/");
@@ -657,32 +801,6 @@ fn main() {
             loc_vignettes += l;
         }
         *lang.entry(file_ext(f)).or_insert(0) += l;
-
-        if in_r && f.to_ascii_lowercase().ends_with(".r") {
-            if let Some(tree) = parser.parse(&content, None) {
-                let root = tree.root_node();
-                let mut st = vec![root];
-                while let Some(nd) = st.pop() {
-                    // count only TOP-LEVEL assigned functions: a function_definition
-                    // that is the rhs of a top-level assignment has the program as its
-                    // grandparent. Nested / anonymous functions are excluded.
-                    if nd.kind() == "function_definition" {
-                        let top = nd
-                            .parent()
-                            .and_then(|p| p.parent())
-                            .map(|gp| gp.id() == root.id())
-                            .unwrap_or(false);
-                        if top {
-                            r_fn_defs += 1;
-                        }
-                    }
-                    let mut c = nd.walk();
-                    for ch in nd.children(&mut c) {
-                        st.push(ch);
-                    }
-                }
-            }
-        }
     }
     let loc_total = loc_r + loc_src + loc_tests + loc_docs + loc_vignettes;
     let compiled_share = if loc_total > 0 {
@@ -709,8 +827,8 @@ fn main() {
     let ns = read(&root, "NAMESPACE")
         .map(|t| parse_namespace(&t, &mut parser))
         .unwrap_or_default();
-    let n_exports = ns.exports.len();
-    let n_internal = r_fn_defs.saturating_sub(n_exports);
+    let has_ns = exists(&files, "NAMESPACE");
+    let funcs = metrics_functions(&root, &files, &ns, has_ns, &package);
 
     // --- legal + portability + tests ---
     let legal = metrics_legal(&desc, &root, &files);
@@ -755,9 +873,12 @@ fn main() {
         "compiled_share": compiled_share,
         "has_src": has_src,
         "lang_breakdown": lang,
-        "n_exports": n_exports,
-        "n_internal": n_internal,
-        "r_fn_defs": r_fn_defs,
+        "n_exports": funcs.n_exports,
+        "n_internal": funcs.n_internal,
+        "nse_surface_n": funcs.nse_surface_n,
+        "nse_surface_frac": funcs.nse_surface_frac,
+        "triple_colon_count": funcs.triple_colon_count,
+        "triple_colon_pkgs": funcs.triple_colon_pkgs,
         "n_deps_direct": n_deps_direct,
         "dep_list": deps,
         "export_patterns": ns.export_patterns,
