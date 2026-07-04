@@ -2090,6 +2090,19 @@ fn main() {
     let date_publication = desc.get("Date/Publication").cloned().filter(|s| !s.is_empty());
     let encoding = desc.get("Encoding").cloned().filter(|s| !s.is_empty());
 
+    // High-value DESCRIPTION fields promoted to explicit slots.
+    let field = |k: &str| desc.get(k).map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+    let priority = field("Priority");
+    let url = field("URL");
+    let bug_reports = field("BugReports");
+    let vignette_builder = field("VignetteBuilder");
+    let os_type = field("OS_type");
+    let pkg_type = field("Type");
+    let language = field("Language");
+    let copyright = field("Copyright");
+    let biocviews = field("biocViews");
+    let needs_compilation = field("NeedsCompilation");
+
     // Data sets: files under data/.
     let mut data_names: Vec<String> = Vec::new();
     let mut data_sizes: Vec<u64> = Vec::new();
@@ -2204,6 +2217,16 @@ fn main() {
         "config": config,
         "date_publication": date_publication,
         "encoding": encoding,
+        "priority": priority,
+        "url": url,
+        "bug_reports": bug_reports,
+        "vignette_builder": vignette_builder,
+        "os_type": os_type,
+        "type": pkg_type,
+        "language": language,
+        "copyright": copyright,
+        "biocviews": biocviews,
+        "needs_compilation": needs_compilation,
         "num_data_files": num_data_files,
         "data_size_total": data_size_total,
         "data_size_median": data_size_median,
@@ -2223,4 +2246,12 @@ fn main() {
     for e in &ns.exports {
         println!("{}", serde_json::json!({"rec": "export", "symbol": e}));
     }
+    // Full parsed DESCRIPTION as a raw intermediate: every field is preserved,
+    // modeled or not, so future metrics derive from stored data without re-cloning.
+    let mut dcf = serde_json::Map::new();
+    dcf.insert("rec".into(), serde_json::Value::String("dcf".into()));
+    for (k, v) in &desc {
+        dcf.insert(k.clone(), serde_json::Value::String(v.clone()));
+    }
+    println!("{}", serde_json::Value::Object(dcf));
 }
