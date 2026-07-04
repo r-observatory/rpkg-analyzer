@@ -2108,6 +2108,7 @@ struct FnStat {
     loc: usize,
     n_params: i64,
     cyclocomp: i64,
+    calls: Vec<String>,
 }
 
 #[derive(Default)]
@@ -2232,6 +2233,20 @@ fn metrics_ast(root: &Path, files: &[String], exports: &[String], parser: &mut P
                     p.children(&mut pc).filter(|c| c.kind() == "parameter").count() as i64
                 })
                 .unwrap_or(0);
+            // call sites within this function's body (for the call-network)
+            let mut calls = Vec::new();
+            let mut bst = vec![rhs];
+            while let Some(n) = bst.pop() {
+                if n.kind() == "call" {
+                    if let Some(cn) = call_fn_name(&n, bytes) {
+                        calls.push(cn);
+                    }
+                }
+                let mut c = n.walk();
+                for ch in n.children(&mut c) {
+                    bst.push(ch);
+                }
+            }
             fns.push(FnStat {
                 exported: exported.contains(name.as_str()),
                 name,
@@ -2240,10 +2255,150 @@ fn metrics_ast(root: &Path, files: &[String], exports: &[String], parser: &mut P
                 loc: rhs.end_position().row - rhs.start_position().row + 1,
                 n_params,
                 cyclocomp: cyclocomp(rhs, bytes),
+                calls,
             });
         }
     }
     (fns, oo)
+}
+
+// ---- call network -----------------------------------------------------------
+// A syntactic call graph: nodes are the package's top-level R functions, a
+// directed edge A -> B means A's body calls B (B also a package function).
+// Metrics are our own definitions.
+
+struct Network {
+    n_nodes: i64,
+    n_edges: i64,
+    n_clusters: i64,     // connected components among functions that have >=1 edge
+    n_isolated: i64,     // functions with no internal call edge
+    node_degree_mean: Option<f64>,
+    node_degree_median: Option<f64>,
+    node_degree_max: i64,
+    n_terminal_nodes: i64, // sinks: functions that call no other package function
+    betweenness_mean: Option<f64>,
+    betweenness_median: Option<f64>,
+    betweenness_max: Option<f64>,
+}
+
+fn mean_f(v: &[f64]) -> Option<f64> {
+    (!v.is_empty()).then(|| v.iter().sum::<f64>() / v.len() as f64)
+}
+fn median_f(v: &[f64]) -> Option<f64> {
+    if v.is_empty() {
+        return None;
+    }
+    let mut s = v.to_vec();
+    s.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let n = s.len();
+    Some(if n % 2 == 1 { s[n / 2] } else { (s[n / 2 - 1] + s[n / 2]) / 2.0 })
+}
+
+fn uf_find(p: &mut [usize], x: usize) -> usize {
+    if p[x] != x {
+        let r = uf_find(p, p[x]);
+        p[x] = r;
+    }
+    p[x]
+}
+
+/// Brandes betweenness centrality, directed and unweighted (raw, not normalized).
+fn brandes(n: usize, adj: &[Vec<usize>]) -> Vec<f64> {
+    let mut bc = vec![0.0f64; n];
+    for s in 0..n {
+        let mut stack = Vec::new();
+        let mut pred: Vec<Vec<usize>> = vec![Vec::new(); n];
+        let mut sigma = vec![0.0f64; n];
+        sigma[s] = 1.0;
+        let mut dist = vec![-1i64; n];
+        dist[s] = 0;
+        let mut q = std::collections::VecDeque::new();
+        q.push_back(s);
+        while let Some(v) = q.pop_front() {
+            stack.push(v);
+            for &w in &adj[v] {
+                if dist[w] < 0 {
+                    dist[w] = dist[v] + 1;
+                    q.push_back(w);
+                }
+                if dist[w] == dist[v] + 1 {
+                    sigma[w] += sigma[v];
+                    pred[w].push(v);
+                }
+            }
+        }
+        let mut delta = vec![0.0f64; n];
+        while let Some(w) = stack.pop() {
+            let dw = delta[w];
+            for &v in &pred[w] {
+                delta[v] += (sigma[v] / sigma[w]) * (1.0 + dw);
+            }
+            if w != s {
+                bc[w] += delta[w];
+            }
+        }
+    }
+    bc
+}
+
+fn metrics_network(fns: &[FnStat]) -> Network {
+    let n = fns.len();
+    let idx: std::collections::HashMap<&str, usize> =
+        fns.iter().enumerate().map(|(i, f)| (f.name.as_str(), i)).collect();
+    let mut edge_set: std::collections::HashSet<(usize, usize)> = std::collections::HashSet::new();
+    for (i, f) in fns.iter().enumerate() {
+        for callee in &f.calls {
+            if let Some(&j) = idx.get(callee.as_str()) {
+                if i != j {
+                    edge_set.insert((i, j));
+                }
+            }
+        }
+    }
+    let edges: Vec<(usize, usize)> = edge_set.into_iter().collect();
+
+    let mut adj: Vec<Vec<usize>> = vec![Vec::new(); n];
+    let mut out_deg = vec![0usize; n];
+    let mut deg = vec![0usize; n];
+    let mut parent: Vec<usize> = (0..n).collect();
+    for &(a, b) in &edges {
+        adj[a].push(b);
+        out_deg[a] += 1;
+        deg[a] += 1;
+        deg[b] += 1;
+        let (ra, rb) = (uf_find(&mut parent, a), uf_find(&mut parent, b));
+        if ra != rb {
+            parent[ra] = rb;
+        }
+    }
+    // clusters among connected nodes (degree >= 1); isolated counted separately
+    let mut roots = std::collections::HashSet::new();
+    let mut n_isolated = 0i64;
+    for i in 0..n {
+        if deg[i] >= 1 {
+            roots.insert(uf_find(&mut parent, i));
+        } else {
+            n_isolated += 1;
+        }
+    }
+    let degrees: Vec<i64> = deg.iter().map(|&d| d as i64).collect();
+    // a terminal (sink) is a connected function that calls no package function
+    let n_terminal_nodes =
+        (0..n).filter(|&i| deg[i] >= 1 && out_deg[i] == 0).count() as i64;
+    let bc = brandes(n, &adj);
+    Network {
+        n_nodes: n as i64,
+        n_edges: edges.len() as i64,
+        n_clusters: roots.len() as i64,
+        n_isolated,
+        node_degree_mean: mean_i(&degrees),
+        node_degree_median: median_i(&degrees),
+        node_degree_max: degrees.iter().copied().max().unwrap_or(0),
+        n_terminal_nodes,
+        betweenness_mean: mean_f(&bc),
+        betweenness_median: median_f(&bc),
+        betweenness_max: bc.iter().copied().fold(None::<f64>, |m, x| Some(m.map_or(x, |v| v.max(x)))),
+    }
 }
 
 // ---- main -------------------------------------------------------------------
@@ -2413,6 +2568,7 @@ fn main() {
     let n_fns_r = fn_stats.len();
     let n_fns_r_exported = fn_stats.iter().filter(|f| f.exported).count();
     let ex = metrics_extra(&desc, &root, &files);
+    let net = metrics_network(&fn_stats);
 
     // --- legal + portability + tests ---
     let legal = metrics_legal(&desc, &root, &files);
@@ -2521,6 +2677,17 @@ fn main() {
         "help_pages_with_examples": ex.help_pages_with_examples,
         "examples_coverage": ex.examples_coverage,
         "news_up_to_date": ex.news_up_to_date,
+        "net_n_nodes": net.n_nodes,
+        "net_n_edges": net.n_edges,
+        "net_n_clusters": net.n_clusters,
+        "net_n_isolated": net.n_isolated,
+        "net_node_degree_mean": net.node_degree_mean,
+        "net_node_degree_median": net.node_degree_median,
+        "net_node_degree_max": net.node_degree_max,
+        "net_n_terminal_nodes": net.n_terminal_nodes,
+        "net_betweenness_mean": net.betweenness_mean,
+        "net_betweenness_median": net.betweenness_median,
+        "net_betweenness_max": net.betweenness_max,
         "n_deps_direct": n_deps_direct,
         "dep_list": deps,
         "has_additional_repositories": !additional_repositories.is_empty(),
