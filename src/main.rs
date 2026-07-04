@@ -2494,16 +2494,65 @@ fn callee_name(call: tree_sitter::Node, bytes: &[u8]) -> Option<String> {
     rightmost_ident(call.child_by_field_name("function")?, bytes)
 }
 
-/// Internal call graph for one compiled language family: nodes are function
-/// definitions in src/, edges are calls between them. `is_rust` picks the
-/// grammar/node kinds; otherwise C and C++ files are graphed together.
-fn build_src_graph(root: &Path, files: &[String], is_rust: bool) -> Network {
-    let exts: &[&str] = if is_rust {
-        &["rs"]
-    } else {
-        &["c", "h", "cc", "cpp", "cxx", "hpp", "hxx"]
+#[derive(Clone, Copy, PartialEq)]
+enum SrcLang {
+    CFamily,
+    Rust,
+    Fortran,
+}
+
+/// Is `n` a function definition for this language?
+fn is_def(n: tree_sitter::Node, lang: SrcLang) -> bool {
+    match lang {
+        SrcLang::CFamily => n.kind() == "function_definition",
+        SrcLang::Rust => n.kind() == "function_item",
+        SrcLang::Fortran => n.is_named() && matches!(n.kind(), "function" | "subroutine"),
+    }
+}
+
+/// The defined function's name.
+fn def_name(n: tree_sitter::Node, lang: SrcLang, bytes: &[u8]) -> Option<String> {
+    match lang {
+        SrcLang::CFamily => c_fn_name(n, bytes),
+        SrcLang::Rust => n
+            .child_by_field_name("name")
+            .and_then(|nm| nm.utf8_text(bytes).ok())
+            .map(String::from),
+        SrcLang::Fortran => {
+            let mut c = n.walk();
+            n.children(&mut c)
+                .find(|ch| ch.kind().ends_with("_statement"))
+                .and_then(|s| s.child_by_field_name("name"))
+                .and_then(|nm| nm.utf8_text(bytes).ok())
+                .map(String::from)
+        }
+    }
+}
+
+/// The callee name at a call-site node, or None if the node is not a call.
+fn call_target(b: tree_sitter::Node, lang: SrcLang, bytes: &[u8]) -> Option<String> {
+    match (lang, b.kind()) {
+        (SrcLang::Fortran, "subroutine_call") => {
+            b.child_by_field_name("subroutine").and_then(|x| rightmost_ident(x, bytes))
+        }
+        // Fortran uses call_expression for function references too (also array
+        // indexing, which is filtered out because it will not match a def name).
+        (SrcLang::Fortran, "call_expression") => {
+            b.named_child(0).and_then(|x| rightmost_ident(x, bytes))
+        }
+        (_, "call_expression") => callee_name(b, bytes),
+        _ => None,
+    }
+}
+
+/// Internal call graph for one compiled language: nodes are function definitions
+/// in src/, edges are calls between them. C and C++ are graphed together.
+fn build_src_graph(root: &Path, files: &[String], lang: SrcLang) -> Network {
+    let exts: &[&str] = match lang {
+        SrcLang::CFamily => &["c", "h", "cc", "cpp", "cxx", "hpp", "hxx"],
+        SrcLang::Rust => &["rs"],
+        SrcLang::Fortran => &["f", "f90", "f95", "f03", "f08"],
     };
-    let def_kind = if is_rust { "function_item" } else { "function_definition" };
     let mut parser = Parser::new();
     let mut names: Vec<String> = Vec::new();
     let mut calls: Vec<Vec<String>> = Vec::new();
@@ -2515,8 +2564,8 @@ fn build_src_graph(root: &Path, files: &[String], is_rust: bool) -> Network {
         if !exts.contains(&ext.as_str()) {
             continue;
         }
-        let Some(lang) = language_for_ext(f) else { continue };
-        if parser.set_language(&lang).is_err() {
+        let Some(l) = language_for_ext(f) else { continue };
+        if parser.set_language(&l).is_err() {
             continue;
         }
         let Some(content) = read(root, f) else { continue };
@@ -2524,20 +2573,13 @@ fn build_src_graph(root: &Path, files: &[String], is_rust: bool) -> Network {
         let bytes = content.as_bytes();
         let mut st = vec![tree.root_node()];
         while let Some(n) = st.pop() {
-            if n.kind() == def_kind {
-                let name = if is_rust {
-                    n.child_by_field_name("name").and_then(|nm| nm.utf8_text(bytes).ok()).map(String::from)
-                } else {
-                    c_fn_name(n, bytes)
-                };
-                if let Some(nm) = name {
+            if is_def(n, lang) {
+                if let Some(nm) = def_name(n, lang, bytes) {
                     let mut callees = Vec::new();
                     let mut bst = vec![n];
                     while let Some(b) = bst.pop() {
-                        if b.kind() == "call_expression" {
-                            if let Some(cn) = callee_name(b, bytes) {
-                                callees.push(cn);
-                            }
+                        if let Some(cn) = call_target(b, lang, bytes) {
+                            callees.push(cn);
                         }
                         let mut bc = b.walk();
                         for ch in b.children(&mut bc) {
@@ -3230,8 +3272,9 @@ fn main() {
     let ws = metrics_whitespace(&root, &files);
     let src_fns = count_src_functions(&root, &files);
     let ng = metrics_native_graph(&root, &files);
-    let cnet = build_src_graph(&root, &files, false); // C/C++ internal graph
-    let rnet = build_src_graph(&root, &files, true); // Rust internal graph
+    let cnet = build_src_graph(&root, &files, SrcLang::CFamily);
+    let rnet = build_src_graph(&root, &files, SrcLang::Rust);
+    let fnet = build_src_graph(&root, &files, SrcLang::Fortran);
 
     // Deprecated R functions: body calls .Deprecated/.Defunct or lifecycle::deprecate_*.
     let dep_calls = [".Deprecated", ".Defunct", "deprecate_soft", "deprecate_warn", "deprecate_stop"];
@@ -3467,6 +3510,11 @@ fn main() {
         "rnet_n_clusters": rnet.n_clusters,
         "rnet_node_degree_max": rnet.node_degree_max,
         "rnet_betweenness_max": rnet.betweenness_max,
+        "fnet_n_nodes": fnet.n_nodes,
+        "fnet_n_edges": fnet.n_edges,
+        "fnet_n_clusters": fnet.n_clusters,
+        "fnet_node_degree_max": fnet.node_degree_max,
+        "fnet_betweenness_max": fnet.betweenness_max,
         "n_library_calls_in_r": n_library_calls,
         "n_internal_calls": n_internal_calls,
         "n_global_assign": n_global_assign,

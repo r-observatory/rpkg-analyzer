@@ -115,10 +115,12 @@ reached), `native_resolution_rate`. On data.table all 178 sites resolve to 108 C
 functions.
 
 The compiled side has its own internal call graphs, built the same way from
-tree-sitter (no ctags/gtags). `cnet_*` is the combined C/C++ graph and `rnet_*`
-the Rust graph, each with `n_nodes`, `n_edges`, `n_clusters`, `node_degree_max`,
-`betweenness_max`. On data.table `cnet` is 389 nodes / 593 edges. Fortran
-internal edges are not built.
+tree-sitter (no ctags/gtags). `cnet_*` (combined C/C++), `rnet_*` (Rust), and
+`fnet_*` (Fortran, resolving both subroutine calls and function references),
+each with `n_nodes`, `n_edges`, `n_clusters`, `node_degree_max`,
+`betweenness_max`. On data.table `cnet` is 389 nodes / 593 edges; on quantreg
+`fnet` is 58 nodes / 38 edges. So the full call graph (R-to-R, R-to-native, and
+each compiled language internally) is covered without external tooling.
 
 ### Static-check-style signals
 
