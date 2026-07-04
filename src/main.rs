@@ -2804,6 +2804,39 @@ fn main() {
     let exp_locs: Vec<i64> = fn_stats.iter().filter(|f| f.exported).map(|f| f.loc as i64).collect();
     let int_locs: Vec<i64> = fn_stats.iter().filter(|f| !f.exported).map(|f| f.loc as i64).collect();
 
+    // Documentation lines per help page (Rd file LOC).
+    let rd_locs: Vec<i64> = find_files(&files, r"^man/.*\.Rd$")
+        .iter()
+        .filter_map(|f| read(&root, f).map(|c| loc(&c) as i64))
+        .collect();
+
+    // Structured SystemRequirements.
+    let sysreq = desc.get("SystemRequirements").cloned().unwrap_or_default();
+    let sysreq_lc = sysreq.to_lowercase();
+    let sysreq_has_java = sysreq_lc.contains("java");
+    let sysreq_has_gnu_make = sysreq_lc.contains("gnu make") || sysreq_lc.contains("gnumake");
+    let sysreq_components: Vec<String> = sysreq
+        .split([',', '\n'])
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    // Static-check-style signals over R source (native interface, library() in
+    // package code, .Internal, super-assignment).
+    let native_re = regex::Regex::new(r"\.(Call|C|Fortran|External2?)\s*\(").unwrap();
+    let library_re = regex::Regex::new(r"\b(?:library|require)\s*\(").unwrap();
+    let internal_re = regex::Regex::new(r"\.Internal\s*\(").unwrap();
+    let ga_re = regex::Regex::new(r"<<-").unwrap();
+    let (mut n_native_calls, mut n_library_calls, mut n_internal_calls, mut n_global_assign) =
+        (0i64, 0i64, 0i64, 0i64);
+    for f in &find_files(&files, r"^R/.*\.[Rr]$") {
+        let Some(c) = read(&root, f) else { continue };
+        n_native_calls += native_re.find_iter(&c).count() as i64;
+        n_library_calls += library_re.find_iter(&c).count() as i64;
+        n_internal_calls += internal_re.find_iter(&c).count() as i64;
+        n_global_assign += ga_re.find_iter(&c).count() as i64;
+    }
+
     // --- legal + portability + tests ---
     let legal = metrics_legal(&desc, &root, &files);
     let port = metrics_portability(&desc, &root, &files);
@@ -2973,6 +3006,15 @@ fn main() {
         "loc_per_fn_exported_median": median_i(&exp_locs),
         "loc_per_fn_internal_mean": mean_i(&int_locs),
         "loc_per_fn_internal_median": median_i(&int_locs),
+        "doclines_per_fn_mean": mean_i(&rd_locs),
+        "doclines_per_fn_median": median_i(&rd_locs),
+        "sysreq_has_java": sysreq_has_java,
+        "sysreq_has_gnu_make": sysreq_has_gnu_make,
+        "sysreq_components": sysreq_components,
+        "n_native_calls": n_native_calls,
+        "n_library_calls_in_r": n_library_calls,
+        "n_internal_calls": n_internal_calls,
+        "n_global_assign": n_global_assign,
         "n_s4_classes": oo.s4_classes,
         "n_s4_generics": oo.s4_generics,
         "n_s4_methods": oo.s4_methods,
