@@ -2827,13 +2827,42 @@ fn main() {
         .map(|m| m.len())
         .sum();
 
-    // Individual test cases: test_that()/it() blocks under tests/.
-    let testcase_re = regex::Regex::new(r"\b(?:test_that|it)\s*\(").unwrap();
-    let n_test_cases: i64 = find_files(&files, r"^tests/.*\.[Rr]$")
-        .iter()
-        .filter_map(|f| read(&root, f))
-        .map(|c| testcase_re.find_iter(&c).count() as i64)
-        .sum();
+    // Test cases across frameworks. Each test file is classified by its content
+    // and counted with that framework's unit; the framework set is also reported.
+    let tf_test_files =
+        find_files(&files, r"^(?:tests|inst/tinytest|inst/unitTests)/.*\.[Rr]$");
+    let re_testthat = regex::Regex::new(r"\b(?:test_that|describe|it)\s*\(").unwrap();
+    let re_expect = regex::Regex::new(r"\bexpect_\w+\s*\(").unwrap();
+    let re_runit_fn = regex::Regex::new(r"(?m)^\s*test[.\w]*\s*(?:<-|=)\s*function").unwrap();
+    let re_runit_check = regex::Regex::new(r"\bcheck(?:Equals|True|Identical|Exception)\w*\s*\(").unwrap();
+    let re_testit = regex::Regex::new(r"\bassert\s*\(").unwrap();
+    let mut n_test_cases = 0i64;
+    let mut testing_frameworks: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for f in &tf_test_files {
+        let Some(c) = read(&root, f) else { continue };
+        if re_testthat.is_match(&c) {
+            testing_frameworks.insert("testthat".into());
+            n_test_cases += re_testthat.find_iter(&c).count() as i64;
+        } else if f.starts_with("inst/tinytest") || re_expect.is_match(&c) {
+            testing_frameworks.insert("tinytest".into());
+            n_test_cases += re_expect.find_iter(&c).count() as i64;
+        } else if re_runit_fn.is_match(&c) || re_runit_check.is_match(&c) {
+            testing_frameworks.insert("RUnit".into());
+            let n = re_runit_fn.find_iter(&c).count();
+            n_test_cases += if n > 0 { n as i64 } else { re_runit_check.find_iter(&c).count() as i64 };
+        } else if re_testit.is_match(&c) {
+            testing_frameworks.insert("testit".into());
+            n_test_cases += re_testit.find_iter(&c).count() as i64;
+        }
+    }
+    // frameworks can be declared without our parser recognizing a case
+    let suggests_lc = desc.get("Suggests").map(|s| s.to_lowercase()).unwrap_or_default();
+    for (dep, name) in [("testthat", "testthat"), ("tinytest", "tinytest"), ("runit", "RUnit"), ("testit", "testit")] {
+        if suggests_lc.contains(dep) {
+            testing_frameworks.insert(name.into());
+        }
+    }
+    let testing_frameworks: Vec<String> = testing_frameworks.into_iter().collect();
 
     // Data sets: files under data/.
     let mut data_names: Vec<String> = Vec::new();
@@ -2851,6 +2880,32 @@ fn main() {
     let num_data_files = data_names.len();
     let data_size_total: u64 = data_sizes.iter().sum();
     let data_size_median = median_u64(&data_sizes);
+
+    // Dataset object names: data/datalist is authoritative (a line is either
+    // `name` or `file: obj1 obj2`); otherwise fall back to file stems. A single
+    // .rda without a datalist can still hold several objects we cannot see here.
+    let datasets: Vec<String> = if let Some(dl) = read(&root, "data/datalist") {
+        let mut names = Vec::new();
+        for line in dl.lines() {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            match line.split_once(':') {
+                Some((_, objs)) => names.extend(objs.split_whitespace().map(String::from)),
+                None => names.push(line.to_string()),
+            }
+        }
+        names
+    } else {
+        let mut names: Vec<String> = data_names
+            .iter()
+            .map(|f| f.rsplit_once('.').map(|(s, _)| s).unwrap_or(f).to_string())
+            .collect();
+        names.sort();
+        names.dedup();
+        names
+    };
 
     let package = get("Package");
     let version = get("Version");
@@ -3172,8 +3227,10 @@ fn main() {
         "data_size_total": data_size_total,
         "data_size_median": data_size_median,
         "data_files": data_names,
+        "datasets": datasets,
         "total_source_size": total_source_size,
         "n_test_cases": n_test_cases,
+        "testing_frameworks": testing_frameworks,
         "export_patterns": ns.export_patterns,
         "s3_methods": ns.s3_methods,
         "export_classes": ns.export_classes,
