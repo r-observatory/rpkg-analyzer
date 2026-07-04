@@ -77,6 +77,21 @@ fn read(root: &Path, rel: &str) -> Option<String> {
     std::fs::read_to_string(root.join(rel)).ok()
 }
 
+/// Median of a slice (average of the two middle values for an even count).
+fn median_u64(v: &[u64]) -> Option<f64> {
+    if v.is_empty() {
+        return None;
+    }
+    let mut s = v.to_vec();
+    s.sort_unstable();
+    let n = s.len();
+    Some(if n % 2 == 1 {
+        s[n / 2] as f64
+    } else {
+        (s[n / 2 - 1] + s[n / 2]) as f64 / 2.0
+    })
+}
+
 /// the is_src: src/ files with a compiled-language extension only (structure.R).
 /// Excludes Makevars, configure, .in, etc.
 fn is_src_file(path: &str) -> bool {
@@ -2066,6 +2081,32 @@ fn main() {
         .map(String::from)
         .collect();
 
+    // Config/* fields as a map (keys stripped of the "Config/" prefix).
+    let config: BTreeMap<String, String> = desc
+        .iter()
+        .filter(|(k, _)| k.starts_with("Config/"))
+        .map(|(k, v)| (k.trim_start_matches("Config/").to_string(), v.clone()))
+        .collect();
+    let date_publication = desc.get("Date/Publication").cloned().filter(|s| !s.is_empty());
+    let encoding = desc.get("Encoding").cloned().filter(|s| !s.is_empty());
+
+    // Data sets: files under data/.
+    let mut data_names: Vec<String> = Vec::new();
+    let mut data_sizes: Vec<u64> = Vec::new();
+    for f in &files {
+        if f.starts_with("data/") {
+            if let Ok(m) = std::fs::metadata(root.join(f)) {
+                if m.is_file() {
+                    data_names.push(f.trim_start_matches("data/").to_string());
+                    data_sizes.push(m.len());
+                }
+            }
+        }
+    }
+    let num_data_files = data_names.len();
+    let data_size_total: u64 = data_sizes.iter().sum();
+    let data_size_median = median_u64(&data_sizes);
+
     let package = get("Package");
     let version = get("Version");
 
@@ -2160,6 +2201,13 @@ fn main() {
         "dep_list": deps,
         "has_additional_repositories": !additional_repositories.is_empty(),
         "additional_repositories": additional_repositories,
+        "config": config,
+        "date_publication": date_publication,
+        "encoding": encoding,
+        "num_data_files": num_data_files,
+        "data_size_total": data_size_total,
+        "data_size_median": data_size_median,
+        "data_files": data_names,
         "export_patterns": ns.export_patterns,
         "s3_methods": ns.s3_methods,
         "export_classes": ns.export_classes,
