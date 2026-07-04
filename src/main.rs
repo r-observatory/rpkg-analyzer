@@ -2004,6 +2004,115 @@ fn metrics_security(desc: &BTreeMap<String, String>, root: &Path, files: &[Strin
     }
 }
 
+// ---- val.meter-style static metrics -----------------------------------------
+
+struct ValMeter {
+    has_recognized_repo: bool,
+    repo_host: Option<String>,
+    repo_url: Option<String>,
+    exports_help_coverage: Option<f64>,
+    help_pages_with_examples: i64,
+    examples_coverage: Option<f64>,
+    news_up_to_date: Option<bool>,
+}
+
+/// Reduce a forge URL to `host/owner/repo`, dropping trailing paths (/issues,
+/// /tree/..., .git) that would break a derived pak spec.
+fn normalize_repo(p: &str, domain: &str) -> String {
+    if let Some(idx) = p.find(domain) {
+        let after = &p[idx + domain.len()..];
+        let segs: Vec<&str> = after
+            .trim_start_matches(['/', ':'])
+            .split('/')
+            .filter(|s| !s.is_empty())
+            .collect();
+        if segs.len() >= 2 {
+            let repo = segs[1].trim_end_matches(".git");
+            return format!("{domain}/{}/{repo}", segs[0]);
+        }
+    }
+    p.to_string()
+}
+
+/// Detect a source repository on a recognized forge from URL / BugReports.
+fn detect_repo(fields: &[Option<String>]) -> Option<(String, String)> {
+    let forges = [
+        ("github.com", "GitHub"),
+        ("gitlab.com", "GitLab"),
+        ("codeberg.org", "Codeberg"),
+        ("bitbucket.org", "Bitbucket"),
+        ("git.sr.ht", "SourceHut"),
+    ];
+    for field in fields.iter().flatten() {
+        for part in field.split([',', ' ', '\n', '\t']) {
+            let p = part.trim().trim_end_matches('/');
+            if p.is_empty() {
+                continue;
+            }
+            for (domain, label) in forges {
+                if p.contains(domain) {
+                    return Some((label.to_string(), normalize_repo(p, domain)));
+                }
+            }
+            if p.contains("gitea") {
+                return Some(("Gitea".to_string(), p.to_string()));
+            }
+        }
+    }
+    None
+}
+
+fn metrics_valmeter(
+    desc: &BTreeMap<String, String>,
+    root: &Path,
+    files: &[String],
+    exports: &[String],
+) -> ValMeter {
+    let repo = detect_repo(&[desc.get("URL").cloned(), desc.get("BugReports").cloned()]);
+
+    // Rd help pages: collect \alias symbols and count \examples sections.
+    let rd_files = find_files(files, r"^man/.*\.Rd$");
+    let mut aliases = std::collections::HashSet::new();
+    let mut help_pages_with_examples = 0i64;
+    for f in &rd_files {
+        let text = read(root, f).unwrap_or_default();
+        for a in rd_all_blocks(&text, "alias") {
+            aliases.insert(a.trim().to_string());
+        }
+        if rd_has_block(&text, "examples") {
+            help_pages_with_examples += 1;
+        }
+    }
+    let real_exports: Vec<&String> = exports.iter().filter(|e| !e.starts_with("pattern:")).collect();
+    let exports_help_coverage = (!real_exports.is_empty()).then(|| {
+        real_exports.iter().filter(|e| aliases.contains(e.as_str())).count() as f64
+            / real_exports.len() as f64
+    });
+    let examples_coverage =
+        (!rd_files.is_empty()).then(|| help_pages_with_examples as f64 / rd_files.len() as f64);
+
+    // NEWS synced to version: the first version token in NEWS equals the package Version.
+    let news_up_to_date = ["NEWS.md", "NEWS", "inst/NEWS.md", "inst/NEWS"]
+        .iter()
+        .find_map(|p| read(root, p))
+        .map(|news| {
+            let ver_re = regex::Regex::new(r"\d+\.\d+(?:[.-]\d+)*").unwrap();
+            let latest = ver_re.find(&news).map(|m| m.as_str().to_string());
+            let pkg_ver = desc.get("Version").map(|s| s.trim().to_string());
+            latest.is_some() && latest == pkg_ver
+        });
+
+    ValMeter {
+        has_recognized_repo: repo.is_some(),
+        repo_host: repo.as_ref().map(|(h, _)| h.clone()),
+        repo_url: repo.map(|(_, u)| u),
+        exports_help_coverage,
+        help_pages_with_examples,
+        examples_coverage,
+        news_up_to_date,
+    }
+}
+
 // ---- AST: per-function stats + OO kinds -------------------------------------
 
 struct FnStat {
@@ -2296,6 +2405,7 @@ fn main() {
         fn_stats.iter().filter(|f| f.exported).map(|f| f.n_params).collect();
     let n_fns_r = fn_stats.len();
     let n_fns_r_exported = fn_stats.iter().filter(|f| f.exported).count();
+    let vm = metrics_valmeter(&desc, &root, &files, &ns.exports);
 
     // --- legal + portability + tests ---
     let legal = metrics_legal(&desc, &root, &files);
@@ -2395,6 +2505,13 @@ fn main() {
         "n_s7_classes": oo.s7_classes,
         "n_s3_methods": ns.s3_methods,
         "uses_usemethod": oo.uses_usemethod,
+        "has_recognized_repo": vm.has_recognized_repo,
+        "repo_host": vm.repo_host,
+        "repo_url": vm.repo_url,
+        "exports_help_coverage": vm.exports_help_coverage,
+        "help_pages_with_examples": vm.help_pages_with_examples,
+        "examples_coverage": vm.examples_coverage,
+        "news_up_to_date": vm.news_up_to_date,
         "n_deps_direct": n_deps_direct,
         "dep_list": deps,
         "has_additional_repositories": !additional_repositories.is_empty(),
