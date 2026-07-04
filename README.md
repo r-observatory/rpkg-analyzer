@@ -24,7 +24,12 @@ One `summary` record per run, followed by intermediate records:
 | `dependency` | declared dependency | `package` |
 | `export` | exported symbol | `symbol` |
 | `function` | top-level R function | `name`, `exported`, `file`, `line`, `loc`, `n_params`, `cyclocomp` |
+| `call_edge` | one call-graph edge | `graph` (`r`/`native`/`c`/`rust`/`fortran`), `from`, `to` |
 | `dcf` | package version | every DESCRIPTION field verbatim (the catch-all) |
+
+The `function` records are the graph's nodes and the `call_edge` records its
+edges, so the full labeled call graph can be reconstructed and stored or drawn.
+The summary carries only the aggregate network stats.
 
 The `dcf` record preserves the full parsed DESCRIPTION so any field can be
 promoted to a metric later without re-reading the source.

@@ -2397,6 +2397,7 @@ struct NativeGraph {
     n_native_edges: i64,
     n_native_targets: i64,
     native_resolution_rate: Option<f64>,
+    edges: Vec<(String, String)>,
 }
 
 fn metrics_native_graph(root: &Path, files: &[String]) -> NativeGraph {
@@ -2460,10 +2461,12 @@ fn metrics_native_graph(root: &Path, files: &[String]) -> NativeGraph {
     };
     let n_native_call_sites = symbols.len() as i64;
     let mut targets = std::collections::HashSet::new();
+    let mut edge_pairs: std::collections::HashSet<(String, String)> = std::collections::HashSet::new();
     let mut edges = 0i64;
     for s in &symbols {
         if let Some(c) = resolve(s) {
             edges += 1;
+            edge_pairs.insert((s.clone(), c.clone()));
             targets.insert(c);
         }
     }
@@ -2473,6 +2476,7 @@ fn metrics_native_graph(root: &Path, files: &[String]) -> NativeGraph {
         n_native_targets: targets.len() as i64,
         native_resolution_rate: (n_native_call_sites > 0)
             .then(|| edges as f64 / n_native_call_sites as f64),
+        edges: edge_pairs.into_iter().collect(),
     }
 }
 
@@ -2547,7 +2551,11 @@ fn call_target(b: tree_sitter::Node, lang: SrcLang, bytes: &[u8]) -> Option<Stri
 
 /// Internal call graph for one compiled language: nodes are function definitions
 /// in src/, edges are calls between them. C and C++ are graphed together.
-fn build_src_graph(root: &Path, files: &[String], lang: SrcLang) -> Network {
+fn build_src_graph(
+    root: &Path,
+    files: &[String],
+    lang: SrcLang,
+) -> (Network, Vec<(String, String)>) {
     let exts: &[&str] = match lang {
         SrcLang::CFamily => &["c", "h", "cc", "cpp", "cxx", "hpp", "hxx"],
         SrcLang::Rust => &["rs"],
@@ -2918,8 +2926,12 @@ fn brandes(n: usize, adj: &[Vec<usize>]) -> Vec<f64> {
 }
 
 /// Build a call graph from named nodes and their (possibly external) callees,
-/// then compute the network statistics. Callees not in `names` are dropped.
-fn graph_from_calls(names: &[String], per_node_calls: &[Vec<String>]) -> Network {
+/// returning the network statistics and the resolved edges as name pairs.
+/// Callees not in `names` are dropped.
+fn graph_from_calls(
+    names: &[String],
+    per_node_calls: &[Vec<String>],
+) -> (Network, Vec<(String, String)>) {
     let idx: std::collections::HashMap<&str, usize> =
         names.iter().enumerate().map(|(i, n)| (n.as_str(), i)).collect();
     let mut edge_set: std::collections::HashSet<(usize, usize)> = std::collections::HashSet::new();
@@ -2933,10 +2945,12 @@ fn graph_from_calls(names: &[String], per_node_calls: &[Vec<String>]) -> Network
         }
     }
     let edges: Vec<(usize, usize)> = edge_set.into_iter().collect();
-    graph_stats(names.len(), &edges)
+    let named: Vec<(String, String)> =
+        edges.iter().map(|&(a, b)| (names[a].clone(), names[b].clone())).collect();
+    (graph_stats(names.len(), &edges), named)
 }
 
-fn metrics_network(fns: &[FnStat]) -> Network {
+fn metrics_network(fns: &[FnStat]) -> (Network, Vec<(String, String)>) {
     let names: Vec<String> = fns.iter().map(|f| f.name.clone()).collect();
     let calls: Vec<Vec<String>> = fns.iter().map(|f| f.calls.clone()).collect();
     graph_from_calls(&names, &calls)
@@ -3268,13 +3282,13 @@ fn main() {
     let n_fns_r = fn_stats.len();
     let n_fns_r_exported = fn_stats.iter().filter(|f| f.exported).count();
     let ex = metrics_extra(&desc, &root, &files);
-    let net = metrics_network(&fn_stats);
+    let (net, r_edges) = metrics_network(&fn_stats);
     let ws = metrics_whitespace(&root, &files);
     let src_fns = count_src_functions(&root, &files);
     let ng = metrics_native_graph(&root, &files);
-    let cnet = build_src_graph(&root, &files, SrcLang::CFamily);
-    let rnet = build_src_graph(&root, &files, SrcLang::Rust);
-    let fnet = build_src_graph(&root, &files, SrcLang::Fortran);
+    let (cnet, c_edges) = build_src_graph(&root, &files, SrcLang::CFamily);
+    let (rnet, rust_edges) = build_src_graph(&root, &files, SrcLang::Rust);
+    let (fnet, fortran_edges) = build_src_graph(&root, &files, SrcLang::Fortran);
 
     // Deprecated R functions: body calls .Deprecated/.Defunct or lifecycle::deprecate_*.
     let dep_calls = [".Deprecated", ".Defunct", "deprecate_soft", "deprecate_warn", "deprecate_stop"];
@@ -3619,6 +3633,22 @@ fn main() {
                 "n_params": fnst.n_params, "cyclocomp": fnst.cyclocomp,
             })
         );
+    }
+    // Call-graph edges: the raw structure behind the network stats. Nodes are the
+    // `function` records above (R) or compiled function names.
+    for (graph, edges) in [
+        ("r", &r_edges),
+        ("native", &ng.edges),
+        ("c", &c_edges),
+        ("rust", &rust_edges),
+        ("fortran", &fortran_edges),
+    ] {
+        for (from, to) in edges {
+            println!(
+                "{}",
+                serde_json::json!({"rec": "call_edge", "graph": graph, "from": from, "to": to})
+            );
+        }
     }
     // Full parsed DESCRIPTION as a raw intermediate: every field is preserved,
     // modeled or not, so future metrics derive from stored data without re-cloning.
