@@ -2004,13 +2004,14 @@ fn metrics_security(desc: &BTreeMap<String, String>, root: &Path, files: &[Strin
     }
 }
 
-// ---- val.meter-style static metrics -----------------------------------------
+// ---- documentation-coverage + source-repository signals ---------------------
+// (exports-help coverage is intentionally omitted: roxygen_doc_coverage in the
+// docs group already measures the fraction of exports with a \name/\alias page.)
 
-struct ValMeter {
+struct Extra {
     has_recognized_repo: bool,
     repo_host: Option<String>,
     repo_url: Option<String>,
-    exports_help_coverage: Option<f64>,
     help_pages_with_examples: i64,
     examples_coverage: Option<f64>,
     news_up_to_date: Option<bool>,
@@ -2062,32 +2063,17 @@ fn detect_repo(fields: &[Option<String>]) -> Option<(String, String)> {
     None
 }
 
-fn metrics_valmeter(
-    desc: &BTreeMap<String, String>,
-    root: &Path,
-    files: &[String],
-    exports: &[String],
-) -> ValMeter {
+fn metrics_extra(desc: &BTreeMap<String, String>, root: &Path, files: &[String]) -> Extra {
     let repo = detect_repo(&[desc.get("URL").cloned(), desc.get("BugReports").cloned()]);
 
-    // Rd help pages: collect \alias symbols and count \examples sections.
+    // Rd help pages with an \examples section.
     let rd_files = find_files(files, r"^man/.*\.Rd$");
-    let mut aliases = std::collections::HashSet::new();
     let mut help_pages_with_examples = 0i64;
     for f in &rd_files {
-        let text = read(root, f).unwrap_or_default();
-        for a in rd_all_blocks(&text, "alias") {
-            aliases.insert(a.trim().to_string());
-        }
-        if rd_has_block(&text, "examples") {
+        if rd_has_block(&read(root, f).unwrap_or_default(), "examples") {
             help_pages_with_examples += 1;
         }
     }
-    let real_exports: Vec<&String> = exports.iter().filter(|e| !e.starts_with("pattern:")).collect();
-    let exports_help_coverage = (!real_exports.is_empty()).then(|| {
-        real_exports.iter().filter(|e| aliases.contains(e.as_str())).count() as f64
-            / real_exports.len() as f64
-    });
     let examples_coverage =
         (!rd_files.is_empty()).then(|| help_pages_with_examples as f64 / rd_files.len() as f64);
 
@@ -2102,11 +2088,10 @@ fn metrics_valmeter(
             latest.is_some() && latest == pkg_ver
         });
 
-    ValMeter {
+    Extra {
         has_recognized_repo: repo.is_some(),
         repo_host: repo.as_ref().map(|(h, _)| h.clone()),
         repo_url: repo.map(|(_, u)| u),
-        exports_help_coverage,
         help_pages_with_examples,
         examples_coverage,
         news_up_to_date,
@@ -2427,7 +2412,7 @@ fn main() {
         fn_stats.iter().filter(|f| f.exported).map(|f| f.n_params).collect();
     let n_fns_r = fn_stats.len();
     let n_fns_r_exported = fn_stats.iter().filter(|f| f.exported).count();
-    let vm = metrics_valmeter(&desc, &root, &files, &ns.exports);
+    let ex = metrics_extra(&desc, &root, &files);
 
     // --- legal + portability + tests ---
     let legal = metrics_legal(&desc, &root, &files);
@@ -2530,13 +2515,12 @@ fn main() {
         "n_s7_classes": oo.s7_classes,
         "n_s3_methods": ns.s3_methods,
         "uses_usemethod": oo.uses_usemethod,
-        "has_recognized_repo": vm.has_recognized_repo,
-        "repo_host": vm.repo_host,
-        "repo_url": vm.repo_url,
-        "exports_help_coverage": vm.exports_help_coverage,
-        "help_pages_with_examples": vm.help_pages_with_examples,
-        "examples_coverage": vm.examples_coverage,
-        "news_up_to_date": vm.news_up_to_date,
+        "has_recognized_repo": ex.has_recognized_repo,
+        "repo_host": ex.repo_host,
+        "repo_url": ex.repo_url,
+        "help_pages_with_examples": ex.help_pages_with_examples,
+        "examples_coverage": ex.examples_coverage,
+        "news_up_to_date": ex.news_up_to_date,
         "n_deps_direct": n_deps_direct,
         "dep_list": deps,
         "has_additional_repositories": !additional_repositories.is_empty(),
