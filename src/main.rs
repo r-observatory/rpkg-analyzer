@@ -2262,6 +2262,141 @@ fn metrics_ast(root: &Path, files: &[String], exports: &[String], parser: &mut P
     (fns, oo)
 }
 
+// ---- per-subdir whitespace / comment metrics --------------------------------
+
+#[derive(Clone, Copy)]
+enum Lang {
+    R,
+    C,
+    Fortran,
+    Rd,
+    Other,
+}
+
+fn lang_of(path: &str) -> Lang {
+    match path.rsplit('.').next().unwrap_or("").to_ascii_lowercase().as_str() {
+        "r" => Lang::R,
+        "c" | "cc" | "cpp" | "cxx" | "h" | "hpp" | "hxx" => Lang::C,
+        "f" | "f90" | "f95" => Lang::Fortran,
+        "rd" => Lang::Rd,
+        _ => Lang::Other,
+    }
+}
+
+/// (blank, comment) line counts for one file, language-aware. Approximate:
+/// comment detection handles line comments plus C block comments.
+fn line_stats(content: &str, lang: Lang) -> (i64, i64) {
+    let mut blank = 0i64;
+    let mut comment = 0i64;
+    let mut in_block = false;
+    for line in content.lines() {
+        let t = line.trim();
+        if t.is_empty() {
+            blank += 1;
+            continue;
+        }
+        let is_comment = match lang {
+            Lang::R => t.starts_with('#'),
+            Lang::Rd => t.starts_with('%'),
+            Lang::Fortran => {
+                t.starts_with('!') || matches!(line.chars().next(), Some('c' | 'C' | '*'))
+            }
+            Lang::C => {
+                if in_block {
+                    if t.contains("*/") {
+                        in_block = false;
+                    }
+                    true
+                } else if t.starts_with("//") {
+                    true
+                } else if t.starts_with("/*") {
+                    if !t.contains("*/") {
+                        in_block = true;
+                    }
+                    true
+                } else {
+                    false
+                }
+            }
+            Lang::Other => false,
+        };
+        if is_comment {
+            comment += 1;
+        }
+    }
+    (blank, comment)
+}
+
+/// Indentation style over R/ files: -1 for tabs, else the modal space width, 0 if none.
+fn detect_indentation(root: &Path, r_files: &[&str]) -> i64 {
+    let mut has_tab = false;
+    let mut widths: BTreeMap<usize, usize> = BTreeMap::new();
+    for f in r_files {
+        let Some(c) = read(root, f) else { continue };
+        for line in c.lines() {
+            let leading: String = line.chars().take_while(|c| *c == ' ' || *c == '\t').collect();
+            if leading.contains('\t') {
+                has_tab = true;
+            } else {
+                let n = leading.len();
+                if n > 0 {
+                    *widths.entry(n).or_insert(0) += 1;
+                }
+            }
+        }
+    }
+    if has_tab {
+        return -1;
+    }
+    widths.into_iter().max_by_key(|&(_, count)| count).map(|(w, _)| w as i64).unwrap_or(0)
+}
+
+struct WhiteSpace {
+    blank_lines_r: i64,
+    comment_lines_r: i64,
+    rel_space_r: Option<f64>,
+    blank_lines_src: i64,
+    comment_lines_src: i64,
+    rel_space_src: Option<f64>,
+    blank_lines_tests: i64,
+    comment_lines_tests: i64,
+    rel_space_tests: Option<f64>,
+    indentation: i64,
+}
+
+fn metrics_whitespace(root: &Path, files: &[String]) -> WhiteSpace {
+    let subdir = |prefix: &str| -> (i64, i64, i64) {
+        let (mut blank, mut comment, mut total) = (0i64, 0i64, 0i64);
+        for f in files {
+            if !f.starts_with(prefix) || is_noncode(f) {
+                continue;
+            }
+            let Some(c) = read(root, f) else { continue };
+            let (b, cm) = line_stats(&c, lang_of(f));
+            blank += b;
+            comment += cm;
+            total += loc(&c) as i64;
+        }
+        (blank, comment, total)
+    };
+    let rel = |blank: i64, total: i64| (total > 0).then(|| blank as f64 / total as f64);
+    let (br, cr, tr) = subdir("R/");
+    let (bs, cs, ts) = subdir("src/");
+    let (bt, ct, tt) = subdir("tests/");
+    WhiteSpace {
+        blank_lines_r: br,
+        comment_lines_r: cr,
+        rel_space_r: rel(br, tr),
+        blank_lines_src: bs,
+        comment_lines_src: cs,
+        rel_space_src: rel(bs, ts),
+        blank_lines_tests: bt,
+        comment_lines_tests: ct,
+        rel_space_tests: rel(bt, tt),
+        indentation: detect_indentation(root, &find_files(files, r"^R/.*\.[Rr]$")),
+    }
+}
+
 // ---- call network -----------------------------------------------------------
 // A syntactic call graph: nodes are the package's top-level R functions, a
 // directed edge A -> B means A's body calls B (B also a package function).
@@ -2569,6 +2704,7 @@ fn main() {
     let n_fns_r_exported = fn_stats.iter().filter(|f| f.exported).count();
     let ex = metrics_extra(&desc, &root, &files);
     let net = metrics_network(&fn_stats);
+    let ws = metrics_whitespace(&root, &files);
 
     // --- legal + portability + tests ---
     let legal = metrics_legal(&desc, &root, &files);
@@ -2688,6 +2824,16 @@ fn main() {
         "net_betweenness_mean": net.betweenness_mean,
         "net_betweenness_median": net.betweenness_median,
         "net_betweenness_max": net.betweenness_max,
+        "blank_lines_r": ws.blank_lines_r,
+        "comment_lines_r": ws.comment_lines_r,
+        "rel_space_r": ws.rel_space_r,
+        "blank_lines_src": ws.blank_lines_src,
+        "comment_lines_src": ws.comment_lines_src,
+        "rel_space_src": ws.rel_space_src,
+        "blank_lines_tests": ws.blank_lines_tests,
+        "comment_lines_tests": ws.comment_lines_tests,
+        "rel_space_tests": ws.rel_space_tests,
+        "indentation": ws.indentation,
         "n_deps_direct": n_deps_direct,
         "dep_list": deps,
         "has_additional_repositories": !additional_repositories.is_empty(),
