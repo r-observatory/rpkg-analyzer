@@ -2833,6 +2833,7 @@ fn main() {
         find_files(&files, r"^(?:tests|inst/tinytest|inst/unitTests)/.*\.[Rr]$");
     let re_testthat = regex::Regex::new(r"\b(?:test_that|describe|it)\s*\(").unwrap();
     let re_expect = regex::Regex::new(r"\bexpect_\w+\s*\(").unwrap();
+    let re_unittest = regex::Regex::new(r"\bok(?:_group)?\s*\(").unwrap();
     let re_runit_fn = regex::Regex::new(r"(?m)^\s*test[.\w]*\s*(?:<-|=)\s*function").unwrap();
     let re_runit_check = regex::Regex::new(r"\bcheck(?:Equals|True|Identical|Exception)\w*\s*\(").unwrap();
     let re_testit = regex::Regex::new(r"\bassert\s*\(").unwrap();
@@ -2843,6 +2844,9 @@ fn main() {
         if re_testthat.is_match(&c) {
             testing_frameworks.insert("testthat".into());
             n_test_cases += re_testthat.find_iter(&c).count() as i64;
+        } else if re_unittest.is_match(&c) {
+            testing_frameworks.insert("unittest".into());
+            n_test_cases += re_unittest.find_iter(&c).count() as i64;
         } else if f.starts_with("inst/tinytest") || re_expect.is_match(&c) {
             testing_frameworks.insert("tinytest".into());
             n_test_cases += re_expect.find_iter(&c).count() as i64;
@@ -2855,10 +2859,24 @@ fn main() {
             n_test_cases += re_testit.find_iter(&c).count() as i64;
         }
     }
-    // frameworks can be declared without our parser recognizing a case
+    // unitizer is expression-based (no discrete case token); flag by its dir.
+    if files.iter().any(|f| f.starts_with("tests/unitizer/")) {
+        testing_frameworks.insert("unitizer".into());
+    }
+    // frameworks can be declared without our parser recognizing a case.
     let suggests_lc = desc.get("Suggests").map(|s| s.to_lowercase()).unwrap_or_default();
-    for (dep, name) in [("testthat", "testthat"), ("tinytest", "tinytest"), ("runit", "RUnit"), ("testit", "testit")] {
-        if suggests_lc.contains(dep) {
+    for (dep, name) in [
+        ("testthat", "testthat"),
+        ("tinytest", "tinytest"),
+        ("runit", "RUnit"),
+        ("testit", "testit"),
+        ("unittest", "unittest"),
+        ("unitizer", "unitizer"),
+        ("svunit", "svUnit"),
+        ("quickcheck", "quickcheck"),
+        ("hedgehog", "hedgehog"),
+    ] {
+        if suggests_lc.split(',').any(|d| d.trim().starts_with(dep)) {
             testing_frameworks.insert(name.into());
         }
     }

@@ -118,9 +118,14 @@ function). `net_n_nodes`, `net_n_edges`, `net_n_clusters`, `net_n_isolated`,
 
 ### Tests
 
-`n_test_cases` and `testing_frameworks`, recognizing testthat (`test_that`/`it`),
-tinytest (`expect_*`), RUnit (`test.*` functions / `check*`), and testit
-(`assert`).
+`n_test_cases` and `testing_frameworks`. Cases are counted for testthat
+(`test_that`/`describe`/`it`), unittest (`ok`/`ok_group`), tinytest (`expect_*`),
+RUnit (`test.*` functions / `check*`), and testit (`assert`). unitizer (by its
+`tests/unitizer/` directory), svUnit, quickcheck, and hedgehog are detected as
+frameworks (via layout or `Suggests`) but not case-counted, since they are
+expression- or property-based rather than discrete-case. Assertion libraries
+(assertthat, checkmate) and mocking libraries (mockery, mockr) are intentionally
+not treated as frameworks.
 
 ### NAMESPACE intelligence
 
