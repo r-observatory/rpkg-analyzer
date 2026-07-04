@@ -173,6 +173,240 @@ fn parse_namespace(src: &str, parser: &mut Parser) -> Namespace {
     ns
 }
 
+// ---- legal ------------------------------------------------------------------
+
+const SPDX_TOKENS: &[&str] = &[
+    "GPL-2", "GPL-3", "GPL (>= 2)", "GPL (>= 3)", "LGPL-2", "LGPL-2.1", "LGPL-3",
+    "LGPL (>= 2)", "LGPL (>= 2.1)", "MIT", "BSD_2_clause", "BSD_3_clause",
+    "Apache License 2.0", "Apache License (>= 2)", "CC0", "CC BY 4.0", "CC-BY-4.0",
+    "MPL-2.0", "Artistic-2.0", "AGPL-3", "AGPL (>= 3)", "Unlimited",
+    "file LICENSE", "file LICENCE",
+];
+const OSI_TOKENS: &[&str] = &[
+    "GPL-2", "GPL-3", "GPL (>= 2)", "GPL (>= 3)", "LGPL-2", "LGPL-2.1", "LGPL-3",
+    "LGPL (>= 2)", "LGPL (>= 2.1)", "MIT", "BSD_2_clause", "BSD_3_clause",
+    "Apache License 2.0", "Apache License (>= 2)", "MPL-2.0", "Artistic-2.0",
+    "AGPL-3", "AGPL (>= 3)",
+];
+const TEMPLATE_TOKENS: &[&str] = &["MIT", "BSD_2_clause", "BSD_3_clause"];
+
+struct Legal {
+    license: Option<String>,
+    spdx_valid: Option<bool>,
+    osi_approved: Option<bool>,
+    license_file_completeness: Option<bool>,
+    copyright_holder_declared: Option<bool>,
+}
+
+/// Split a DESCRIPTION License string into canonical tokens (port of .legal_tokenize).
+fn legal_tokenize(lic: &str) -> Vec<String> {
+    if lic.trim().is_empty() {
+        return vec![];
+    }
+    let ws = regex::Regex::new(r"[ \t]+").unwrap();
+    let strip = regex::Regex::new(r"\s*\+\s*file\s+LICEN[SC]E\s*$").unwrap();
+    lic.split('|')
+        .filter_map(|part| {
+            let norm = ws.replace_all(part, " ");
+            let norm = norm.trim();
+            if norm.is_empty() {
+                return None;
+            }
+            let s = strip.replace(norm, "");
+            let s = s.trim();
+            Some(if s.is_empty() {
+                "file LICENSE".to_string()
+            } else {
+                s.to_string()
+            })
+        })
+        .collect()
+}
+
+fn metrics_legal(desc: &BTreeMap<String, String>, root: &Path, files: &[String]) -> Legal {
+    let license = desc
+        .get("License")
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string());
+    let tokens = license.as_deref().map(legal_tokenize).unwrap_or_default();
+    let all_in = |set: &[&str]| tokens.iter().all(|t| set.contains(&t.as_str()));
+    let spdx_valid = (!tokens.is_empty()).then(|| all_in(SPDX_TOKENS));
+    let osi_approved = (!tokens.is_empty()).then(|| all_in(OSI_TOKENS));
+
+    let has_file_ref = license
+        .as_deref()
+        .map(|l| regex::Regex::new(r"\bfile\s+LICEN[SC]E\b").unwrap().is_match(l))
+        .unwrap_or(false);
+    let license_file_completeness = if license.is_none() || !has_file_ref {
+        None
+    } else {
+        let path = if files.iter().any(|f| f == "LICENSE") {
+            Some("LICENSE")
+        } else if files.iter().any(|f| f == "LICENCE") {
+            Some("LICENCE")
+        } else {
+            None
+        };
+        match path {
+            None => Some(false),
+            Some(p) => {
+                let content = read(root, p).unwrap_or_default();
+                if content.trim().is_empty() {
+                    Some(false)
+                } else if tokens.iter().any(|t| TEMPLATE_TOKENS.contains(&t.as_str())) {
+                    let year = regex::Regex::new(r"\bYEAR\b").unwrap().is_match(&content);
+                    let ch = regex::Regex::new(r"\bCOPYRIGHT HOLDER\b").unwrap().is_match(&content);
+                    Some(!(year || ch))
+                } else {
+                    Some(true)
+                }
+            }
+        }
+    };
+
+    let copyright_holder_declared = {
+        let authors_r = desc.get("Authors@R").map(|s| s.trim()).filter(|s| !s.is_empty());
+        if let Some(ar) = authors_r {
+            Some(regex::Regex::new(r#""cph"|'cph'"#).unwrap().is_match(ar))
+        } else {
+            desc.get("Author")
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+                .map(|_| true)
+        }
+    };
+
+    Legal { license, spdx_valid, osi_approved, license_file_completeness, copyright_holder_declared }
+}
+
+// ---- portability ------------------------------------------------------------
+
+struct Port {
+    system_requirements_count: Option<i64>,
+    cxx_standard_required: Option<String>,
+    nonportable_compiler_flags: i64,
+    nonportable_compiler_flags_json: Vec<String>,
+    min_r_version: Option<String>,
+    has_vignettes: bool,
+    vignette_dynamic: Option<bool>,
+}
+
+fn find_files<'a>(files: &'a [String], pat: &str) -> Vec<&'a str> {
+    let re = regex::Regex::new(pat).unwrap();
+    files.iter().filter(|f| re.is_match(f)).map(|s| s.as_str()).collect()
+}
+
+fn metrics_portability(desc: &BTreeMap<String, String>, root: &Path, files: &[String]) -> Port {
+    // system_requirements_count: split on comma or the word "and", unique lowercased
+    let system_requirements_count = desc
+        .get("SystemRequirements")
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .and_then(|sr| {
+            let re = regex::Regex::new(r"[,]|\band\b").unwrap();
+            let mut seen = std::collections::HashSet::new();
+            let n = re
+                .split(sr)
+                .map(|p| p.trim().to_lowercase())
+                .filter(|p| !p.is_empty())
+                .filter(|p| seen.insert(p.clone()))
+                .count();
+            (n > 0).then_some(n as i64)
+        });
+
+    // cxx_standard_required + nonportable flags: scan src/Makevars(.win)
+    let bad_flags = ["-march=native", "-O3", "-funroll-loops", "-ffast-math"];
+    let cxx_re = regex::Regex::new(r"^\s*CXX_STD\s*=\s*CXX(\d+)").unwrap();
+    let abs_re = regex::Regex::new(r"-[IL]/\S+").unwrap();
+    let comment_re = regex::Regex::new(r"^\s*#").unwrap();
+    let mut cxx_standard_required: Option<String> = None;
+    let mut found_flags: Vec<String> = Vec::new();
+    for mf in find_files(files, r"^src/Makevars(\.win)?$") {
+        let Some(content) = read(root, mf) else { continue };
+        for ln in content.lines() {
+            if comment_re.is_match(ln) {
+                continue;
+            }
+            if cxx_standard_required.is_none() {
+                if let Some(c) = cxx_re.captures(ln) {
+                    cxx_standard_required = Some(format!("C++{}", &c[1]));
+                }
+            }
+            for pat in &bad_flags {
+                if ln.contains(pat) && !found_flags.contains(&pat.to_string()) {
+                    found_flags.push(pat.to_string());
+                }
+            }
+            for m in abs_re.find_iter(ln) {
+                let s = m.as_str().to_string();
+                if !found_flags.contains(&s) {
+                    found_flags.push(s);
+                }
+            }
+        }
+    }
+    let nonportable_compiler_flags = found_flags.len() as i64;
+
+    // min_r_version: R (>= x.y.z) in Depends
+    let min_r_version = desc
+        .get("Depends")
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .and_then(|dep| {
+            let re = regex::Regex::new(r"\bR\s*\(\s*>=\s*([0-9]+\.[0-9]+(?:\.[0-9]+)?)\s*\)").unwrap();
+            re.captures(dep).map(|c| c[1].to_string())
+        });
+
+    // vignettes
+    let vig_files = find_files(files, r"^vignettes/.*\.[Rr](md|nw)$");
+    let has_vignettes = !vig_files.is_empty();
+    let vignette_dynamic = if !has_vignettes {
+        None
+    } else {
+        let rmd_hdr = regex::Regex::new(r"```\{r[^}]*\}").unwrap();
+        let rnw_hdr = regex::Regex::new(r"<<[^>]*>>=").unwrap();
+        let eval_off = fancy_regex::Regex::new(r"eval\s*=\s*(FALSE|F)(?=[,}\s]|$)").unwrap();
+        let mut found_any = false;
+        let mut found_active = false;
+        for vf in &vig_files {
+            let Some(content) = read(root, vf) else { continue };
+            if content.is_empty() {
+                continue;
+            }
+            let headers: Vec<&str> = if regex::Regex::new(r"\.[Rr]md$").unwrap().is_match(vf) {
+                rmd_hdr.find_iter(&content).map(|m| m.as_str()).collect()
+            } else {
+                rnw_hdr.find_iter(&content).map(|m| m.as_str()).collect()
+            };
+            if headers.is_empty() {
+                continue;
+            }
+            found_any = true;
+            for h in headers {
+                if !eval_off.is_match(h).unwrap_or(false) {
+                    found_active = true;
+                    break;
+                }
+            }
+            if found_active {
+                break;
+            }
+        }
+        Some(if !found_any { true } else { found_active })
+    };
+
+    Port {
+        system_requirements_count,
+        cxx_standard_required,
+        nonportable_compiler_flags,
+        nonportable_compiler_flags_json: found_flags,
+        min_r_version,
+        has_vignettes,
+        vignette_dynamic,
+    }
+}
+
 // ---- main -------------------------------------------------------------------
 
 fn main() {
@@ -266,7 +500,6 @@ fn main() {
     let n_deps_direct = deps.len();
     let package = get("Package");
     let version = get("Version");
-    let license = get("License");
 
     // --- NAMESPACE ---
     let ns = read(&root, "NAMESPACE")
@@ -275,12 +508,27 @@ fn main() {
     let n_exports = ns.exports.len();
     let n_internal = r_fn_defs.saturating_sub(n_exports);
 
+    // --- legal + portability ---
+    let legal = metrics_legal(&desc, &root, &files);
+    let port = metrics_portability(&desc, &root, &files);
+
     // --- emit NDJSON ---
     let summary = serde_json::json!({
         "rec": "summary",
         "package": package,
         "version": version,
-        "license": license,
+        "license": legal.license,
+        "spdx_valid": legal.spdx_valid,
+        "osi_approved": legal.osi_approved,
+        "license_file_completeness": legal.license_file_completeness,
+        "copyright_holder_declared": legal.copyright_holder_declared,
+        "min_r_version": port.min_r_version,
+        "system_requirements_count": port.system_requirements_count,
+        "cxx_standard_required": port.cxx_standard_required,
+        "nonportable_compiler_flags": port.nonportable_compiler_flags,
+        "nonportable_compiler_flags_json": port.nonportable_compiler_flags_json,
+        "has_vignettes": port.has_vignettes,
+        "vignette_dynamic": port.vignette_dynamic,
         "n_files": n_files,
         "loc_total": loc_total,
         "loc_r": loc_r,
