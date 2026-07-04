@@ -2019,7 +2019,8 @@ fn main() {
     let desc = read(&root, "DESCRIPTION").map(|t| parse_dcf(&t)).unwrap_or_default();
     let get = |k: &str| desc.get(k).cloned().unwrap_or_default();
     let mut deps: Vec<String> = Vec::new();
-    for field in ["Depends", "Imports"] {
+    // the meta.R rule combines c(Imports, Depends) in that order.
+    for field in ["Imports", "Depends"] {
         deps.extend(dep_names(&get(field)));
     }
     // preserve declaration order, dropping later duplicates
