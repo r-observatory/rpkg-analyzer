@@ -2476,6 +2476,89 @@ fn metrics_native_graph(root: &Path, files: &[String]) -> NativeGraph {
     }
 }
 
+/// The rightmost identifier of a call target (`foo`, `obj.foo`, `ns::foo`).
+fn rightmost_ident(node: tree_sitter::Node, bytes: &[u8]) -> Option<String> {
+    match node.kind() {
+        "identifier" | "field_identifier" | "type_identifier" => {
+            node.utf8_text(bytes).ok().map(String::from)
+        }
+        "field_expression" => node.child_by_field_name("field").and_then(|f| rightmost_ident(f, bytes)),
+        "scoped_identifier" | "qualified_identifier" => {
+            node.child_by_field_name("name").and_then(|f| rightmost_ident(f, bytes))
+        }
+        _ => None,
+    }
+}
+
+fn callee_name(call: tree_sitter::Node, bytes: &[u8]) -> Option<String> {
+    rightmost_ident(call.child_by_field_name("function")?, bytes)
+}
+
+/// Internal call graph for one compiled language family: nodes are function
+/// definitions in src/, edges are calls between them. `is_rust` picks the
+/// grammar/node kinds; otherwise C and C++ files are graphed together.
+fn build_src_graph(root: &Path, files: &[String], is_rust: bool) -> Network {
+    let exts: &[&str] = if is_rust {
+        &["rs"]
+    } else {
+        &["c", "h", "cc", "cpp", "cxx", "hpp", "hxx"]
+    };
+    let def_kind = if is_rust { "function_item" } else { "function_definition" };
+    let mut parser = Parser::new();
+    let mut names: Vec<String> = Vec::new();
+    let mut calls: Vec<Vec<String>> = Vec::new();
+    for f in files {
+        if !f.starts_with("src/") {
+            continue;
+        }
+        let ext = f.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
+        if !exts.contains(&ext.as_str()) {
+            continue;
+        }
+        let Some(lang) = language_for_ext(f) else { continue };
+        if parser.set_language(&lang).is_err() {
+            continue;
+        }
+        let Some(content) = read(root, f) else { continue };
+        let Some(tree) = parser.parse(&content, None) else { continue };
+        let bytes = content.as_bytes();
+        let mut st = vec![tree.root_node()];
+        while let Some(n) = st.pop() {
+            if n.kind() == def_kind {
+                let name = if is_rust {
+                    n.child_by_field_name("name").and_then(|nm| nm.utf8_text(bytes).ok()).map(String::from)
+                } else {
+                    c_fn_name(n, bytes)
+                };
+                if let Some(nm) = name {
+                    let mut callees = Vec::new();
+                    let mut bst = vec![n];
+                    while let Some(b) = bst.pop() {
+                        if b.kind() == "call_expression" {
+                            if let Some(cn) = callee_name(b, bytes) {
+                                callees.push(cn);
+                            }
+                        }
+                        let mut bc = b.walk();
+                        for ch in b.children(&mut bc) {
+                            bst.push(ch);
+                        }
+                    }
+                    names.push(nm);
+                    calls.push(callees);
+                }
+                // do not descend further: nested definitions fold into this one
+                continue;
+            }
+            let mut c = n.walk();
+            for ch in n.children(&mut c) {
+                st.push(ch);
+            }
+        }
+    }
+    graph_from_calls(&names, &calls)
+}
+
 fn metrics_ast(root: &Path, files: &[String], exports: &[String], parser: &mut Parser) -> (Vec<FnStat>, Oo) {
     let r_files = find_files(files, r"^R/.*\.[Rr]$");
     let exported: std::collections::HashSet<&str> = exports.iter().map(String::as_str).collect();
@@ -2792,13 +2875,14 @@ fn brandes(n: usize, adj: &[Vec<usize>]) -> Vec<f64> {
     bc
 }
 
-fn metrics_network(fns: &[FnStat]) -> Network {
-    let n = fns.len();
+/// Build a call graph from named nodes and their (possibly external) callees,
+/// then compute the network statistics. Callees not in `names` are dropped.
+fn graph_from_calls(names: &[String], per_node_calls: &[Vec<String>]) -> Network {
     let idx: std::collections::HashMap<&str, usize> =
-        fns.iter().enumerate().map(|(i, f)| (f.name.as_str(), i)).collect();
+        names.iter().enumerate().map(|(i, n)| (n.as_str(), i)).collect();
     let mut edge_set: std::collections::HashSet<(usize, usize)> = std::collections::HashSet::new();
-    for (i, f) in fns.iter().enumerate() {
-        for callee in &f.calls {
+    for (i, calls) in per_node_calls.iter().enumerate() {
+        for callee in calls {
             if let Some(&j) = idx.get(callee.as_str()) {
                 if i != j {
                     edge_set.insert((i, j));
@@ -2807,12 +2891,21 @@ fn metrics_network(fns: &[FnStat]) -> Network {
         }
     }
     let edges: Vec<(usize, usize)> = edge_set.into_iter().collect();
+    graph_stats(names.len(), &edges)
+}
 
+fn metrics_network(fns: &[FnStat]) -> Network {
+    let names: Vec<String> = fns.iter().map(|f| f.name.clone()).collect();
+    let calls: Vec<Vec<String>> = fns.iter().map(|f| f.calls.clone()).collect();
+    graph_from_calls(&names, &calls)
+}
+
+fn graph_stats(n: usize, edges: &[(usize, usize)]) -> Network {
     let mut adj: Vec<Vec<usize>> = vec![Vec::new(); n];
     let mut out_deg = vec![0usize; n];
     let mut deg = vec![0usize; n];
     let mut parent: Vec<usize> = (0..n).collect();
-    for &(a, b) in &edges {
+    for &(a, b) in edges {
         adj[a].push(b);
         out_deg[a] += 1;
         deg[a] += 1;
@@ -3137,6 +3230,8 @@ fn main() {
     let ws = metrics_whitespace(&root, &files);
     let src_fns = count_src_functions(&root, &files);
     let ng = metrics_native_graph(&root, &files);
+    let cnet = build_src_graph(&root, &files, false); // C/C++ internal graph
+    let rnet = build_src_graph(&root, &files, true); // Rust internal graph
 
     // Deprecated R functions: body calls .Deprecated/.Defunct or lifecycle::deprecate_*.
     let dep_calls = [".Deprecated", ".Defunct", "deprecate_soft", "deprecate_warn", "deprecate_stop"];
@@ -3362,6 +3457,16 @@ fn main() {
         "n_native_edges": ng.n_native_edges,
         "n_native_targets": ng.n_native_targets,
         "native_resolution_rate": ng.native_resolution_rate,
+        "cnet_n_nodes": cnet.n_nodes,
+        "cnet_n_edges": cnet.n_edges,
+        "cnet_n_clusters": cnet.n_clusters,
+        "cnet_node_degree_max": cnet.node_degree_max,
+        "cnet_betweenness_max": cnet.betweenness_max,
+        "rnet_n_nodes": rnet.n_nodes,
+        "rnet_n_edges": rnet.n_edges,
+        "rnet_n_clusters": rnet.n_clusters,
+        "rnet_node_degree_max": rnet.node_degree_max,
+        "rnet_betweenness_max": rnet.betweenness_max,
         "n_library_calls_in_r": n_library_calls,
         "n_internal_calls": n_internal_calls,
         "n_global_assign": n_global_assign,

@@ -112,8 +112,13 @@ using the string routine name, a `C_`-stripped symbol, and the C registration
 table (`R_CallMethodDef` and friends). `n_native_call_sites` (total),
 `n_native_edges` (resolved), `n_native_targets` (distinct compiled functions
 reached), `native_resolution_rate`. On data.table all 178 sites resolve to 108 C
-functions. This covers the R-to-C boundary; the internal C-to-C call graph is not
-built here (that is where ctags/gtags would add value).
+functions.
+
+The compiled side has its own internal call graphs, built the same way from
+tree-sitter (no ctags/gtags). `cnet_*` is the combined C/C++ graph and `rnet_*`
+the Rust graph, each with `n_nodes`, `n_edges`, `n_clusters`, `node_degree_max`,
+`betweenness_max`. On data.table `cnet` is 389 nodes / 593 edges. Fortran
+internal edges are not built.
 
 ### Static-check-style signals
 
