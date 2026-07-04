@@ -2023,10 +2023,22 @@ fn main() {
     for field in ["Imports", "Depends"] {
         deps.extend(dep_names(&get(field)));
     }
-    // preserve declaration order, dropping later duplicates
+    // Distinct direct dependencies, declaration order. some tools do not dedupe, so a
+    // package listed in both Imports and Depends is double-counted there; we keep
+    // the distinct count.
     let mut seen = std::collections::HashSet::new();
     deps.retain(|d| seen.insert(d.clone()));
     let n_deps_direct = deps.len();
+
+    // Additional_repositories: non-CRAN repo URLs declared for dependencies.
+    // its presence signals a source outside the CRAN registry.
+    let additional_repositories: Vec<String> = get("Additional_repositories")
+        .split([',', ' ', '\t', '\n'])
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(String::from)
+        .collect();
+
     let package = get("Package");
     let version = get("Version");
 
@@ -2119,6 +2131,8 @@ fn main() {
         "triple_colon_pkgs": funcs.triple_colon_pkgs,
         "n_deps_direct": n_deps_direct,
         "dep_list": deps,
+        "has_additional_repositories": !additional_repositories.is_empty(),
+        "additional_repositories": additional_repositories,
         "export_patterns": ns.export_patterns,
         "s3_methods": ns.s3_methods,
         "export_classes": ns.export_classes,
