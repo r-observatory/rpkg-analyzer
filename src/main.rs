@@ -2193,7 +2193,9 @@ fn count_kinds(node: tree_sitter::Node, kinds: &[&str]) -> i64 {
     let mut n = 0i64;
     let mut st = vec![node];
     while let Some(x) = st.pop() {
-        if kinds.contains(&x.kind()) {
+        // named nodes only: Fortran's `function`/`subroutine` keyword tokens share
+        // the kind name of the definition node but are anonymous.
+        if x.is_named() && kinds.contains(&x.kind()) {
             n += 1;
         }
         let mut c = x.walk();
@@ -2614,14 +2616,29 @@ fn main() {
         .expect("load tree-sitter-r");
 
     // Debug: --sexp <file.R> prints the parse tree, for learning node kinds.
-    if dir == "--sexp" {
-        let f = std::env::args().nth(2).expect("--sexp <file>");
+    if dir == "--sexp" || dir == "--kinds" {
+        let f = std::env::args().nth(2).expect("<file>");
         let src = std::fs::read_to_string(&f).expect("read");
         if let Some(lang) = language_for_ext(&f) {
             parser.set_language(&lang).expect("load grammar");
         }
         let tree = parser.parse(&src, None).expect("parse");
-        println!("{}", tree.root_node().to_sexp());
+        if dir == "--sexp" {
+            println!("{}", tree.root_node().to_sexp());
+        } else {
+            let mut hist: BTreeMap<String, i64> = BTreeMap::new();
+            let mut st = vec![tree.root_node()];
+            while let Some(x) = st.pop() {
+                *hist.entry(x.kind().to_string()).or_insert(0) += 1;
+                let mut c = x.walk();
+                for ch in x.children(&mut c) {
+                    st.push(ch);
+                }
+            }
+            for (k, v) in hist {
+                println!("{v}\t{k}");
+            }
+        }
         return;
     }
 
