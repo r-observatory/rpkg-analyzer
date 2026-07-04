@@ -1,4 +1,4 @@
-#![recursion_limit = "512"]
+#![recursion_limit = "2048"]
 // rpkg-analyzer: a pure function of one extracted R package source tree.
 // Reads a directory, emits newline-delimited JSON metric records on stdout.
 // This first cut covers the structure, DESCRIPTION (DCF), and NAMESPACE groups,
@@ -89,6 +89,18 @@ fn median_u64(v: &[u64]) -> Option<f64> {
         s[n / 2] as f64
     } else {
         (s[n / 2 - 1] + s[n / 2]) as f64 / 2.0
+    })
+}
+
+/// The tree-sitter grammar for a compiled-source file, by extension.
+fn language_for_ext(path: &str) -> Option<tree_sitter::Language> {
+    let ext = path.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
+    Some(match ext.as_str() {
+        "c" | "h" => tree_sitter_c::LANGUAGE.into(),
+        "cc" | "cpp" | "cxx" | "hpp" | "hxx" => tree_sitter_cpp::LANGUAGE.into(),
+        "f" | "f90" | "f95" | "f03" | "f08" => tree_sitter_fortran::LANGUAGE.into(),
+        "rs" => tree_sitter_rust::LANGUAGE.into(),
+        _ => return None,
     })
 }
 
@@ -2177,6 +2189,61 @@ fn median_i(v: &[i64]) -> Option<f64> {
     })
 }
 
+fn count_kinds(node: tree_sitter::Node, kinds: &[&str]) -> i64 {
+    let mut n = 0i64;
+    let mut st = vec![node];
+    while let Some(x) = st.pop() {
+        if kinds.contains(&x.kind()) {
+            n += 1;
+        }
+        let mut c = x.walk();
+        for ch in x.children(&mut c) {
+            st.push(ch);
+        }
+    }
+    n
+}
+
+struct SrcFns {
+    total: i64,
+    c: i64,
+    cpp: i64,
+    fortran: i64,
+    rust: i64,
+    n_files: i64,
+}
+
+/// Function counts in src/ across C, C++, Fortran, and Rust.
+fn count_src_functions(root: &Path, files: &[String]) -> SrcFns {
+    let mut parser = Parser::new();
+    let (mut c, mut cpp, mut fortran, mut rust, mut nf) = (0i64, 0i64, 0i64, 0i64, 0i64);
+    for f in files {
+        if !f.starts_with("src/") {
+            continue;
+        }
+        let Some(lang) = language_for_ext(f) else { continue };
+        if parser.set_language(&lang).is_err() {
+            continue;
+        }
+        let Some(content) = read(root, f) else { continue };
+        let Some(tree) = parser.parse(&content, None) else { continue };
+        nf += 1;
+        let ext = f.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
+        match ext.as_str() {
+            "c" | "h" => c += count_kinds(tree.root_node(), &["function_definition"]),
+            "cc" | "cpp" | "cxx" | "hpp" | "hxx" => {
+                cpp += count_kinds(tree.root_node(), &["function_definition"])
+            }
+            "f" | "f90" | "f95" | "f03" | "f08" => {
+                fortran += count_kinds(tree.root_node(), &["function", "subroutine"])
+            }
+            "rs" => rust += count_kinds(tree.root_node(), &["function_item"]),
+            _ => {}
+        }
+    }
+    SrcFns { total: c + cpp + fortran + rust, c, cpp, fortran, rust, n_files: nf }
+}
+
 fn metrics_ast(root: &Path, files: &[String], exports: &[String], parser: &mut Parser) -> (Vec<FnStat>, Oo) {
     let r_files = find_files(files, r"^R/.*\.[Rr]$");
     let exported: std::collections::HashSet<&str> = exports.iter().map(String::as_str).collect();
@@ -2550,6 +2617,9 @@ fn main() {
     if dir == "--sexp" {
         let f = std::env::args().nth(2).expect("--sexp <file>");
         let src = std::fs::read_to_string(&f).expect("read");
+        if let Some(lang) = language_for_ext(&f) {
+            parser.set_language(&lang).expect("load grammar");
+        }
         let tree = parser.parse(&src, None).expect("parse");
         println!("{}", tree.root_node().to_sexp());
         return;
@@ -2705,6 +2775,17 @@ fn main() {
     let ex = metrics_extra(&desc, &root, &files);
     let net = metrics_network(&fn_stats);
     let ws = metrics_whitespace(&root, &files);
+    let src_fns = count_src_functions(&root, &files);
+
+    // Deprecated R functions: body calls .Deprecated/.Defunct or lifecycle::deprecate_*.
+    let dep_calls = [".Deprecated", ".Defunct", "deprecate_soft", "deprecate_warn", "deprecate_stop"];
+    let n_deprecated_functions = fn_stats
+        .iter()
+        .filter(|f| f.calls.iter().any(|c| dep_calls.contains(&c.as_str())))
+        .count() as i64;
+    // LOC per function split by exported vs internal.
+    let exp_locs: Vec<i64> = fn_stats.iter().filter(|f| f.exported).map(|f| f.loc as i64).collect();
+    let int_locs: Vec<i64> = fn_stats.iter().filter(|f| !f.exported).map(|f| f.loc as i64).collect();
 
     // --- legal + portability + tests ---
     let legal = metrics_legal(&desc, &root, &files);
@@ -2864,6 +2945,17 @@ fn main() {
         "cyclocomp_mean": mean_i(&fn_cyclos),
         "cyclocomp_median": median_i(&fn_cyclos),
         "cyclocomp_max": fn_cyclos.iter().max().copied(),
+        "n_fns_src": src_fns.total,
+        "n_fns_c": src_fns.c,
+        "n_fns_cpp": src_fns.cpp,
+        "n_fns_fortran": src_fns.fortran,
+        "n_fns_rust": src_fns.rust,
+        "n_fns_per_file_src": (src_fns.n_files > 0).then(|| src_fns.total as f64 / src_fns.n_files as f64),
+        "n_deprecated_functions": n_deprecated_functions,
+        "loc_per_fn_exported_mean": mean_i(&exp_locs),
+        "loc_per_fn_exported_median": median_i(&exp_locs),
+        "loc_per_fn_internal_mean": mean_i(&int_locs),
+        "loc_per_fn_internal_median": median_i(&int_locs),
         "n_s4_classes": oo.s4_classes,
         "n_s4_generics": oo.s4_generics,
         "n_s4_methods": oo.s4_methods,
