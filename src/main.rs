@@ -2288,6 +2288,194 @@ fn count_src_functions(root: &Path, files: &[String]) -> SrcFns {
     SrcFns { total: c + cpp + fortran + rust, c, cpp, fortran, rust, n_files: nf }
 }
 
+// ---- cross-language (R -> native) call graph --------------------------------
+
+/// The C/C++ function name from a function_definition, unwrapping pointer and
+/// parenthesized declarators down to the identifier.
+fn c_fn_name(def: tree_sitter::Node, bytes: &[u8]) -> Option<String> {
+    let mut st = vec![def];
+    while let Some(n) = st.pop() {
+        if n.kind() == "function_declarator" {
+            let mut d = n.child_by_field_name("declarator");
+            for _ in 0..8 {
+                let dd = d?;
+                if matches!(dd.kind(), "identifier" | "field_identifier" | "qualified_identifier") {
+                    return dd.utf8_text(bytes).ok().map(String::from);
+                }
+                d = dd.child_by_field_name("declarator");
+            }
+        }
+        let mut c = n.walk();
+        for ch in n.children(&mut c) {
+            st.push(ch);
+        }
+    }
+    None
+}
+
+/// Names of every function defined in src/ (C, C++, Fortran, Rust).
+fn collect_src_function_names(root: &Path, files: &[String]) -> std::collections::HashSet<String> {
+    let mut parser = Parser::new();
+    let mut names = std::collections::HashSet::new();
+    for f in files {
+        if !f.starts_with("src/") {
+            continue;
+        }
+        let Some(lang) = language_for_ext(f) else { continue };
+        if parser.set_language(&lang).is_err() {
+            continue;
+        }
+        let Some(content) = read(root, f) else { continue };
+        let Some(tree) = parser.parse(&content, None) else { continue };
+        let bytes = content.as_bytes();
+        let ext = f.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
+        let mut st = vec![tree.root_node()];
+        while let Some(n) = st.pop() {
+            let name = match ext.as_str() {
+                "c" | "h" | "cc" | "cpp" | "cxx" | "hpp" | "hxx"
+                    if n.kind() == "function_definition" =>
+                {
+                    c_fn_name(n, bytes)
+                }
+                "f" | "f90" | "f95" | "f03" | "f08"
+                    if n.is_named() && matches!(n.kind(), "function" | "subroutine") =>
+                {
+                    let mut c = n.walk();
+                    n.children(&mut c)
+                        .find(|ch| ch.kind().ends_with("_statement"))
+                        .and_then(|s| s.child_by_field_name("name"))
+                        .and_then(|nm| nm.utf8_text(bytes).ok())
+                        .map(String::from)
+                }
+                "rs" if n.kind() == "function_item" => n
+                    .child_by_field_name("name")
+                    .and_then(|nm| nm.utf8_text(bytes).ok())
+                    .map(String::from),
+                _ => None,
+            };
+            if let Some(nm) = name {
+                names.insert(nm);
+            }
+            let mut c = n.walk();
+            for ch in n.children(&mut c) {
+                st.push(ch);
+            }
+        }
+    }
+    names
+}
+
+/// The R-visible routine name / symbol from the first argument of a native call.
+fn first_arg_symbol(args: tree_sitter::Node, bytes: &[u8]) -> Option<String> {
+    let mut c = args.walk();
+    for ch in args.children(&mut c) {
+        if ch.kind() != "argument" {
+            continue;
+        }
+        let val = ch.child_by_field_name("value")?;
+        return match val.kind() {
+            "string" => {
+                let mut cc = val.walk();
+                val.children(&mut cc)
+                    .find(|x| x.kind() == "string_content")
+                    .and_then(|x| x.utf8_text(bytes).ok())
+                    .map(String::from)
+            }
+            "identifier" => val.utf8_text(bytes).ok().map(String::from),
+            "namespace_operator" => val
+                .child_by_field_name("rhs")
+                .and_then(|x| x.utf8_text(bytes).ok())
+                .map(String::from),
+            _ => None,
+        };
+    }
+    None
+}
+
+struct NativeGraph {
+    n_native_call_sites: i64,
+    n_native_edges: i64,
+    n_native_targets: i64,
+    native_resolution_rate: Option<f64>,
+}
+
+fn metrics_native_graph(root: &Path, files: &[String]) -> NativeGraph {
+    let c_functions = collect_src_function_names(root, files);
+
+    // Registration table: {"rname", (DL_FUNC) &cfunc, n} across the *MethodDef arrays.
+    let reg_re =
+        regex::Regex::new(r#"\{\s*"([^"]+)"\s*,\s*\(DL_FUNC\)\s*&?\s*(\w+)"#).unwrap();
+    let mut reg: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    for f in files {
+        if !is_src_file(f) {
+            continue;
+        }
+        let Some(content) = read(root, f) else { continue };
+        for cap in reg_re.captures_iter(&content) {
+            reg.insert(cap[1].to_string(), cap[2].to_string());
+        }
+    }
+
+    // R native call sites and their routine symbols.
+    let mut parser = Parser::new();
+    parser.set_language(&tree_sitter_r::LANGUAGE.into()).expect("load R");
+    let mut symbols: Vec<String> = Vec::new();
+    for f in find_files(files, r"^R/.*\.[Rr]$") {
+        let Some(content) = read(root, &f) else { continue };
+        let Some(tree) = parser.parse(&content, None) else { continue };
+        let bytes = content.as_bytes();
+        let mut st = vec![tree.root_node()];
+        while let Some(n) = st.pop() {
+            if n.kind() == "call" {
+                if let Some(fname) = call_fn_name(&n, bytes) {
+                    if matches!(fname.as_str(), ".Call" | ".C" | ".Fortran" | ".External" | ".External2") {
+                        if let Some(args) = n.child_by_field_name("arguments") {
+                            if let Some(s) = first_arg_symbol(args, bytes) {
+                                symbols.push(s);
+                            }
+                        }
+                    }
+                }
+            }
+            let mut c = n.walk();
+            for ch in n.children(&mut c) {
+                st.push(ch);
+            }
+        }
+    }
+
+    // Resolve each symbol to a compiled function, via the registration table or a
+    // direct / C_-stripped name match.
+    let resolve = |sym: &str| -> Option<String> {
+        let stripped = sym.strip_prefix("C_").or_else(|| sym.strip_prefix("F_")).unwrap_or(sym);
+        for cand in [sym, stripped] {
+            if let Some(c) = reg.get(cand) {
+                return Some(c.clone());
+            }
+            if c_functions.contains(cand) {
+                return Some(cand.to_string());
+            }
+        }
+        None
+    };
+    let n_native_call_sites = symbols.len() as i64;
+    let mut targets = std::collections::HashSet::new();
+    let mut edges = 0i64;
+    for s in &symbols {
+        if let Some(c) = resolve(s) {
+            edges += 1;
+            targets.insert(c);
+        }
+    }
+    NativeGraph {
+        n_native_call_sites,
+        n_native_edges: edges,
+        n_native_targets: targets.len() as i64,
+        native_resolution_rate: (n_native_call_sites > 0)
+            .then(|| edges as f64 / n_native_call_sites as f64),
+    }
+}
+
 fn metrics_ast(root: &Path, files: &[String], exports: &[String], parser: &mut Parser) -> (Vec<FnStat>, Oo) {
     let r_files = find_files(files, r"^R/.*\.[Rr]$");
     let exported: std::collections::HashSet<&str> = exports.iter().map(String::as_str).collect();
@@ -2948,6 +3136,7 @@ fn main() {
     let net = metrics_network(&fn_stats);
     let ws = metrics_whitespace(&root, &files);
     let src_fns = count_src_functions(&root, &files);
+    let ng = metrics_native_graph(&root, &files);
 
     // Deprecated R functions: body calls .Deprecated/.Defunct or lifecycle::deprecate_*.
     let dep_calls = [".Deprecated", ".Defunct", "deprecate_soft", "deprecate_warn", "deprecate_stop"];
@@ -3169,6 +3358,10 @@ fn main() {
         "sysreq_has_gnu_make": sysreq_has_gnu_make,
         "sysreq_components": sysreq_components,
         "n_native_calls": n_native_calls,
+        "n_native_call_sites": ng.n_native_call_sites,
+        "n_native_edges": ng.n_native_edges,
+        "n_native_targets": ng.n_native_targets,
+        "native_resolution_rate": ng.native_resolution_rate,
         "n_library_calls_in_r": n_library_calls,
         "n_internal_calls": n_internal_calls,
         "n_global_assign": n_global_assign,
