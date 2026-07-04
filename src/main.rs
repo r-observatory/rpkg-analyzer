@@ -2121,6 +2121,7 @@ struct FnStat {
     n_params: i64,
     cyclocomp: i64,
     calls: Vec<String>,
+    native_calls: Vec<String>,
 }
 
 #[derive(Default)]
@@ -2400,7 +2401,7 @@ struct NativeGraph {
     edges: Vec<(String, String)>,
 }
 
-fn metrics_native_graph(root: &Path, files: &[String]) -> NativeGraph {
+fn metrics_native_graph(root: &Path, files: &[String], fns: &[FnStat]) -> NativeGraph {
     let c_functions = collect_src_function_names(root, files);
 
     // Registration table: {"rname", (DL_FUNC) &cfunc, n} across the *MethodDef arrays.
@@ -2417,36 +2418,8 @@ fn metrics_native_graph(root: &Path, files: &[String]) -> NativeGraph {
         }
     }
 
-    // R native call sites and their routine symbols.
-    let mut parser = Parser::new();
-    parser.set_language(&tree_sitter_r::LANGUAGE.into()).expect("load R");
-    let mut symbols: Vec<String> = Vec::new();
-    for f in find_files(files, r"^R/.*\.[Rr]$") {
-        let Some(content) = read(root, &f) else { continue };
-        let Some(tree) = parser.parse(&content, None) else { continue };
-        let bytes = content.as_bytes();
-        let mut st = vec![tree.root_node()];
-        while let Some(n) = st.pop() {
-            if n.kind() == "call" {
-                if let Some(fname) = call_fn_name(&n, bytes) {
-                    if matches!(fname.as_str(), ".Call" | ".C" | ".Fortran" | ".External" | ".External2") {
-                        if let Some(args) = n.child_by_field_name("arguments") {
-                            if let Some(s) = first_arg_symbol(args, bytes) {
-                                symbols.push(s);
-                            }
-                        }
-                    }
-                }
-            }
-            let mut c = n.walk();
-            for ch in n.children(&mut c) {
-                st.push(ch);
-            }
-        }
-    }
-
-    // Resolve each symbol to a compiled function, via the registration table or a
-    // direct / C_-stripped name match.
+    // Resolve a routine symbol to a compiled function, via the registration table
+    // or a direct / C_-stripped name match.
     let resolve = |sym: &str| -> Option<String> {
         let stripped = sym.strip_prefix("C_").or_else(|| sym.strip_prefix("F_")).unwrap_or(sym);
         for cand in [sym, stripped] {
@@ -2459,23 +2432,29 @@ fn metrics_native_graph(root: &Path, files: &[String]) -> NativeGraph {
         }
         None
     };
-    let n_native_call_sites = symbols.len() as i64;
+
+    // Each R function's native calls become R -> compiled edges (the bridge that
+    // unites the R graph with the compiled graphs).
+    let mut n_native_call_sites = 0i64;
+    let mut resolved = 0i64;
     let mut targets = std::collections::HashSet::new();
     let mut edge_pairs: std::collections::HashSet<(String, String)> = std::collections::HashSet::new();
-    let mut edges = 0i64;
-    for s in &symbols {
-        if let Some(c) = resolve(s) {
-            edges += 1;
-            edge_pairs.insert((s.clone(), c.clone()));
-            targets.insert(c);
+    for f in fns {
+        for sym in &f.native_calls {
+            n_native_call_sites += 1;
+            if let Some(c) = resolve(sym) {
+                resolved += 1;
+                edge_pairs.insert((f.name.clone(), c.clone()));
+                targets.insert(c);
+            }
         }
     }
     NativeGraph {
         n_native_call_sites,
-        n_native_edges: edges,
+        n_native_edges: edge_pairs.len() as i64,
         n_native_targets: targets.len() as i64,
         native_resolution_rate: (n_native_call_sites > 0)
-            .then(|| edges as f64 / n_native_call_sites as f64),
+            .then(|| resolved as f64 / n_native_call_sites as f64),
         edges: edge_pairs.into_iter().collect(),
     }
 }
@@ -2657,6 +2636,7 @@ fn metrics_ast(root: &Path, files: &[String], exports: &[String], parser: &mut P
                 .child_by_field_name("lhs")
                 .and_then(|l| l.utf8_text(bytes).ok())
                 .unwrap_or("")
+                .trim_matches(|c| c == '"' || c == '\'' || c == '`')
                 .to_string();
             let n_params = rhs
                 .child_by_field_name("parameters")
@@ -2667,10 +2647,19 @@ fn metrics_ast(root: &Path, files: &[String], exports: &[String], parser: &mut P
                 .unwrap_or(0);
             // call sites within this function's body (for the call-network)
             let mut calls = Vec::new();
+            let mut native_calls = Vec::new();
             let mut bst = vec![rhs];
             while let Some(n) = bst.pop() {
                 if n.kind() == "call" {
                     if let Some(cn) = call_fn_name(&n, bytes) {
+                        // a native call also carries its routine symbol (the R->C bridge)
+                        if matches!(cn.as_str(), ".Call" | ".C" | ".Fortran" | ".External" | ".External2") {
+                            if let Some(args) = n.child_by_field_name("arguments") {
+                                if let Some(sym) = first_arg_symbol(args, bytes) {
+                                    native_calls.push(sym);
+                                }
+                            }
+                        }
                         calls.push(cn);
                     }
                 }
@@ -2688,6 +2677,7 @@ fn metrics_ast(root: &Path, files: &[String], exports: &[String], parser: &mut P
                 n_params,
                 cyclocomp: cyclocomp(rhs, bytes),
                 calls,
+                native_calls,
             });
         }
     }
@@ -3285,7 +3275,7 @@ fn main() {
     let (net, r_edges) = metrics_network(&fn_stats);
     let ws = metrics_whitespace(&root, &files);
     let src_fns = count_src_functions(&root, &files);
-    let ng = metrics_native_graph(&root, &files);
+    let ng = metrics_native_graph(&root, &files, &fn_stats);
     let (cnet, c_edges) = build_src_graph(&root, &files, SrcLang::CFamily);
     let (rnet, rust_edges) = build_src_graph(&root, &files, SrcLang::Rust);
     let (fnet, fortran_edges) = build_src_graph(&root, &files, SrcLang::Fortran);
