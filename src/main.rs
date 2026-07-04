@@ -756,6 +756,934 @@ fn metrics_functions(root: &Path, files: &[String], ns: &Namespace, has_ns: bool
     }
 }
 
+
+// ---- docs --------------------------------------------------------------
+
+struct Docs {
+    dontrun_example_ratio: Option<f64>,
+    undocumented_params_rate: Option<f64>,
+    value_doc_rate: Option<f64>,
+    references_coverage: Option<f64>,
+    roxygen_doc_coverage: Option<f64>,
+    has_readme: bool,
+    readme_prose_length: Option<i64>,
+    has_pkgdown: bool,
+    news_present: bool,
+    news_structure_quality: Option<f64>,
+}
+
+/// Brace-balanced content starting right after a known opening '{' at byte
+/// offset `after_open` in `text`. Handles Rd escapes \{ and \}.
+/// Returns (content, end) where end = byte offset of the closing '}', or
+/// None when braces are unbalanced. Port of docs.R's `.bc`.
+fn rd_brace_content(text: &str, after_open: usize) -> Option<(String, usize)> {
+    let bytes = text.as_bytes();
+    if after_open >= bytes.len() {
+        return None;
+    }
+    let mut depth = 1i32;
+    let mut i = after_open;
+    while i < bytes.len() {
+        let ch = bytes[i];
+        if ch == b'\\' && i + 1 < bytes.len() && (bytes[i + 1] == b'{' || bytes[i + 1] == b'}') {
+            i += 2;
+            continue;
+        }
+        if ch == b'{' {
+            depth += 1;
+        } else if ch == b'}' {
+            depth -= 1;
+            if depth == 0 {
+                return Some((text[after_open..i].to_string(), i));
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+/// First \cmd{...} block in text. Port of docs.R's `.fb`.
+fn rd_first_block(text: &str, cmd: &str) -> Option<(String, usize)> {
+    let pat = format!(r"\\{}\s*\{{", regex::escape(cmd));
+    let re = regex::Regex::new(&pat).ok()?;
+    let m = re.find(text)?;
+    rd_brace_content(text, m.end())
+}
+
+/// All \cmd{...} block contents in text (only successful parses). Port of docs.R's `.ab`.
+fn rd_all_blocks(text: &str, cmd: &str) -> Vec<String> {
+    let pat = format!(r"\\{}\s*\{{", regex::escape(cmd));
+    let Ok(re) = regex::Regex::new(&pat) else { return vec![] };
+    re.find_iter(text)
+        .filter_map(|m| rd_brace_content(text, m.end()).map(|(c, _)| c))
+        .collect()
+}
+
+/// Whether text contains at least one \cmd{ marker. Port of docs.R's `.hc`.
+fn rd_has_block(text: &str, cmd: &str) -> bool {
+    let pat = format!(r"\\{}\s*\{{", regex::escape(cmd));
+    regex::Regex::new(&pat).map(|re| re.is_match(text)).unwrap_or(false)
+}
+
+/// Extract parameter names from \usage block content (approximate).
+/// Port of docs.R's `.uparams`.
+fn rd_usage_params(u: &str) -> Vec<String> {
+    if u.trim().is_empty() {
+        return vec![];
+    }
+    let comment_re = regex::Regex::new(r"%[^\n]*").unwrap();
+    let u = comment_re.replace_all(u, "");
+    let dots_re = regex::Regex::new(r"\\dots|\\ldots").unwrap();
+    let u = dots_re.replace_all(&u, "...");
+    let sig_re = regex::Regex::new(r"[A-Za-z_.][A-Za-z0-9_.]*\s*\(").unwrap();
+    let eq_re = regex::Regex::new(r"\s*=.*$").unwrap();
+
+    let mut params: Vec<String> = Vec::new();
+    for m in sig_re.find_iter(&u) {
+        let after = m.end();
+        if after >= u.len() {
+            continue;
+        }
+        let mut depth = 1i32;
+        let mut end_i: Option<usize> = None;
+        let mut idx = after;
+        for ch in u[after..].chars() {
+            if ch == '(' {
+                depth += 1;
+            } else if ch == ')' {
+                depth -= 1;
+                if depth == 0 {
+                    end_i = Some(idx);
+                    break;
+                }
+            }
+            idx += ch.len_utf8();
+        }
+        let Some(end_i) = end_i else { continue };
+        let sig = &u[after..end_i];
+
+        // Split by top-level commas only (respects nested parentheses).
+        let mut toks: Vec<&str> = Vec::new();
+        let mut d2 = 0i32;
+        let mut ts = 0usize;
+        let mut pos = 0usize;
+        for ch in sig.chars() {
+            match ch {
+                '(' => d2 += 1,
+                ')' => d2 -= 1,
+                ',' if d2 == 0 => {
+                    toks.push(&sig[ts..pos]);
+                    ts = pos + ch.len_utf8();
+                }
+                _ => {}
+            }
+            pos += ch.len_utf8();
+        }
+        if ts < sig.len() {
+            toks.push(&sig[ts..]);
+        }
+
+        for tok in toks {
+            let tok = tok.trim();
+            let pname = eq_re.replace(tok, "");
+            let pname = pname.trim();
+            if pname.is_empty() || pname == "..." {
+                continue;
+            }
+            let first_ok = pname
+                .chars()
+                .next()
+                .map(|c| c.is_ascii_alphabetic() || c == '_' || c == '.')
+                .unwrap_or(false);
+            if !first_ok {
+                continue;
+            }
+            params.push(pname.to_string());
+        }
+    }
+
+    let mut seen = std::collections::HashSet::new();
+    params.retain(|p| seen.insert(p.clone()));
+    params
+}
+
+/// Parameter names documented via \item{name}{} in \arguments content.
+/// Port of docs.R's `.inames`.
+fn rd_arg_names(args_text: &str) -> Vec<String> {
+    let re = regex::Regex::new(r"\\item\s*\{([^{}]*)\}").unwrap();
+    re.captures_iter(args_text)
+        .map(|c| c[1].trim().to_string())
+        .collect()
+}
+
+/// Component-wise version comparison (numeric_version semantics: shorter
+/// versions are zero-padded for comparison).
+fn version_ge(a: &[u64], b: &[u64]) -> bool {
+    let len = a.len().max(b.len());
+    for i in 0..len {
+        let ai = a.get(i).copied().unwrap_or(0);
+        let bi = b.get(i).copied().unwrap_or(0);
+        if ai != bi {
+            return ai > bi;
+        }
+    }
+    true
+}
+
+fn metrics_docs(
+    _desc: &BTreeMap<String, String>,
+    root: &Path,
+    files: &[String],
+    exports: &[String],
+) -> Docs {
+    let rd_files = find_files(files, r"^man/.*\.Rd$");
+    let n_rd = rd_files.len();
+
+    let exports_filtered: Vec<&String> =
+        exports.iter().filter(|e| !e.starts_with("pattern:")).collect();
+
+    // Symbols declared per Rd file (\name + \alias).
+    let mut rd_syms: BTreeMap<&str, Vec<String>> = BTreeMap::new();
+    for f in &rd_files {
+        let text = read(root, f).unwrap_or_default();
+        let mut syms: Vec<String> = rd_all_blocks(&text, "name");
+        syms.extend(rd_all_blocks(&text, "alias"));
+        let syms: Vec<String> = syms.iter().map(|s| s.trim().to_string()).collect();
+        rd_syms.insert(f, syms);
+    }
+
+    // Rd files that document at least one exported symbol.
+    let exports_set: std::collections::HashSet<&str> =
+        exports_filtered.iter().map(|s| s.as_str()).collect();
+    let ex_fn_rd: Vec<&str> = rd_files
+        .iter()
+        .filter(|f| {
+            !exports_set.is_empty()
+                && rd_syms
+                    .get(*f)
+                    .map(|v| v.iter().any(|s| exports_set.contains(s.as_str())))
+                    .unwrap_or(false)
+        })
+        .cloned()
+        .collect();
+
+    // ---- 1. dontrun_example_ratio -------------------------------------------
+    let dontrun_example_ratio = {
+        let rd_ex: Vec<&str> = rd_files
+            .iter()
+            .filter(|f| rd_has_block(&read(root, f).unwrap_or_default(), "examples"))
+            .cloned()
+            .collect();
+        let n_ex = rd_ex.len();
+        if n_ex == 0 {
+            None
+        } else {
+            let dontrun_re = regex::Regex::new(r"^\\don(trun|ttest)\s*\{").unwrap();
+            let n_wrap = rd_ex
+                .iter()
+                .filter(|f| {
+                    let text = read(root, f).unwrap_or_default();
+                    let Some((content, _)) = rd_first_block(&text, "examples") else {
+                        return false;
+                    };
+                    let body = content.trim();
+                    let Some(m2) = dontrun_re.find(body) else {
+                        return false;
+                    };
+                    let Some((_, inner_end)) = rd_brace_content(body, m2.end()) else {
+                        return false;
+                    };
+                    body[(inner_end + 1)..].trim().is_empty()
+                })
+                .count();
+            Some(n_wrap as f64 / n_ex as f64)
+        }
+    };
+
+    // ---- 2. undocumented_params_rate ----------------------------------------
+    let undocumented_params_rate = if ex_fn_rd.is_empty() || exports_filtered.is_empty() {
+        None
+    } else {
+        let rates: Vec<f64> = ex_fn_rd
+            .iter()
+            .filter_map(|f| {
+                let text = read(root, f).unwrap_or_default();
+                let ublk = rd_first_block(&text, "usage")?;
+                let params = rd_usage_params(&ublk.0);
+                if params.is_empty() {
+                    return None;
+                }
+                let ablk = rd_first_block(&text, "arguments");
+                let dnames: Vec<String> =
+                    ablk.map(|(c, _)| rd_arg_names(&c)).unwrap_or_default();
+                let undoc = params.iter().filter(|p| !dnames.contains(p)).count();
+                Some(undoc as f64 / params.len() as f64)
+            })
+            .collect();
+        if rates.is_empty() {
+            None
+        } else {
+            Some(rates.iter().sum::<f64>() / rates.len() as f64)
+        }
+    };
+
+    // ---- 3. value_doc_rate ---------------------------------------------------
+    let value_doc_rate = if ex_fn_rd.is_empty() {
+        None
+    } else {
+        let n = ex_fn_rd
+            .iter()
+            .filter(|f| rd_has_block(&read(root, f).unwrap_or_default(), "value"))
+            .count();
+        Some(n as f64 / ex_fn_rd.len() as f64)
+    };
+
+    // ---- 4. references_coverage ----------------------------------------------
+    let references_coverage = if n_rd == 0 {
+        None
+    } else {
+        let n = rd_files
+            .iter()
+            .filter(|f| rd_has_block(&read(root, f).unwrap_or_default(), "references"))
+            .count();
+        Some(n as f64 / n_rd as f64)
+    };
+
+    // ---- 5. roxygen_doc_coverage ----------------------------------------------
+    let roxygen_doc_coverage = if exports_filtered.is_empty() {
+        None
+    } else {
+        let mut all_syms: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        for v in rd_syms.values() {
+            for s in v {
+                all_syms.insert(s.as_str());
+            }
+        }
+        let n = exports_filtered
+            .iter()
+            .filter(|e| all_syms.contains(e.as_str()))
+            .count();
+        Some(n as f64 / exports_filtered.len() as f64)
+    };
+
+    // ---- 6. has_readme ----------------------------------------------------------
+    let has_readme = exists(files, "README.md") || exists(files, "README.Rmd");
+
+    // ---- 7. readme_prose_length --------------------------------------------------
+    let readme_prose_length = {
+        let rpath = if exists(files, "README.md") {
+            Some("README.md")
+        } else if exists(files, "README.Rmd") {
+            Some("README.Rmd")
+        } else {
+            None
+        };
+        rpath.map(|p| {
+            let text = read(root, p).unwrap_or_default();
+            if text.is_empty() {
+                0i64
+            } else {
+                let fence_re = regex::Regex::new(r"(?s)```[^\n]*\n.*?```").unwrap();
+                let stripped = fence_re.replace_all(&text, "");
+                let badge_re = regex::Regex::new(r"^\s*(\[!\[|<img\s|\[\[img)").unwrap();
+                let text2: String = stripped
+                    .lines()
+                    .filter(|l| !badge_re.is_match(l))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                text2.split_whitespace().count() as i64
+            }
+        })
+    };
+
+    // ---- 8. has_pkgdown -----------------------------------------------------------
+    let has_pkgdown = exists(files, "_pkgdown.yml") || exists(files, "pkgdown/_pkgdown.yml");
+
+    // ---- 9. news_present ------------------------------------------------------------
+    let news_present = exists(files, "NEWS") || exists(files, "NEWS.md");
+
+    // ---- 10. news_structure_quality ---------------------------------------------------
+    let news_structure_quality = {
+        let npath = if exists(files, "NEWS.md") {
+            Some("NEWS.md")
+        } else if exists(files, "NEWS") {
+            Some("NEWS")
+        } else {
+            None
+        };
+        npath.map(|p| {
+            let text = read(root, p).unwrap_or_default();
+            if text.trim().is_empty() {
+                0.0
+            } else {
+                let lns: Vec<&str> = text.lines().collect();
+                let mut n_met = 0i64;
+
+                let ver_hd_re = regex::Regex::new(
+                    r"^(#{1,4}\s[^\n]*\d+\.\d+|[Vv]ersion\s+\d+\.\d+|[Cc]hanges?\s+(in|for)\s+(version\s+)?\d+\.\d+|\d+\.\d+(?:\.\d+)?\s*([-_(]|$))",
+                )
+                .unwrap();
+                let hd_lines: Vec<&str> =
+                    lns.iter().filter(|l| ver_hd_re.is_match(l)).cloned().collect();
+                if !hd_lines.is_empty() {
+                    n_met += 1;
+                }
+
+                let bullet_re = regex::Regex::new(r"^\s*[-*+]\s+\S").unwrap();
+                if lns.iter().any(|l| bullet_re.is_match(l)) {
+                    n_met += 1;
+                }
+
+                if hd_lines.len() >= 2 {
+                    let ver_num_re = regex::Regex::new(r"\d+\.\d+(?:\.\d+)*").unwrap();
+                    let ver_strs: Vec<&str> = hd_lines
+                        .iter()
+                        .flat_map(|l| ver_num_re.find_iter(l).map(|m| m.as_str()))
+                        .collect();
+                    if ver_strs.len() >= 2 {
+                        let parsed: Option<Vec<Vec<u64>>> = ver_strs
+                            .iter()
+                            .map(|v| {
+                                v.split('.')
+                                    .map(|p| p.parse::<u64>().ok())
+                                    .collect::<Option<Vec<u64>>>()
+                            })
+                            .collect();
+                        if let Some(vers) = parsed {
+                            let all_desc = vers.windows(2).all(|w| version_ge(&w[0], &w[1]));
+                            if all_desc {
+                                n_met += 1;
+                            }
+                        }
+                    }
+                }
+
+                n_met as f64 / 3.0
+            }
+        })
+    };
+
+    Docs {
+        dontrun_example_ratio,
+        undocumented_params_rate,
+        value_doc_rate,
+        references_coverage,
+        roxygen_doc_coverage,
+        has_readme,
+        readme_prose_length,
+        has_pkgdown,
+        news_present,
+        news_structure_quality,
+    }
+}
+
+// ---- health -----------------------------------------------------------------
+
+struct Health {
+    on_exit_coverage_rate: Option<f64>,
+    global_state_write_density: Option<f64>,
+    deprecated_idiom_density: Option<f64>,
+    debug_artifact_density: Option<f64>,
+    has_code_of_conduct: bool,
+    has_contributing_guide: bool,
+}
+
+/// Strip a single-line comment (rough: ignores '#' inside strings), matching
+/// R's `sub("#.*$", "", line)`.
+fn strip_comment_line(line: &str) -> String {
+    match line.find('#') {
+        Some(idx) => line[..idx].to_string(),
+        None => line.to_string(),
+    }
+}
+
+fn n_open(s: &str) -> i64 {
+    s.matches('{').count() as i64
+}
+
+fn n_close(s: &str) -> i64 {
+    s.matches('}').count() as i64
+}
+
+/// Extract top-level function bodies from raw lines (comments stripped
+/// internally). Brace tracking scans up to 15 lines ahead for the opening
+/// '{', handling multi-line argument lists. Nested function bodies are
+/// absorbed into the enclosing body and are NOT separately extracted. This
+/// is a conservative heuristic (rare false positives/negatives possible),
+/// ported faithfully from extract_function_bodies() in health.R.
+fn extract_function_bodies(lines: &[String]) -> Vec<Vec<String>> {
+    let fn_re = regex::Regex::new(r"\bfunction\s*\(").unwrap();
+    let stripped: Vec<String> = lines.iter().map(|l| strip_comment_line(l)).collect();
+    let n = stripped.len();
+    let mut bodies: Vec<Vec<String>> = Vec::new();
+    let mut i = 0usize;
+
+    while i < n {
+        if !fn_re.is_match(&stripped[i]) {
+            i += 1;
+            continue;
+        }
+
+        // Locate the opening '{' (handles multi-line signatures).
+        let end_k = (i + 15).min(n - 1);
+        let mut brace_at: Option<usize> = None;
+        for k in i..=end_k {
+            if n_open(&stripped[k]) > 0 {
+                brace_at = Some(k);
+                break;
+            }
+        }
+
+        let Some(brace_at) = brace_at else {
+            // No '{' found within look-ahead: single-expression body.
+            bodies.push(vec![stripped[i].clone()]);
+            i += 1;
+            continue;
+        };
+
+        // Collect signature lines plus body until brace depth returns to 0.
+        let mut body_lines: Vec<String> = stripped[i..=brace_at].to_vec();
+        let mut depth: i64 = body_lines.iter().map(|l| n_open(l) - n_close(l)).sum();
+        let mut j = brace_at + 1;
+
+        while j < n && depth > 0 {
+            let l = stripped[j].clone();
+            depth += n_open(&l) - n_close(&l);
+            body_lines.push(l);
+            j += 1;
+        }
+
+        bodies.push(body_lines);
+        i = j; // continue from the first line after the closing '}'
+    }
+    bodies
+}
+
+// Patterns that indicate a function body mutates shared/global state.
+// options()/par() with a named argument (=) are setters; bare calls are getters.
+// Connection-opening functions are included because unclosed connections
+// affect global file-descriptor state.
+const MUTATOR_PATS: &[&str] = &[
+    "<<-",
+    r"\boptions\s*\([^)]*=",
+    r"\bpar\s*\([^)]*=",
+    r"\bsetwd\s*\(",
+    r"\bSys\.setenv\s*\(",
+    r"\bsink\s*\(",
+    r"\bfile\s*\(",
+    r"\burl\s*\(",
+    r"\bpipe\s*\(",
+    r"\bgzfile\s*\(",
+    r"\bbzfile\s*\(",
+    r"\bxzfile\s*\(",
+    r"\btextConnection\s*\(",
+];
+
+fn body_has_mutator(body: &[String], mutator_res: &[regex::Regex]) -> bool {
+    let txt = body.join("\n");
+    mutator_res.iter().any(|re| re.is_match(&txt))
+}
+
+fn body_has_on_exit(body: &[String], on_exit_re: &regex::Regex) -> bool {
+    on_exit_re.is_match(&body.join("\n"))
+}
+
+fn metrics_health(_desc: &BTreeMap<String, String>, root: &Path, files: &[String]) -> Health {
+    // ---- R/ file inventory ----
+    let r_files = find_files(files, r"^R/.*\.R$");
+    let mut r_loc: i64 = 0;
+    let mut file_lines: Vec<Vec<String>> = Vec::new();
+    for &f in &r_files {
+        let content = read(root, f).unwrap_or_default();
+        r_loc += loc(&content) as i64;
+        file_lines.push(content.lines().map(|l| l.to_string()).collect());
+    }
+    let kloc_r = if r_loc > 0 { r_loc as f64 / 1000.0 } else { 0.0 };
+
+    // ---- on_exit_coverage_rate ----
+    // Fraction of R/ function bodies that both mutate global/shared state AND
+    // call on.exit(). None when no function mutates state (denominator = 0).
+    let mutator_res: Vec<regex::Regex> =
+        MUTATOR_PATS.iter().map(|p| regex::Regex::new(p).unwrap()).collect();
+    let on_exit_re = regex::Regex::new(r"\bon\.exit\s*\(").unwrap();
+
+    let mut n_mutating: i64 = 0;
+    let mut n_on_exit: i64 = 0;
+    for lns in &file_lines {
+        if lns.is_empty() {
+            continue;
+        }
+        for body in extract_function_bodies(lns) {
+            if body_has_mutator(&body, &mutator_res) {
+                n_mutating += 1;
+                if body_has_on_exit(&body, &on_exit_re) {
+                    n_on_exit += 1;
+                }
+            }
+        }
+    }
+    let on_exit_coverage_rate =
+        (n_mutating != 0).then(|| n_on_exit as f64 / n_mutating as f64);
+
+    // ---- global_state_write_density ----
+    // Per KLOC of R/: <<-, assign()-to-global, options() setters, Sys.setenv().
+    // Each grepl() sum below counts matching LINES (not total occurrences).
+    let superassign_re = regex::Regex::new("<<-").unwrap();
+    let assign_global_re = regex::Regex::new(
+        r"\bassign\s*\([^)]*(?:\.GlobalEnv|globalenv\s*\(|baseenv\s*\()",
+    )
+    .unwrap();
+    let options_setter_re = regex::Regex::new(r"\boptions\s*\([^)]*=").unwrap();
+    let sys_setenv_re = regex::Regex::new(r"\bSys\.setenv\s*\(").unwrap();
+
+    let global_state_write_density = (r_loc != 0).then(|| {
+        let mut cnt: i64 = 0;
+        for lns in &file_lines {
+            let stripped: Vec<String> = lns.iter().map(|l| strip_comment_line(l)).collect();
+            cnt += stripped.iter().filter(|l| superassign_re.is_match(l)).count() as i64;
+            cnt += stripped.iter().filter(|l| assign_global_re.is_match(l)).count() as i64;
+            cnt += stripped.iter().filter(|l| options_setter_re.is_match(l)).count() as i64;
+            cnt += stripped.iter().filter(|l| sys_setenv_re.is_match(l)).count() as i64;
+        }
+        cnt as f64 / kloc_r
+    });
+
+    // ---- deprecated_idiom_density ----
+    // Per KLOC of R/: bare T/F, 1:length/nrow/ncol, require()/library() inside
+    // function bodies (indentation heuristic), .Internal(). Line-count based,
+    // like above. The bare T/F pattern needs lookaround -> fancy_regex.
+    let bare_tf_re =
+        fancy_regex::Regex::new(r"(?<![A-Za-z0-9_.])[TF](?![A-Za-z0-9_.=])").unwrap();
+    let seq_re = regex::Regex::new(r"\b1:(?:length|nrow|ncol)\s*\(").unwrap();
+    let indent_re = regex::Regex::new(r"^[ \t]{2,}").unwrap();
+    let req_lib_re = regex::Regex::new(r"\b(?:require|library)\s*\(").unwrap();
+    let internal_re = regex::Regex::new(r"\.Internal\s*\(").unwrap();
+
+    let deprecated_idiom_density = (r_loc != 0).then(|| {
+        let mut cnt: i64 = 0;
+        for lns in &file_lines {
+            let stripped: Vec<String> = lns.iter().map(|l| strip_comment_line(l)).collect();
+            cnt += stripped
+                .iter()
+                .filter(|l| bare_tf_re.is_match(l).unwrap_or(false))
+                .count() as i64;
+            cnt += stripped.iter().filter(|l| seq_re.is_match(l)).count() as i64;
+            cnt += stripped
+                .iter()
+                .filter(|l| indent_re.is_match(l) && req_lib_re.is_match(l))
+                .count() as i64;
+            cnt += stripped.iter().filter(|l| internal_re.is_match(l)).count() as i64;
+        }
+        cnt as f64 / kloc_r
+    });
+
+    // ---- debug_artifact_density ----
+    // Per KLOC of R/ (test files live in tests/, not R/). Detects browser()
+    // and stray print()/cat() at statement position; lines that also contain
+    // message()/warning()/stop() are excluded (intentional output contexts).
+    let browser_re = regex::Regex::new(r"^\s*browser\s*\(\s*\)").unwrap();
+    let warn_ctx_re = regex::Regex::new(r"\b(?:message|warning|stop)\s*\(").unwrap();
+    let print_cat_re = regex::Regex::new(r"^\s*(?:print|cat)\s*\(").unwrap();
+
+    let debug_artifact_density = (r_loc != 0).then(|| {
+        let mut cnt: i64 = 0;
+        for lns in &file_lines {
+            let stripped: Vec<String> = lns.iter().map(|l| strip_comment_line(l)).collect();
+            cnt += stripped.iter().filter(|l| browser_re.is_match(l)).count() as i64;
+            cnt += stripped
+                .iter()
+                .filter(|l| print_cat_re.is_match(l) && !warn_ctx_re.is_match(l))
+                .count() as i64;
+        }
+        cnt as f64 / kloc_r
+    });
+
+    // ---- community health files ----
+    let has_code_of_conduct =
+        exists(files, "CODE_OF_CONDUCT.md") || exists(files, ".github/CODE_OF_CONDUCT.md");
+    let has_contributing_guide =
+        exists(files, "CONTRIBUTING.md") || exists(files, ".github/CONTRIBUTING.md");
+
+    Health {
+        on_exit_coverage_rate,
+        global_state_write_density,
+        deprecated_idiom_density,
+        debug_artifact_density,
+        has_code_of_conduct,
+        has_contributing_guide,
+    }
+}
+
+/// One parsed `person()` call (Authors@R) or one parsed free-text Author entry.
+struct Person {
+    given: Option<String>,
+    family: Option<String>,
+    roles: Vec<String>,
+}
+
+struct Meta {
+    maintainer: Option<String>,
+    maintainer_email: Option<String>,
+    n_authors: Option<i64>,
+    /// Pre-serialized JSON array of {given,family,roles} objects, matching the
+    /// `as.character(jsonlite::toJSON(parsed, auto_unbox = TRUE))`. we store this
+    /// as a character scalar containing JSON text (double-encoded when embedded in
+    /// the outer summary object), so this is a String, not a Vec<String>.
+    authors: Option<String>,
+}
+
+/// Extract the inner content of each top-level `person(...)` call in an
+/// Authors@R string, tracking balanced parens/quotes (port of .meta_person_inners).
+fn meta_person_inners(text: &str) -> Vec<String> {
+    let t = text.trim();
+    if t.is_empty() {
+        return Vec::new();
+    }
+    let person_re = regex::Regex::new(r"\bperson\s*\(").unwrap();
+    let mut result = Vec::new();
+    let mut remaining: Vec<char> = t.chars().collect();
+    loop {
+        let remaining_str: String = remaining.iter().collect();
+        let Some(m) = person_re.find(&remaining_str) else { break };
+        let m_start_chars = remaining_str[..m.start()].chars().count();
+        let m_len_chars = remaining_str[m.start()..m.end()].chars().count();
+        let n = remaining.len();
+        let open_pos = m_start_chars + m_len_chars - 1; // index of "("
+        let start = open_pos + 1; // first char inside "("
+        let mut depth: i32 = 1;
+        let mut pos = start;
+        let mut in_dq = false;
+        let mut in_sq = false;
+        while pos < n && depth > 0 {
+            let ch = remaining[pos];
+            if !in_sq && ch == '"' {
+                in_dq = !in_dq;
+            } else if !in_dq && ch == '\'' {
+                in_sq = !in_sq;
+            } else if !in_dq && !in_sq {
+                if ch == '(' {
+                    depth += 1;
+                } else if ch == ')' {
+                    depth -= 1;
+                }
+            }
+            pos += 1;
+        }
+        let inner: String = if pos > start {
+            remaining[start..(pos - 1)].iter().collect()
+        } else {
+            String::new()
+        };
+        result.push(inner);
+        remaining = remaining[pos.min(n)..].to_vec();
+    }
+    result
+}
+
+/// First capture group of the first match, or None (port of .cap1).
+fn cap1(re: &regex::Regex, text: &str) -> Option<String> {
+    re.captures(text).and_then(|c| c.get(1)).map(|m| m.as_str().to_string())
+}
+
+/// All quoted (single- or double-) string contents in `text`, outer quotes
+/// stripped (port of .extract_quoted).
+fn extract_quoted(text: &str) -> Vec<String> {
+    let re = regex::Regex::new(r#""[^"]*"|'[^']*'"#).unwrap();
+    re.find_iter(text)
+        .map(|m| {
+            let s = m.as_str();
+            s[1..s.len() - 1].to_string()
+        })
+        .collect()
+}
+
+/// Parse the inner content of a single person() call: named given/family/role
+/// first, falling back to positional quoted strings (port of .meta_parse_person).
+fn meta_parse_person(inner: &str) -> Person {
+    let mut given: Option<String> = None;
+    let mut family: Option<String> = None;
+    let mut roles: Vec<String> = Vec::new();
+
+    let gd_re = regex::Regex::new(r#"(?:given|first)\s*=\s*"([^"]*)""#).unwrap();
+    let gs_re = regex::Regex::new(r"(?:given|first)\s*=\s*'([^']*)'").unwrap();
+    if let Some(g) = cap1(&gd_re, inner).or_else(|| cap1(&gs_re, inner)) {
+        given = Some(g);
+    }
+
+    let fd_re = regex::Regex::new(r#"(?:family|last)\s*=\s*"([^"]*)""#).unwrap();
+    let fs_re = regex::Regex::new(r"(?:family|last)\s*=\s*'([^']*)'").unwrap();
+    if let Some(f) = cap1(&fd_re, inner).or_else(|| cap1(&fs_re, inner)) {
+        family = Some(f);
+    }
+
+    let role_c_re = regex::Regex::new(r"role\s*=\s*c\(([^)]*)\)").unwrap();
+    if let Some(c) = role_c_re.captures(inner) {
+        let role_content = c.get(1).map(|m| m.as_str()).unwrap_or("");
+        roles = extract_quoted(role_content);
+    } else {
+        let rd_re = regex::Regex::new(r#"role\s*=\s*"([^"]*)""#).unwrap();
+        let rs_re = regex::Regex::new(r"role\s*=\s*'([^']*)'").unwrap();
+        if let Some(r) = cap1(&rd_re, inner).or_else(|| cap1(&rs_re, inner)) {
+            roles = vec![r];
+        }
+    }
+
+    if given.is_none() || family.is_none() {
+        let named_c_re = regex::Regex::new(r"[A-Za-z_.][A-Za-z0-9_.]*\s*=\s*c\([^)]*\)").unwrap();
+        let named_val_re =
+            regex::Regex::new(r#"[A-Za-z_.][A-Za-z0-9_.]*\s*=\s*(?:"[^"]*"|'[^']*')"#).unwrap();
+        let cleaned = named_c_re.replace_all(inner, "");
+        let cleaned = named_val_re.replace_all(&cleaned, "");
+        let pos_strs: Vec<String> =
+            extract_quoted(&cleaned).into_iter().filter(|s| !s.is_empty()).collect();
+        if given.is_none() && !pos_strs.is_empty() {
+            given = Some(pos_strs[0].clone());
+        }
+        if family.is_none() && pos_strs.len() >= 2 {
+            family = Some(pos_strs[1].clone());
+        }
+    }
+
+    Person { given, family, roles }
+}
+
+/// Parse the free-text Author field into person entries: split on commas/"and"
+/// (protecting commas inside `[roles]`), strip email, pull `[roles]`, then split
+/// remaining words into given/family (port of .meta_parse_author_text).
+fn meta_parse_author_text(text: &str) -> Vec<Person> {
+    let t = text.trim();
+    if t.is_empty() {
+        return Vec::new();
+    }
+
+    // Protect commas inside [...] blocks before splitting on comma/and.
+    let bracket_re = regex::Regex::new(r"\[[^\]]+\]").unwrap();
+    let mut protected = String::with_capacity(t.len());
+    let mut last = 0usize;
+    for m in bracket_re.find_iter(t) {
+        protected.push_str(&t[last..m.start()]);
+        protected.push_str(&m.as_str().replace(',', "\u{1}"));
+        last = m.end();
+    }
+    protected.push_str(&t[last..]);
+
+    let split_re = regex::Regex::new(r"\s*,\s*|\s+and\s+").unwrap();
+    let parts: Vec<String> = split_re
+        .split(&protected)
+        .map(|p| p.trim().replace('\u{1}', ","))
+        .filter(|p| !p.is_empty())
+        .collect();
+
+    let email_re = regex::Regex::new(r"\s*<[^>]*>").unwrap();
+    let role_re = regex::Regex::new(r"\[([^\]]+)\]").unwrap();
+    let bracket_strip_re = regex::Regex::new(r"\s*\[[^\]]*\]").unwrap();
+    let ws_re = regex::Regex::new(r"\s+").unwrap();
+
+    parts
+        .iter()
+        .map(|raw_entry| {
+            let mut entry = email_re.replace(raw_entry, "").into_owned();
+            let mut roles: Vec<String> = Vec::new();
+            if let Some(c) = role_re.captures(&entry) {
+                let role_str = c.get(1).unwrap().as_str().to_string();
+                roles = role_str
+                    .split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect();
+                entry = bracket_strip_re.replace(&entry, "").trim().to_string();
+            }
+            let name_parts: Vec<&str> =
+                ws_re.split(entry.trim()).filter(|s| !s.is_empty()).collect();
+            let n = name_parts.len();
+            let (given, family) = if n == 0 {
+                (None, None)
+            } else if n == 1 {
+                (None, Some(name_parts[0].to_string()))
+            } else {
+                (Some(name_parts[..n - 1].join(" ")), Some(name_parts[n - 1].to_string()))
+            };
+            Person { given, family, roles }
+        })
+        .collect()
+}
+
+/// A JSON string literal for `v`, or the bare token `null` (jsonlite na="null").
+fn json_str_or_null(v: &Option<String>) -> String {
+    match v {
+        Some(s) => serde_json::to_string(s).unwrap(),
+        None => "null".to_string(),
+    }
+}
+
+/// Compact JSON array of person objects, field order given/family/roles, matching
+/// jsonlite::toJSON(parsed, auto_unbox = TRUE) byte-for-byte (roles always an
+/// array via I(); given/family unboxed strings or null).
+fn persons_to_json(persons: &[Person]) -> String {
+    let items: Vec<String> = persons
+        .iter()
+        .map(|p| {
+            let given = json_str_or_null(&p.given);
+            let family = json_str_or_null(&p.family);
+            let roles = serde_json::to_string(&p.roles).unwrap();
+            format!("{{\"given\":{given},\"family\":{family},\"roles\":{roles}}}")
+        })
+        .collect();
+    format!("[{}]", items.join(","))
+}
+
+/// Compute maintainer/author metadata metrics for a package version
+/// (port of metrics_meta, minus n_deps_direct/dep_list which main.rs already
+/// computes directly off the DESCRIPTION DCF map).
+fn metrics_meta(desc: &BTreeMap<String, String>, _root: &Path, _files: &[String]) -> Meta {
+    // NB: whether DESCRIPTION exists at all vs. exists-but-lacks-these-fields
+    // converges to the same NA outcome below, so no `exists(files, "DESCRIPTION")`
+    // check is needed here (unlike n_deps_direct, where empty-vs-absent differ).
+
+    // ---- maintainer --------------------------------------------------------
+    let maint_raw = desc.get("Maintainer").map(|s| s.trim()).unwrap_or("");
+    let (maintainer, maintainer_email) = if maint_raw.is_empty() {
+        (None, None)
+    } else {
+        let email_re = regex::Regex::new(r"<([^>]+)>").unwrap();
+        if let Some(c) = email_re.captures(maint_raw) {
+            let email = c.get(1).unwrap().as_str().to_string();
+            let strip_re = regex::Regex::new(r"\s*<[^>]*>.*").unwrap();
+            let name_part = strip_re.replace(maint_raw, "").trim().to_string();
+            let maintainer = if name_part.is_empty() { None } else { Some(name_part) };
+            (maintainer, Some(email))
+        } else {
+            (Some(maint_raw.to_string()), None)
+        }
+    };
+
+    // ---- authors ------------------------------------------------------------
+    let ar_text = desc.get("Authors@R").map(|s| s.trim()).unwrap_or("");
+    let (n_authors, authors) = if !ar_text.is_empty() {
+        let inners = meta_person_inners(ar_text);
+        if inners.is_empty() {
+            (None, None)
+        } else {
+            let persons: Vec<Person> = inners.iter().map(|inner| meta_parse_person(inner)).collect();
+            (Some(persons.len() as i64), Some(persons_to_json(&persons)))
+        }
+    } else {
+        let au_text = desc.get("Author").map(|s| s.trim()).unwrap_or("");
+        if au_text.is_empty() {
+            (None, None)
+        } else {
+            let persons = meta_parse_author_text(au_text);
+            if persons.is_empty() {
+                (None, None)
+            } else {
+                (Some(persons.len() as i64), Some(persons_to_json(&persons)))
+            }
+        }
+    };
+
+    Meta { maintainer, maintainer_email, n_authors, authors }
+}
+
 // ---- main -------------------------------------------------------------------
 
 fn main() {
@@ -834,6 +1762,9 @@ fn main() {
     let legal = metrics_legal(&desc, &root, &files);
     let port = metrics_portability(&desc, &root, &files);
     let tests = metrics_tests(&desc, &root, &files, &ns.exports);
+    let docs = metrics_docs(&desc, &root, &files, &ns.exports);
+    let health = metrics_health(&desc, &root, &files);
+    let meta = metrics_meta(&desc, &root, &files);
 
     // --- emit NDJSON ---
     let summary = serde_json::json!({
@@ -863,6 +1794,26 @@ fn main() {
         "ci_type": tests.ci_type,
         "ci_matrix_breadth": tests.ci_matrix_breadth,
         "ci_pr_gated": tests.ci_pr_gated,
+        "dontrun_example_ratio": docs.dontrun_example_ratio,
+        "undocumented_params_rate": docs.undocumented_params_rate,
+        "value_doc_rate": docs.value_doc_rate,
+        "references_coverage": docs.references_coverage,
+        "roxygen_doc_coverage": docs.roxygen_doc_coverage,
+        "has_readme": docs.has_readme,
+        "readme_prose_length": docs.readme_prose_length,
+        "has_pkgdown": docs.has_pkgdown,
+        "news_present": docs.news_present,
+        "news_structure_quality": docs.news_structure_quality,
+        "on_exit_coverage_rate": health.on_exit_coverage_rate,
+        "global_state_write_density": health.global_state_write_density,
+        "deprecated_idiom_density": health.deprecated_idiom_density,
+        "debug_artifact_density": health.debug_artifact_density,
+        "has_code_of_conduct": health.has_code_of_conduct,
+        "has_contributing_guide": health.has_contributing_guide,
+        "maintainer": meta.maintainer,
+        "maintainer_email": meta.maintainer_email,
+        "n_authors": meta.n_authors,
+        "authors": meta.authors,
         "n_files": n_files,
         "loc_total": loc_total,
         "loc_r": loc_r,
