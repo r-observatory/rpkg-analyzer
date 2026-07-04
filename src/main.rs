@@ -2004,17 +2004,175 @@ fn metrics_security(desc: &BTreeMap<String, String>, root: &Path, files: &[Strin
     }
 }
 
+// ---- AST: per-function stats + OO kinds -------------------------------------
+
+struct FnStat {
+    name: String,
+    exported: bool,
+    file: String,
+    line: usize,
+    loc: usize,
+    n_params: i64,
+    cyclocomp: i64,
+}
+
+#[derive(Default)]
+struct Oo {
+    s4_classes: i64,
+    s4_generics: i64,
+    s4_methods: i64,
+    r6_classes: i64,
+    rc_classes: i64,
+    s7_classes: i64,
+    uses_usemethod: bool,
+}
+
+fn call_fn_name(call: &tree_sitter::Node, bytes: &[u8]) -> Option<String> {
+    let f = call.child_by_field_name("function")?;
+    match f.kind() {
+        "identifier" => f.utf8_text(bytes).ok().map(str::to_string),
+        // e.g. R6::R6Class -> take the rhs symbol
+        "namespace_operator" => f
+            .child_by_field_name("rhs")
+            .and_then(|r| r.utf8_text(bytes).ok())
+            .map(str::to_string),
+        _ => None,
+    }
+}
+
+/// Cyclomatic complexity: 1 + decision points (if/for/while/repeat, && and ||).
+fn cyclocomp(node: tree_sitter::Node, bytes: &[u8]) -> i64 {
+    let mut c = 1i64;
+    let mut st = vec![node];
+    while let Some(n) = st.pop() {
+        match n.kind() {
+            "if_statement" | "for_statement" | "while_statement" | "repeat_statement" => c += 1,
+            "binary_operator" => {
+                if let Some(op) = n.child_by_field_name("operator").or_else(|| n.child(1)) {
+                    let t = op.utf8_text(bytes).unwrap_or("");
+                    if t == "&&" || t == "||" {
+                        c += 1;
+                    }
+                }
+            }
+            _ => {}
+        }
+        let mut cur = n.walk();
+        for ch in n.children(&mut cur) {
+            st.push(ch);
+        }
+    }
+    c
+}
+
+fn mean_i(v: &[i64]) -> Option<f64> {
+    (!v.is_empty()).then(|| v.iter().sum::<i64>() as f64 / v.len() as f64)
+}
+fn median_i(v: &[i64]) -> Option<f64> {
+    if v.is_empty() {
+        return None;
+    }
+    let mut s = v.to_vec();
+    s.sort_unstable();
+    let n = s.len();
+    Some(if n % 2 == 1 {
+        s[n / 2] as f64
+    } else {
+        (s[n / 2 - 1] + s[n / 2]) as f64 / 2.0
+    })
+}
+
+fn metrics_ast(root: &Path, files: &[String], exports: &[String], parser: &mut Parser) -> (Vec<FnStat>, Oo) {
+    let r_files = find_files(files, r"^R/.*\.[Rr]$");
+    let exported: std::collections::HashSet<&str> = exports.iter().map(String::as_str).collect();
+    let mut fns = Vec::new();
+    let mut oo = Oo::default();
+    for f in &r_files {
+        let Some(content) = read(root, f) else { continue };
+        let Some(tree) = parser.parse(&content, None) else { continue };
+        let bytes = content.as_bytes();
+        let rootn = tree.root_node();
+
+        // OO kinds: scan every call in the file.
+        let mut st = vec![rootn];
+        while let Some(n) = st.pop() {
+            if n.kind() == "call" {
+                if let Some(name) = call_fn_name(&n, bytes) {
+                    match name.as_str() {
+                        "setClass" => oo.s4_classes += 1,
+                        "setGeneric" => oo.s4_generics += 1,
+                        "setMethod" => oo.s4_methods += 1,
+                        "setRefClass" => oo.rc_classes += 1,
+                        "R6Class" => oo.r6_classes += 1,
+                        "new_class" => oo.s7_classes += 1,
+                        "UseMethod" => oo.uses_usemethod = true,
+                        _ => {}
+                    }
+                }
+            }
+            let mut cur = n.walk();
+            for ch in n.children(&mut cur) {
+                st.push(ch);
+            }
+        }
+
+        // Per-function: top-level `name <- function(...)` assignments.
+        let mut cur = rootn.walk();
+        for child in rootn.children(&mut cur) {
+            if child.kind() != "binary_operator" {
+                continue;
+            }
+            let Some(rhs) = child.child_by_field_name("rhs") else { continue };
+            if rhs.kind() != "function_definition" {
+                continue;
+            }
+            let name = child
+                .child_by_field_name("lhs")
+                .and_then(|l| l.utf8_text(bytes).ok())
+                .unwrap_or("")
+                .to_string();
+            let n_params = rhs
+                .child_by_field_name("parameters")
+                .map(|p| {
+                    let mut pc = p.walk();
+                    p.children(&mut pc).filter(|c| c.kind() == "parameter").count() as i64
+                })
+                .unwrap_or(0);
+            fns.push(FnStat {
+                exported: exported.contains(name.as_str()),
+                name,
+                file: f.to_string(),
+                line: rhs.start_position().row + 1,
+                loc: rhs.end_position().row - rhs.start_position().row + 1,
+                n_params,
+                cyclocomp: cyclocomp(rhs, bytes),
+            });
+        }
+    }
+    (fns, oo)
+}
+
 // ---- main -------------------------------------------------------------------
 
 fn main() {
     let dir = std::env::args().nth(1).expect("usage: rpkg-analyzer <package_dir>");
-    let root = PathBuf::from(&dir);
-    let files = list_files(&root);
 
     let mut parser = Parser::new();
     parser
         .set_language(&tree_sitter_r::LANGUAGE.into())
         .expect("load tree-sitter-r");
+
+    // Debug: --sexp <file.R> prints the parse tree, for learning node kinds.
+    if dir == "--sexp" {
+        let f = std::env::args().nth(2).expect("--sexp <file>");
+        let src = std::fs::read_to_string(&f).expect("read");
+        let tree = parser.parse(&src, None).expect("parse");
+        println!("{}", tree.root_node().to_sexp());
+        return;
+    }
+
+    let root = PathBuf::from(&dir);
+    let files = list_files(&root);
 
     // --- structure ---
     let n_files = files.len();
@@ -2130,6 +2288,15 @@ fn main() {
     let has_ns = exists(&files, "NAMESPACE");
     let funcs = metrics_functions(&root, &files, &ns, has_ns, &package);
 
+    // AST-derived per-function stats + OO kinds (new v2 metrics).
+    let (fn_stats, oo) = metrics_ast(&root, &files, &ns.exports, &mut parser);
+    let fn_locs: Vec<i64> = fn_stats.iter().map(|f| f.loc as i64).collect();
+    let fn_cyclos: Vec<i64> = fn_stats.iter().map(|f| f.cyclocomp).collect();
+    let exp_params: Vec<i64> =
+        fn_stats.iter().filter(|f| f.exported).map(|f| f.n_params).collect();
+    let n_fns_r = fn_stats.len();
+    let n_fns_r_exported = fn_stats.iter().filter(|f| f.exported).count();
+
     // --- legal + portability + tests ---
     let legal = metrics_legal(&desc, &root, &files);
     let port = metrics_portability(&desc, &root, &files);
@@ -2210,6 +2377,24 @@ fn main() {
         "nse_surface_frac": funcs.nse_surface_frac,
         "triple_colon_count": funcs.triple_colon_count,
         "triple_colon_pkgs": funcs.triple_colon_pkgs,
+        "n_fns_r": n_fns_r,
+        "n_fns_r_exported": n_fns_r_exported,
+        "n_fns_r_not_exported": n_fns_r - n_fns_r_exported,
+        "loc_per_fn_mean": mean_i(&fn_locs),
+        "loc_per_fn_median": median_i(&fn_locs),
+        "npars_exported_mean": mean_i(&exp_params),
+        "npars_exported_median": median_i(&exp_params),
+        "cyclocomp_mean": mean_i(&fn_cyclos),
+        "cyclocomp_median": median_i(&fn_cyclos),
+        "cyclocomp_max": fn_cyclos.iter().max().copied(),
+        "n_s4_classes": oo.s4_classes,
+        "n_s4_generics": oo.s4_generics,
+        "n_s4_methods": oo.s4_methods,
+        "n_r6_classes": oo.r6_classes,
+        "n_rc_classes": oo.rc_classes,
+        "n_s7_classes": oo.s7_classes,
+        "n_s3_methods": ns.s3_methods,
+        "uses_usemethod": oo.uses_usemethod,
         "n_deps_direct": n_deps_direct,
         "dep_list": deps,
         "has_additional_repositories": !additional_repositories.is_empty(),
@@ -2245,6 +2430,16 @@ fn main() {
     }
     for e in &ns.exports {
         println!("{}", serde_json::json!({"rec": "export", "symbol": e}));
+    }
+    for fnst in &fn_stats {
+        println!(
+            "{}",
+            serde_json::json!({
+                "rec": "function", "name": fnst.name, "exported": fnst.exported,
+                "file": fnst.file, "line": fnst.line, "loc": fnst.loc,
+                "n_params": fnst.n_params, "cyclocomp": fnst.cyclocomp,
+            })
+        );
     }
     // Full parsed DESCRIPTION as a raw intermediate: every field is preserved,
     // modeled or not, so future metrics derive from stored data without re-cloning.
