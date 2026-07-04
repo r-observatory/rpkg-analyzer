@@ -1,3 +1,4 @@
+#![recursion_limit = "512"]
 // rpkg-analyzer: a pure function of one extracted R package source tree.
 // Reads a directory, emits newline-delimited JSON metric records on stdout.
 // This first cut covers the structure, DESCRIPTION (DCF), and NAMESPACE groups,
@@ -407,6 +408,209 @@ fn metrics_portability(desc: &BTreeMap<String, String>, root: &Path, files: &[St
     }
 }
 
+// ---- tests + CI -------------------------------------------------------------
+
+fn exists(files: &[String], p: &str) -> bool {
+    files.iter().any(|f| f == p)
+}
+
+fn loc_sum(root: &Path, paths: &[&str]) -> usize {
+    paths.iter().filter_map(|p| read(root, p)).map(|c| loc(&c)).sum()
+}
+
+/// Values from YAML inline-array syntax `key: [a, b, 'c']`. `key` may be a regex.
+fn yaml_inline_array(content: &str, key: &str) -> Vec<String> {
+    if content.is_empty() {
+        return vec![];
+    }
+    let re = regex::Regex::new(&format!(r"(?m)^\s+{key}:\s*\[([^\]]+)\]")).unwrap();
+    let mut vals = Vec::new();
+    for cap in re.captures_iter(content) {
+        for part in cap[1].split(',') {
+            let v: String = part.trim().chars().filter(|c| !matches!(c, '"' | '\'' | '`')).collect();
+            if !v.is_empty() {
+                vals.push(v);
+            }
+        }
+    }
+    let mut seen = std::collections::HashSet::new();
+    vals.retain(|v| seen.insert(v.clone()));
+    vals
+}
+
+/// Distinct (os, r-version) matrix combinations across GHA workflow files.
+fn gha_matrix_breadth(root: &Path, ci_yml: &[&str]) -> i64 {
+    if ci_yml.is_empty() {
+        return 0;
+    }
+    let pair_re = regex::Regex::new(r"\{[^}\n]*\bos:\s*[^}\n]+\}").unwrap();
+    let os_re = regex::Regex::new(r#"\bos:\s*['"]?([^,'"{}\s]+)"#).unwrap();
+    let r_re = regex::Regex::new(r#"\br(?:-version)?:\s*['"]?([^,'"{}\s]+)"#).unwrap();
+    let mut max_b = 0i64;
+    for f in ci_yml {
+        let Some(content) = read(root, f) else { continue };
+        if content.is_empty() {
+            continue;
+        }
+        let os_vals = yaml_inline_array(&content, "os");
+        let r_vals = yaml_inline_array(&content, "r(?:-version)?");
+        let cross = if !os_vals.is_empty() && !r_vals.is_empty() {
+            (os_vals.len() * r_vals.len()) as i64
+        } else {
+            os_vals.len().max(r_vals.len()) as i64
+        };
+        let mut combos = Vec::new();
+        for pm in pair_re.find_iter(&content) {
+            let pair = pm.as_str();
+            let Some(os_c) = os_re.captures(pair) else { continue };
+            let combo = match r_re.captures(pair) {
+                Some(rc) => format!("{}:{}", &os_c[1], &rc[1]),
+                None => format!("{}:any", &os_c[1]),
+            };
+            combos.push(combo);
+        }
+        let mut seen = std::collections::HashSet::new();
+        combos.retain(|c| seen.insert(c.clone()));
+        max_b = max_b.max(cross.max(combos.len() as i64));
+    }
+    max_b
+}
+
+struct Tests {
+    has_tests: bool,
+    test_to_code_ratio: Option<f64>,
+    testthat_edition: Option<i64>,
+    snapshot_test_count: i64,
+    test_isolation_libs: Vec<String>,
+    exported_fn_test_linkage: Option<f64>,
+    stochastic_seed_discipline: Option<f64>,
+    ci_present: bool,
+    ci_type: Vec<String>,
+    ci_matrix_breadth: i64,
+    ci_pr_gated: bool,
+}
+
+fn metrics_tests(
+    desc: &BTreeMap<String, String>,
+    root: &Path,
+    files: &[String],
+    exports: &[String],
+) -> Tests {
+    let test_files = find_files(files, r"^tests/");
+    let has_tests = !test_files.is_empty();
+
+    let r_files = find_files(files, r"^R/");
+    let loc_r = loc_sum(root, &r_files);
+    let loc_tests = loc_sum(root, &test_files);
+    let test_to_code_ratio = (loc_r != 0).then(|| loc_tests as f64 / loc_r as f64);
+
+    let testthat_edition = desc
+        .get("Config/testthat/edition")
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .and_then(|s| s.parse::<i64>().ok());
+
+    let test_r_files = find_files(files, r"^tests/.*\.[Rr]$");
+    let snap_re = regex::Regex::new(r"expect_snapshot\s*\(").unwrap();
+    let snapf_re = regex::Regex::new(r"expect_snapshot_file\s*\(").unwrap();
+    let mut snap_calls = 0i64;
+    for f in &test_r_files {
+        if let Some(c) = read(root, f) {
+            snap_calls += snap_re.find_iter(&c).count() as i64;
+            snap_calls += snapf_re.find_iter(&c).count() as i64;
+        }
+    }
+    let snapshot_test_count = snap_calls + find_files(files, r"^tests/testthat/_snaps/").len() as i64;
+
+    let test_content: String = test_files
+        .iter()
+        .filter_map(|f| read(root, f))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    let mut test_isolation_libs = Vec::new();
+    for lib in ["withr", "mockr", "httptest2", "webfakes"] {
+        let pat = format!(
+            r#"\b{lib}::|library\(\s*['"]?{lib}['"]?\s*\)|require\(\s*['"]?{lib}['"]?\s*\)"#
+        );
+        if regex::Regex::new(&pat).unwrap().is_match(&test_content) {
+            test_isolation_libs.push(lib.to_string());
+        }
+    }
+    if regex::Regex::new(r"\blocal_mocked_bindings\s*\(").unwrap().is_match(&test_content) {
+        test_isolation_libs.push("local_mocked_bindings".to_string());
+    }
+
+    let real_exports: Vec<&String> = exports.iter().filter(|e| !e.starts_with("pattern:")).collect();
+    let exported_fn_test_linkage = if real_exports.is_empty() {
+        None
+    } else if test_content.is_empty() {
+        Some(0.0)
+    } else {
+        let n = real_exports
+            .iter()
+            .filter(|fname| {
+                let pat = format!(r"\b{}\b", regex::escape(fname));
+                regex::Regex::new(&pat).unwrap().is_match(&test_content)
+            })
+            .count();
+        Some(n as f64 / real_exports.len() as f64)
+    };
+
+    let stoch_re = regex::Regex::new(r"\b(?:sample|runif|rnorm|rbinom)\s*\(").unwrap();
+    let seed_re = regex::Regex::new(r"\bset\.seed\s*\(").unwrap();
+    let stoch_files: Vec<&&str> = test_r_files
+        .iter()
+        .filter(|f| read(root, f).map(|c| stoch_re.is_match(&c)).unwrap_or(false))
+        .collect();
+    let stochastic_seed_discipline = if stoch_files.is_empty() {
+        None
+    } else {
+        let seeded = stoch_files
+            .iter()
+            .filter(|f| read(root, f).map(|c| seed_re.is_match(&c)).unwrap_or(false))
+            .count();
+        Some(seeded as f64 / stoch_files.len() as f64)
+    };
+
+    let ci_yml = find_files(files, r"^\.github/workflows/.*\.ya?ml$");
+    let has_travis = exists(files, ".travis.yml");
+    let has_appveyor = exists(files, "appveyor.yml");
+    let has_circleci = !find_files(files, r"^\.circleci/").is_empty();
+    let ci_present = !ci_yml.is_empty() || has_travis || has_appveyor || has_circleci;
+    let mut ci_type = Vec::new();
+    if !ci_yml.is_empty() {
+        ci_type.push("github-actions".to_string());
+    }
+    if has_travis {
+        ci_type.push("travis".to_string());
+    }
+    if has_appveyor {
+        ci_type.push("appveyor".to_string());
+    }
+    if has_circleci {
+        ci_type.push("circleci".to_string());
+    }
+    let ci_matrix_breadth = gha_matrix_breadth(root, &ci_yml);
+    let ci_pr_gated = ci_yml
+        .iter()
+        .any(|f| read(root, f).map(|c| c.contains("pull_request")).unwrap_or(false));
+
+    Tests {
+        has_tests,
+        test_to_code_ratio,
+        testthat_edition,
+        snapshot_test_count,
+        test_isolation_libs,
+        exported_fn_test_linkage,
+        stochastic_seed_discipline,
+        ci_present,
+        ci_type,
+        ci_matrix_breadth,
+        ci_pr_gated,
+    }
+}
+
 // ---- main -------------------------------------------------------------------
 
 fn main() {
@@ -508,9 +712,10 @@ fn main() {
     let n_exports = ns.exports.len();
     let n_internal = r_fn_defs.saturating_sub(n_exports);
 
-    // --- legal + portability ---
+    // --- legal + portability + tests ---
     let legal = metrics_legal(&desc, &root, &files);
     let port = metrics_portability(&desc, &root, &files);
+    let tests = metrics_tests(&desc, &root, &files, &ns.exports);
 
     // --- emit NDJSON ---
     let summary = serde_json::json!({
@@ -529,6 +734,17 @@ fn main() {
         "nonportable_compiler_flags_json": port.nonportable_compiler_flags_json,
         "has_vignettes": port.has_vignettes,
         "vignette_dynamic": port.vignette_dynamic,
+        "has_tests": tests.has_tests,
+        "test_to_code_ratio": tests.test_to_code_ratio,
+        "testthat_edition": tests.testthat_edition,
+        "snapshot_test_count": tests.snapshot_test_count,
+        "test_isolation_libs": tests.test_isolation_libs,
+        "exported_fn_test_linkage": tests.exported_fn_test_linkage,
+        "stochastic_seed_discipline": tests.stochastic_seed_discipline,
+        "ci_present": tests.ci_present,
+        "ci_type": tests.ci_type,
+        "ci_matrix_breadth": tests.ci_matrix_breadth,
+        "ci_pr_gated": tests.ci_pr_gated,
         "n_files": n_files,
         "loc_total": loc_total,
         "loc_r": loc_r,
