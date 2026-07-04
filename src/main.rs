@@ -2324,6 +2324,28 @@ fn main() {
         0.0
     };
 
+    // --- extended languages: LOC by extension over the WHOLE package (incl.
+    // inst/ web assets), distinct from the code-dir lang_breakdown. Flags
+    // likely-minified/generated files (a very long single line).
+    let mut all_lang: BTreeMap<String, usize> = BTreeMap::new();
+    let mut minified_asset_files = 0i64;
+    for f in &files {
+        if is_noncode(f) {
+            continue;
+        }
+        let Some(content) = read(&root, f) else { continue };
+        *all_lang.entry(file_ext(f)).or_insert(0) += loc(&content);
+        if content.lines().any(|ln| ln.chars().count() > 2000) {
+            minified_asset_files += 1;
+        }
+    }
+    let has_web_assets = all_lang.keys().any(|e| {
+        matches!(
+            e.as_str(),
+            "js" | "html" | "htm" | "css" | "ts" | "jsx" | "tsx" | "vue" | "scss" | "sass"
+        )
+    });
+
     // --- DESCRIPTION ---
     let desc = read(&root, "DESCRIPTION").map(|t| parse_dcf(&t)).unwrap_or_default();
     let get = |k: &str| desc.get(k).cloned().unwrap_or_default();
@@ -2481,6 +2503,9 @@ fn main() {
         "compiled_share": compiled_share,
         "has_src": has_src,
         "lang_breakdown": lang,
+        "all_languages": all_lang,
+        "has_web_assets": has_web_assets,
+        "minified_asset_files": minified_asset_files,
         "n_exports": funcs.n_exports,
         "n_internal": funcs.n_internal,
         "nse_surface_n": funcs.nse_surface_n,
