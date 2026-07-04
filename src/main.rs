@@ -2715,6 +2715,71 @@ fn main() {
     let meta = metrics_meta(&desc, &root, &files);
     let security = metrics_security(&desc, &root, &files);
 
+    // --- additional static signals ---
+    // OpenMP: SystemRequirements, Makevars -fopenmp, or a src #pragma omp / _OPENMP.
+    let uses_openmp = desc
+        .get("SystemRequirements")
+        .map(|s| s.to_lowercase().contains("openmp"))
+        .unwrap_or(false)
+        || find_files(&files, r"^src/Makevars(\.win)?$")
+            .iter()
+            .any(|f| read(&root, f).map(|c| c.contains("-fopenmp")).unwrap_or(false))
+        || files.iter().filter(|f| is_src_file(f)).any(|f| {
+            read(&root, f)
+                .map(|c| c.contains("#pragma omp") || c.contains("_OPENMP"))
+                .unwrap_or(false)
+        });
+
+    let num_vignettes = find_files(&files, r"^vignettes/.*\.[Rr](md|nw)$").len();
+    let num_demos = find_files(&files, r"^demo/.*\.[Rr]$").len();
+    let count_prefix = |p: &str| files.iter().filter(|f| f.starts_with(p)).count();
+    let files_r = count_prefix("R/");
+    let files_src = count_prefix("src/");
+    let files_tests = count_prefix("tests/");
+    let files_inst = count_prefix("inst/include/"); // inst counts only inst/include
+    let files_vignettes = count_prefix("vignettes/");
+
+    // Translations: language codes from po/*.po|.pot filenames (e.g. R-de.po -> de).
+    let mut translations: Vec<String> = files
+        .iter()
+        .filter(|f| f.starts_with("po/") && (f.ends_with(".po") || f.ends_with(".pot")))
+        .filter_map(|f| {
+            let base = f.rsplit('/').next()?;
+            let stem = base.trim_end_matches(".pot").trim_end_matches(".po");
+            Some(stem.rsplit('-').next().unwrap_or(stem).to_string())
+        })
+        .collect();
+    translations.sort();
+    translations.dedup();
+
+    // Website: a pkgdown site or a declared URL on a non-forge host.
+    let forges = ["github.com", "gitlab.com", "codeberg.org", "bitbucket.org", "git.sr.ht"];
+    let url_website = desc.get("URL").map(|u| {
+        u.split([',', ' ', '\n'])
+            .map(str::trim)
+            .filter(|s| s.starts_with("http"))
+            .any(|s| !forges.iter().any(|d| s.contains(d)))
+    }).unwrap_or(false);
+    let has_website = docs.has_pkgdown || url_website;
+
+    // Author role counts from Authors@R.
+    let authors_r = desc.get("Authors@R").cloned().unwrap_or_default();
+    let role_count = |role: &str| {
+        regex::Regex::new(&format!(r#"["']{role}["']"#))
+            .unwrap()
+            .find_iter(&authors_r)
+            .count() as i64
+    };
+    let (desc_n_aut, desc_n_cre, desc_n_ctb, desc_n_cph, desc_n_fnd, desc_n_rev, desc_n_trl) = (
+        role_count("aut"),
+        role_count("cre"),
+        role_count("ctb"),
+        role_count("cph"),
+        role_count("fnd"),
+        role_count("rev"),
+        role_count("trl"),
+    );
+
     // --- emit NDJSON ---
     let summary = serde_json::json!({
         "rec": "summary",
@@ -2834,6 +2899,23 @@ fn main() {
         "comment_lines_tests": ws.comment_lines_tests,
         "rel_space_tests": ws.rel_space_tests,
         "indentation": ws.indentation,
+        "uses_openmp": uses_openmp,
+        "num_vignettes": num_vignettes,
+        "num_demos": num_demos,
+        "files_r": files_r,
+        "files_src": files_src,
+        "files_tests": files_tests,
+        "files_inst": files_inst,
+        "files_vignettes": files_vignettes,
+        "translations": translations,
+        "has_website": has_website,
+        "desc_n_aut": desc_n_aut,
+        "desc_n_cre": desc_n_cre,
+        "desc_n_ctb": desc_n_ctb,
+        "desc_n_cph": desc_n_cph,
+        "desc_n_fnd": desc_n_fnd,
+        "desc_n_rev": desc_n_rev,
+        "desc_n_trl": desc_n_trl,
         "n_deps_direct": n_deps_direct,
         "dep_list": deps,
         "has_additional_repositories": !additional_repositories.is_empty(),
