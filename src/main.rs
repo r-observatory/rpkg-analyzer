@@ -1684,6 +1684,284 @@ fn metrics_meta(desc: &BTreeMap<String, String>, _root: &Path, _files: &[String]
     Meta { maintainer, maintainer_email, n_authors, authors }
 }
 
+
+// ---- security -----------------------------------------------------------
+
+#[derive(serde::Serialize)]
+struct InstallTimeSideEffectSurface {
+    configure_files: Vec<String>,
+    configure_loc: i64,
+    #[serde(rename = "onLoad_file_write")]
+    onload_file_write: bool,
+    #[serde(rename = "onLoad_network")]
+    onload_network: bool,
+}
+
+#[derive(serde::Serialize)]
+struct NonRegistryRemotes {
+    count: i64,
+    schemes: Vec<String>,
+}
+
+#[derive(serde::Serialize)]
+struct BundledThirdPartyCode {
+    detected: bool,
+    files: Vec<String>,
+}
+
+struct Security {
+    unsafe_pattern_score: i64,
+    install_time_side_effect_surface: InstallTimeSideEffectSurface,
+    dep_constraint_coverage: Option<f64>,
+    non_registry_remotes: NonRegistryRemotes,
+    secret_pattern_count: i64,
+    compiled_external_lib_exposure: serde_json::Value,
+    bundled_third_party_code: BundledThirdPartyCode,
+}
+
+/// Unbox a plain (non `as.list`-wrapped) character vector the way
+/// jsonlite::toJSON(x, auto_unbox = TRUE) does: empty -> [], one element ->
+/// a bare JSON string, two or more -> a JSON array.
+fn unbox_str_vec(v: Vec<String>) -> serde_json::Value {
+    match v.len() {
+        0 => serde_json::Value::Array(vec![]),
+        1 => serde_json::Value::String(v.into_iter().next().unwrap()),
+        _ => serde_json::Value::Array(v.into_iter().map(serde_json::Value::String).collect()),
+    }
+}
+
+fn metrics_security(desc: &BTreeMap<String, String>, root: &Path, files: &[String]) -> Security {
+    let r_files = find_files(files, r"^R/.*\.R$");
+
+    // shared regexes for (1) unsafe_pattern_score and (2) install-time surface
+    let eval_parse_re = regex::Regex::new(r"eval\s*\(\s*parse\s*\(\s*text\s*=").unwrap();
+    let system_paste_re = regex::Regex::new(r"system\s*\(\s*paste\s*\(").unwrap();
+    let system2_paste_re = regex::Regex::new(r"system2\s*\([^\n]*paste\s*\(").unwrap();
+    let setenv_re = regex::Regex::new(r"Sys\.setenv\s*\(").unwrap();
+    let sq_re = regex::Regex::new(r"'[^']*'").unwrap();
+    let dq_re = regex::Regex::new(r#""[^"]*""#).unwrap();
+    let assign_re = regex::Regex::new(r"=\s*[A-Za-z_.][A-Za-z0-9_.]*").unwrap();
+    let onload_re = regex::Regex::new(r"\.on(?:Load|Attach)\s*<-\s*function").unwrap();
+    // narrow network pattern used for the score (weight 2)
+    let net_pat_re = regex::Regex::new(r"download\.file\s*\(|\burl\s*\(|\bcurl\s*\(").unwrap();
+    // file-write pattern needs a negative lookbehind (bare file(...) but not tempfile(...) etc)
+    let file_write_re = fancy_regex::Regex::new(
+        r"writeLines?\s*\(|writeBin\s*\(|\bcat\s*\(\s*[^)]*,\s*(?:file|con)\s*=|(?<![A-Za-z0-9_.])file\s*\(|\bsink\s*\(|write\.csv\s*\(|write\.table\s*\(",
+    )
+    .unwrap();
+    // broader network pattern (adds httr::/RCurl::/curl::) used for the side-effect surface
+    let network_re =
+        regex::Regex::new(r"download\.file\s*\(|\burl\s*\(|\bcurl\s*\(|httr::|RCurl::|curl::").unwrap();
+
+    let mut unsafe_pattern_score: i64 = 0;
+    let mut onload_file_write = false;
+    let mut onload_network = false;
+
+    for f in &r_files {
+        let Some(content) = read(root, f) else { continue };
+        if content.is_empty() {
+            continue;
+        }
+
+        // 1. unsafe_pattern_score
+        unsafe_pattern_score += 3 * eval_parse_re.find_iter(&content).count() as i64;
+        unsafe_pattern_score += 2 * system_paste_re.find_iter(&content).count() as i64;
+        unsafe_pattern_score += 2 * system2_paste_re.find_iter(&content).count() as i64;
+
+        for ln in content.lines() {
+            if !setenv_re.is_match(ln) {
+                continue;
+            }
+            let tmp = sq_re.replace_all(ln, "''").into_owned();
+            let stripped = dq_re.replace_all(&tmp, "\"\"");
+            if assign_re.is_match(&stripped) {
+                unsafe_pattern_score += 2;
+            }
+        }
+
+        let is_onload_file = onload_re.is_match(&content);
+        if is_onload_file {
+            unsafe_pattern_score += 2 * net_pat_re.find_iter(&content).count() as i64;
+
+            // 2. install_time_side_effect_surface (onLoad/onAttach side effects)
+            if file_write_re.is_match(&content).unwrap_or(false) {
+                onload_file_write = true;
+            }
+            if network_re.is_match(&content) {
+                onload_network = true;
+            }
+        }
+    }
+
+    let cfg_names = ["configure", "configure.win", "cleanup", "cleanup.win"];
+    let cfg_present: Vec<String> = cfg_names
+        .iter()
+        .filter(|n| exists(files, n))
+        .map(|s| s.to_string())
+        .collect();
+    let configure_loc: i64 = cfg_present
+        .iter()
+        .filter_map(|f| read(root, f))
+        .map(|c| loc(&c) as i64)
+        .sum();
+
+    let install_time_side_effect_surface = InstallTimeSideEffectSurface {
+        configure_files: cfg_present,
+        configure_loc,
+        onload_file_write,
+        onload_network,
+    };
+
+    // 3. dep_constraint_coverage: fraction of Imports+Depends (excl. "R") with an explicit >= bound
+    let parse_dep_entries = |raw: Option<&String>| -> Vec<String> {
+        match raw {
+            Some(r) if !r.trim().is_empty() => r.split(',').map(|s| s.trim().to_string()).collect(),
+            _ => vec![],
+        }
+    };
+    let mut dep_entries: Vec<String> = Vec::new();
+    dep_entries.extend(parse_dep_entries(desc.get("Imports")));
+    dep_entries.extend(parse_dep_entries(desc.get("Depends")));
+    dep_entries.retain(|s| !s.is_empty());
+
+    let paren_re = regex::Regex::new(r"\s*\(.*").unwrap();
+    let mut qualifying: Vec<String> = Vec::new();
+    for e in &dep_entries {
+        let name = paren_re.replace(e, "").trim().to_string();
+        if !name.is_empty() && name != "R" {
+            qualifying.push(e.clone());
+        }
+    }
+    let dep_constraint_coverage = if qualifying.is_empty() {
+        None
+    } else {
+        let n_ge = qualifying.iter().filter(|e| e.contains(">=")).count();
+        Some(n_ge as f64 / qualifying.len() as f64)
+    };
+
+    // 4. non_registry_remotes
+    let raw_remotes = desc.get("Remotes").map(|s| s.as_str()).unwrap_or("");
+    let non_registry_remotes = if raw_remotes.trim().is_empty() {
+        NonRegistryRemotes { count: 0, schemes: vec![] }
+    } else {
+        let entries: Vec<String> = raw_remotes
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        let schemes: Vec<String> = entries
+            .iter()
+            .map(|e| match e.find("::") {
+                Some(idx) => e[..idx].trim().to_string(),
+                None => "github".to_string(),
+            })
+            .collect();
+        NonRegistryRemotes { count: entries.len() as i64, schemes }
+    };
+
+    // 5. secret_pattern_count
+    let nonbinary_re = regex::Regex::new(
+        r"(?i)\.(rda|rdata|rds|pdf|png|jpg|jpeg|gif|bmp|svg|ico|woff|woff2|eot|ttf|otf|gz|zip|tar|bz2|xz|7z|dll|so|dylib|o|a|lib|pyd|class|jar|pyc|xlsx|xls|docx|doc|pptx|ppt|mp3|mp4|ogg|wav|avi|mov|sam|bam|bai|cram|fasta|fa|fastq|fq|vcf|bcf|bed|wig|bedgraph|bigwig|bw|bigbed|bb)$",
+    )
+    .unwrap();
+    let md5_re = regex::Regex::new(r"(^|/)MD5$").unwrap();
+    let akia_re = regex::Regex::new(r"AKIA[0-9A-Z]{16}").unwrap();
+    let gh_re = regex::Regex::new(r"gh[pous]_[A-Za-z0-9_]{36,}|github_pat_[A-Za-z0-9_]{36,}").unwrap();
+    let api_key_re = regex::Regex::new(
+        r#"(?i)(api[_-]?key|api[_-]?secret|secret[_-]?key|access[_-]?token)\s*[=:]\s*["'][A-Za-z0-9+/=_-]{16,}["']"#,
+    )
+    .unwrap();
+    let b64_re = regex::Regex::new(
+        r#"(?i)(password|passwd|api_?key|auth_?token|secret)\s*=\s*["'][A-Za-z0-9+/]{40,}={0,2}["']"#,
+    )
+    .unwrap();
+
+    let mut secret_pattern_count: i64 = 0;
+    for f in files {
+        if nonbinary_re.is_match(f) || md5_re.is_match(f) {
+            continue;
+        }
+        let Some(content) = read(root, f) else { continue };
+        if content.is_empty() || content.len() > 1_000_000 {
+            continue;
+        }
+        secret_pattern_count += akia_re.find_iter(&content).count() as i64;
+        secret_pattern_count += gh_re.find_iter(&content).count() as i64;
+        secret_pattern_count += api_key_re.find_iter(&content).count() as i64;
+        secret_pattern_count += b64_re.find_iter(&content).count() as i64;
+    }
+
+    // 6. compiled_external_lib_exposure
+    let src_cfg_files = [
+        "src/Makevars",
+        "src/Makevars.win",
+        "src/Makevars.in",
+        "src/Makevars.ucrt",
+        "configure",
+        "configure.ac",
+        "configure.in",
+    ];
+    let flag_re = regex::Regex::new(r"-l[A-Za-z][A-Za-z0-9_-]*").unwrap();
+    let ac_re = regex::Regex::new(r"AC_CHECK_LIB\s*\(\s*([A-Za-z][A-Za-z0-9_-]*)").unwrap();
+    let mut all_libs: Vec<String> = Vec::new();
+    for f in src_cfg_files {
+        if !exists(files, f) {
+            continue;
+        }
+        let Some(content) = read(root, f) else { continue };
+        if content.is_empty() {
+            continue;
+        }
+        for m in flag_re.find_iter(&content) {
+            let lib = m.as_str().strip_prefix("-l").unwrap_or(m.as_str());
+            all_libs.push(lib.to_string());
+        }
+        for c in ac_re.captures_iter(&content) {
+            all_libs.push(c[1].to_string());
+        }
+    }
+    let mut seen = std::collections::HashSet::new();
+    all_libs.retain(|l| seen.insert(l.clone()));
+    let compiled_external_lib_exposure = unbox_str_vec(all_libs);
+
+    // 7. bundled_third_party_code
+    const KNOWN_VENDORED: &[&str] = &[
+        "sqlite3.c", "sqlite3.h", "json.hpp", "miniz.c", "miniz.h", "stb_image.h",
+        "stb_image_write.h", "nanosvg.h", "nanosvgrast.h", "xxhash.h", "xxhash.c",
+        "tinyxml2.cpp", "tinyxml2.h", "pugixml.cpp", "pugixml.hpp",
+    ];
+    let license_re = regex::Regex::new(r"^src/.+/(LICENSE|COPYING)(\.[A-Za-z]+)?$").unwrap();
+    let mut found: Vec<String> = Vec::new();
+    for f in files {
+        if !(f.starts_with("src/") || f.starts_with("inst/")) {
+            continue;
+        }
+        let base = f.rsplit('/').next().unwrap_or(f.as_str());
+        if KNOWN_VENDORED.contains(&base) {
+            found.push(f.clone());
+        }
+    }
+    for f in files {
+        if license_re.is_match(f) {
+            found.push(f.clone());
+        }
+    }
+    let mut seen2 = std::collections::HashSet::new();
+    found.retain(|f| seen2.insert(f.clone()));
+    let detected = !found.is_empty();
+    let bundled_third_party_code = BundledThirdPartyCode { detected, files: found };
+
+    Security {
+        unsafe_pattern_score,
+        install_time_side_effect_surface,
+        dep_constraint_coverage,
+        non_registry_remotes,
+        secret_pattern_count,
+        compiled_external_lib_exposure,
+        bundled_third_party_code,
+    }
+}
+
 // ---- main -------------------------------------------------------------------
 
 fn main() {
@@ -1765,6 +2043,7 @@ fn main() {
     let docs = metrics_docs(&desc, &root, &files, &ns.exports);
     let health = metrics_health(&desc, &root, &files);
     let meta = metrics_meta(&desc, &root, &files);
+    let security = metrics_security(&desc, &root, &files);
 
     // --- emit NDJSON ---
     let summary = serde_json::json!({
@@ -1814,6 +2093,13 @@ fn main() {
         "maintainer_email": meta.maintainer_email,
         "n_authors": meta.n_authors,
         "authors": meta.authors,
+        "unsafe_pattern_score": security.unsafe_pattern_score,
+        "install_time_side_effect_surface": security.install_time_side_effect_surface,
+        "dep_constraint_coverage": security.dep_constraint_coverage,
+        "non_registry_remotes": security.non_registry_remotes,
+        "secret_pattern_count": security.secret_pattern_count,
+        "compiled_external_lib_exposure": security.compiled_external_lib_exposure,
+        "bundled_third_party_code": security.bundled_third_party_code,
         "n_files": n_files,
         "loc_total": loc_total,
         "loc_r": loc_r,
