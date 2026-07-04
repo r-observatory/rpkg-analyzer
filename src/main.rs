@@ -2189,6 +2189,48 @@ fn median_i(v: &[i64]) -> Option<f64> {
     })
 }
 
+/// nexpr: median count of expression nodes starting per code line (R only).
+/// A tree-sitter approximation of a getParseData-based measure.
+fn metrics_nexpr(root: &Path, files: &[String], parser: &mut Parser) -> Option<f64> {
+    let expr_kinds = [
+        "call",
+        "binary_operator",
+        "unary_operator",
+        "if_statement",
+        "for_statement",
+        "while_statement",
+        "repeat_statement",
+        "function_definition",
+        "braced_expression",
+        "extract_operator",
+        "subset",
+        "subset2",
+        "namespace_operator",
+    ];
+    let mut counts: Vec<i64> = Vec::new();
+    for f in find_files(files, r"^R/.*\.[Rr]$") {
+        let Some(content) = read(root, &f) else { continue };
+        let Some(tree) = parser.parse(&content, None) else { continue };
+        let n_lines = content.lines().count().max(1);
+        let mut per_line = vec![0i64; n_lines];
+        let mut st = vec![tree.root_node()];
+        while let Some(x) = st.pop() {
+            if x.is_named() && expr_kinds.contains(&x.kind()) {
+                let row = x.start_position().row;
+                if row < per_line.len() {
+                    per_line[row] += 1;
+                }
+            }
+            let mut c = x.walk();
+            for ch in x.children(&mut c) {
+                st.push(ch);
+            }
+        }
+        counts.extend(per_line.into_iter().filter(|&c| c > 0));
+    }
+    median_i(&counts)
+}
+
 fn count_kinds(node: tree_sitter::Node, kinds: &[&str]) -> i64 {
     let mut n = 0i64;
     let mut st = vec![node];
@@ -2340,6 +2382,23 @@ enum Lang {
     Fortran,
     Rd,
     Other,
+}
+
+/// Family for a file extension, so extensions roll up into meaningful groups.
+fn ext_category(ext: &str) -> &'static str {
+    match ext.to_ascii_lowercase().as_str() {
+        "r" | "c" | "cc" | "cpp" | "cxx" | "h" | "hpp" | "hxx" | "f" | "f90" | "f95" | "f03"
+        | "f08" | "rs" | "py" | "java" | "scala" | "jl" | "go" | "sh" | "bash" | "pl" | "rb"
+        | "lua" | "sql" | "stan" | "jags" | "bug" | "s" | "asm" => "code",
+        "rmd" | "qmd" | "rnw" | "rd" | "md" | "markdown" | "tex" | "ltx" | "rst" | "org"
+        | "adoc" | "asciidoc" | "ipynb" | "texi" | "pod" => "documentation",
+        "csv" | "tsv" | "rda" | "rdata" | "rds" | "json" | "ndjson" | "xml" | "parquet"
+        | "feather" | "txt" | "dat" | "tab" | "fwf" => "data",
+        "yml" | "yaml" | "toml" | "ini" | "cfg" | "conf" | "dcf" | "lock" => "config",
+        "js" | "mjs" | "cjs" | "jsx" | "ts" | "tsx" | "css" | "scss" | "sass" | "less" | "html"
+        | "htm" | "vue" | "svelte" => "web",
+        _ => "other",
+    }
 }
 
 fn lang_of(path: &str) -> Lang {
@@ -2707,6 +2766,11 @@ fn main() {
             "js" | "html" | "htm" | "css" | "ts" | "jsx" | "tsx" | "vue" | "scss" | "sass"
         )
     });
+    // Roll extensions up into families (code / documentation / data / config / web).
+    let mut language_categories: BTreeMap<String, usize> = BTreeMap::new();
+    for (ext, l) in &all_lang {
+        *language_categories.entry(ext_category(ext).to_string()).or_insert(0) += l;
+    }
 
     // --- DESCRIPTION ---
     let desc = read(&root, "DESCRIPTION").map(|t| parse_dcf(&t)).unwrap_or_default();
@@ -2783,6 +2847,7 @@ fn main() {
 
     // AST-derived per-function stats + OO kinds (new v2 metrics).
     let (fn_stats, oo) = metrics_ast(&root, &files, &ns.exports, &mut parser);
+    let nexpr = metrics_nexpr(&root, &files, &mut parser);
     let fn_locs: Vec<i64> = fn_stats.iter().map(|f| f.loc as i64).collect();
     let fn_cyclos: Vec<i64> = fn_stats.iter().map(|f| f.cyclocomp).collect();
     let exp_params: Vec<i64> =
@@ -2977,8 +3042,10 @@ fn main() {
         "has_src": has_src,
         "lang_breakdown": lang,
         "all_languages": all_lang,
+        "language_categories": language_categories,
         "has_web_assets": has_web_assets,
         "minified_asset_files": minified_asset_files,
+        "nexpr": nexpr,
         "n_exports": funcs.n_exports,
         "n_internal": funcs.n_internal,
         "nse_surface_n": funcs.nse_surface_n,
