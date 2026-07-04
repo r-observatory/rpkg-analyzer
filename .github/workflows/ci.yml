@@ -1,0 +1,25 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build
+        run: cargo build --release --locked
+      - name: Smoke test
+        run: |
+          pkg="$(mktemp -d)"
+          mkdir -p "$pkg/R"
+          printf 'Package: smoke\nVersion: 1.0\n' > "$pkg/DESCRIPTION"
+          printf 'f <- function(x) x + 1\n' > "$pkg/R/a.R"
+          out="$(./target/release/rpkg-analyzer "$pkg" | head -1)"
+          echo "$out"
+          echo "$out" | grep -q '"rec":"summary"'

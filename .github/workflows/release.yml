@@ -1,0 +1,28 @@
+name: release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build
+        run: cargo build --release --locked
+      - name: Package
+        run: |
+          strip target/release/rpkg-analyzer
+          tar -czf rpkg-analyzer-linux-x86_64.tar.gz -C target/release rpkg-analyzer
+          sha256sum rpkg-analyzer-linux-x86_64.tar.gz > rpkg-analyzer-linux-x86_64.tar.gz.sha256
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            rpkg-analyzer-linux-x86_64.tar.gz
+            rpkg-analyzer-linux-x86_64.tar.gz.sha256
