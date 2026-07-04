@@ -53,14 +53,41 @@ fn is_noncode(path: &str) -> bool {
     )
 }
 
-/// R's line count: length(strsplit(content, "\n")) with the trailing-empty drop.
-/// Rust's `lines()` reproduces that exactly (and handles CRLF).
+/// the line count, which is `length(strsplit(paste(readLines(f), collapse="\n"), "\n"))`.
+/// readLines drops the empty segment after a final newline; paste+strsplit then
+/// drops one further trailing empty. Net effect vs a naive line count: a trailing
+/// blank line is not counted. `\r` does not affect the count.
 fn loc(content: &str) -> usize {
-    content.lines().count()
+    if content.is_empty() {
+        return 0;
+    }
+    // readLines treats \r\n and bare \r as line terminators too; normalize to \n.
+    let normalized = content.replace("\r\n", "\n").replace('\r', "\n");
+    let mut lines: Vec<&str> = normalized.split('\n').collect();
+    if normalized.ends_with('\n') {
+        lines.pop(); // readLines: no empty line from the final terminator
+    }
+    if lines.last() == Some(&"") {
+        lines.pop(); // paste + strsplit drops the trailing empty (a blank last line)
+    }
+    lines.len()
 }
 
 fn read(root: &Path, rel: &str) -> Option<String> {
     std::fs::read_to_string(root.join(rel)).ok()
+}
+
+/// the is_src: src/ files with a compiled-language extension only (structure.R).
+/// Excludes Makevars, configure, .in, etc.
+fn is_src_file(path: &str) -> bool {
+    if !path.starts_with("src/") {
+        return false;
+    }
+    let ext = path.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
+    matches!(
+        ext.as_str(),
+        "c" | "cc" | "cpp" | "cxx" | "h" | "hpp" | "hxx" | "f" | "f90" | "f95"
+    )
 }
 
 fn file_ext(path: &str) -> String {
@@ -1982,7 +2009,7 @@ fn main() {
 
     for f in &files {
         let in_r = f.starts_with("R/");
-        let in_src = f.starts_with("src/");
+        let in_src = is_src_file(f);
         let in_tests = f.starts_with("tests/");
         let in_docs = f.starts_with("man/");
         let in_vig = f.starts_with("vignettes/");
