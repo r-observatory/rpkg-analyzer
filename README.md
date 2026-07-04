@@ -104,7 +104,16 @@ nodes per code line).
 Syntactic R call graph (an edge is one function calling another package
 function). `net_n_nodes`, `net_n_edges`, `net_n_clusters`, `net_n_isolated`,
 `net_node_degree_mean/median/max`, `net_n_terminal_nodes`,
-`net_betweenness_mean/median/max` (Brandes betweenness). Definitions are our own. `n_native_calls` is the R-to-compiled edge signal.
+`net_betweenness_mean/median/max` (Brandes betweenness). Definitions are our own.
+
+The graph is also cross-language at the R-to-native boundary. Every `.Call`/`.C`/
+`.Fortran`/`.External` site is resolved to the compiled function it invokes,
+using the string routine name, a `C_`-stripped symbol, and the C registration
+table (`R_CallMethodDef` and friends). `n_native_call_sites` (total),
+`n_native_edges` (resolved), `n_native_targets` (distinct compiled functions
+reached), `native_resolution_rate`. On data.table all 178 sites resolve to 108 C
+functions. This covers the R-to-C boundary; the internal C-to-C call graph is not
+built here (that is where ctags/gtags would add value).
 
 ### Static-check-style signals
 
