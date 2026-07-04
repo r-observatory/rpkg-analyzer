@@ -2818,6 +2818,23 @@ fn main() {
     let biocviews = field("biocViews");
     let needs_compilation = field("NeedsCompilation");
 
+    // Total expanded source size on disk (static proxy for install footprint;
+    // the true installed size needs a build / the r-universe API).
+    let total_source_size: u64 = files
+        .iter()
+        .filter_map(|f| std::fs::metadata(root.join(f)).ok())
+        .filter(|m| m.is_file())
+        .map(|m| m.len())
+        .sum();
+
+    // Individual test cases: test_that()/it() blocks under tests/.
+    let testcase_re = regex::Regex::new(r"\b(?:test_that|it)\s*\(").unwrap();
+    let n_test_cases: i64 = find_files(&files, r"^tests/.*\.[Rr]$")
+        .iter()
+        .filter_map(|f| read(&root, f))
+        .map(|c| testcase_re.find_iter(&c).count() as i64)
+        .sum();
+
     // Data sets: files under data/.
     let mut data_names: Vec<String> = Vec::new();
     let mut data_sizes: Vec<u64> = Vec::new();
@@ -3155,6 +3172,8 @@ fn main() {
         "data_size_total": data_size_total,
         "data_size_median": data_size_median,
         "data_files": data_names,
+        "total_source_size": total_source_size,
+        "n_test_cases": n_test_cases,
         "export_patterns": ns.export_patterns,
         "s3_methods": ns.s3_methods,
         "export_classes": ns.export_classes,
