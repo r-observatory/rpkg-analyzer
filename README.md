@@ -23,13 +23,14 @@ One `summary` record per run, followed by intermediate records:
 | `summary` | package version | all scalar/aggregate metrics below |
 | `dependency` | declared dependency | `package` |
 | `export` | exported symbol | `symbol` |
-| `function` | top-level R function | `name`, `exported`, `file`, `line`, `loc`, `n_params`, `cyclocomp` |
+| `function` | R or compiled function | `lang` (`r`/`c`/`cpp`/`rust`/`fortran`), `name`, `file`, `line`, `loc`; R nodes also `exported`, `n_params`, `cyclocomp` |
 | `call_edge` | one call-graph edge | `graph` (`r`/`native`/`c`/`rust`/`fortran`), `from`, `to` |
 | `dcf` | package version | every DESCRIPTION field verbatim (the catch-all) |
 
-The `function` records are the graph's nodes and the `call_edge` records its
-edges, so the full labeled call graph can be reconstructed and stored or drawn.
-The summary carries only the aggregate network stats.
+The `function` records are the graph's nodes (R and compiled alike, tagged by
+`lang`, each with file/line/loc) and the `call_edge` records its edges, so the
+full labeled call graph can be reconstructed and stored or drawn. The summary
+carries only the aggregate network stats.
 
 These are not five separate graphs but one cross-language graph. The `native`
 edges go from an R function to the compiled function it invokes, bridging the R

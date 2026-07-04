@@ -2528,13 +2528,33 @@ fn call_target(b: tree_sitter::Node, lang: SrcLang, bytes: &[u8]) -> Option<Stri
     }
 }
 
+/// A compiled function node with metadata, mirroring the R `function` records.
+struct SrcFn {
+    name: String,
+    lang: &'static str,
+    file: String,
+    line: usize,
+    loc: usize,
+}
+
+fn lang_str_of(ext: &str) -> &'static str {
+    match ext {
+        "c" | "h" => "c",
+        "cc" | "cpp" | "cxx" | "hpp" | "hxx" => "cpp",
+        "f" | "f90" | "f95" | "f03" | "f08" => "fortran",
+        "rs" => "rust",
+        _ => "other",
+    }
+}
+
 /// Internal call graph for one compiled language: nodes are function definitions
 /// in src/, edges are calls between them. C and C++ are graphed together.
+/// Returns the stats, the edges, and the node records with metadata.
 fn build_src_graph(
     root: &Path,
     files: &[String],
     lang: SrcLang,
-) -> (Network, Vec<(String, String)>) {
+) -> (Network, Vec<(String, String)>, Vec<SrcFn>) {
     let exts: &[&str] = match lang {
         SrcLang::CFamily => &["c", "h", "cc", "cpp", "cxx", "hpp", "hxx"],
         SrcLang::Rust => &["rs"],
@@ -2543,6 +2563,7 @@ fn build_src_graph(
     let mut parser = Parser::new();
     let mut names: Vec<String> = Vec::new();
     let mut calls: Vec<Vec<String>> = Vec::new();
+    let mut nodes: Vec<SrcFn> = Vec::new();
     for f in files {
         if !f.starts_with("src/") {
             continue;
@@ -2558,6 +2579,7 @@ fn build_src_graph(
         let Some(content) = read(root, f) else { continue };
         let Some(tree) = parser.parse(&content, None) else { continue };
         let bytes = content.as_bytes();
+        let lang_str = lang_str_of(&ext);
         let mut st = vec![tree.root_node()];
         while let Some(n) = st.pop() {
             if is_def(n, lang) {
@@ -2573,6 +2595,13 @@ fn build_src_graph(
                             bst.push(ch);
                         }
                     }
+                    nodes.push(SrcFn {
+                        name: nm.clone(),
+                        lang: lang_str,
+                        file: f.clone(),
+                        line: n.start_position().row + 1,
+                        loc: n.end_position().row - n.start_position().row + 1,
+                    });
                     names.push(nm);
                     calls.push(callees);
                 }
@@ -2585,7 +2614,8 @@ fn build_src_graph(
             }
         }
     }
-    graph_from_calls(&names, &calls)
+    let (net, edges) = graph_from_calls(&names, &calls);
+    (net, edges, nodes)
 }
 
 fn metrics_ast(root: &Path, files: &[String], exports: &[String], parser: &mut Parser) -> (Vec<FnStat>, Oo) {
@@ -3276,9 +3306,9 @@ fn main() {
     let ws = metrics_whitespace(&root, &files);
     let src_fns = count_src_functions(&root, &files);
     let ng = metrics_native_graph(&root, &files, &fn_stats);
-    let (cnet, c_edges) = build_src_graph(&root, &files, SrcLang::CFamily);
-    let (rnet, rust_edges) = build_src_graph(&root, &files, SrcLang::Rust);
-    let (fnet, fortran_edges) = build_src_graph(&root, &files, SrcLang::Fortran);
+    let (cnet, c_edges, c_nodes) = build_src_graph(&root, &files, SrcLang::CFamily);
+    let (rnet, rust_edges, rust_nodes) = build_src_graph(&root, &files, SrcLang::Rust);
+    let (fnet, fortran_edges, fortran_nodes) = build_src_graph(&root, &files, SrcLang::Fortran);
 
     // Deprecated R functions: body calls .Deprecated/.Defunct or lifecycle::deprecate_*.
     let dep_calls = [".Deprecated", ".Defunct", "deprecate_soft", "deprecate_warn", "deprecate_stop"];
@@ -3618,9 +3648,20 @@ fn main() {
         println!(
             "{}",
             serde_json::json!({
-                "rec": "function", "name": fnst.name, "exported": fnst.exported,
+                "rec": "function", "lang": "r", "name": fnst.name, "exported": fnst.exported,
                 "file": fnst.file, "line": fnst.line, "loc": fnst.loc,
                 "n_params": fnst.n_params, "cyclocomp": fnst.cyclocomp,
+            })
+        );
+    }
+    // Compiled function nodes, so C/C++/Rust/Fortran endpoints in the unified
+    // graph carry the same file/line/loc metadata as the R nodes.
+    for sf in c_nodes.iter().chain(&rust_nodes).chain(&fortran_nodes) {
+        println!(
+            "{}",
+            serde_json::json!({
+                "rec": "function", "lang": sf.lang, "name": sf.name,
+                "file": sf.file, "line": sf.line, "loc": sf.loc,
             })
         );
     }
