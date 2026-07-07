@@ -11,7 +11,7 @@ jobs:
   release:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Build
@@ -21,7 +21,7 @@ jobs:
           strip target/release/rpkg-analyzer
           tar -czf rpkg-analyzer-linux-x86_64.tar.gz -C target/release rpkg-analyzer
           sha256sum rpkg-analyzer-linux-x86_64.tar.gz > rpkg-analyzer-linux-x86_64.tar.gz.sha256
-      - uses: softprops/action-gh-release@v2
+      - uses: softprops/action-gh-release@v3
         with:
           files: |
             rpkg-analyzer-linux-x86_64.tar.gz
