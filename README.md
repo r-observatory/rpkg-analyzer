@@ -26,6 +26,9 @@ One `summary` record per run, followed by intermediate records:
 | `function` | R or compiled function | `lang` (`r`/`c`/`cpp`/`rust`/`fortran`), `name`, `file`, `line`, `loc`; R nodes also `exported`, `n_params`, `cyclocomp` |
 | `call_edge` | one call-graph edge | `graph` (`r`/`native`/`c`/`rust`/`fortran`), `from`, `to` |
 | `dcf` | package version | every DESCRIPTION field verbatim (the catch-all) |
+| `dataset` | dataset under `data/` or `R/sysdata.rda` | `name`, `file`, `format`, `compression`, `class`, `nrow`, `ncol`, `columns[]` (`name`, `type`, `n_missing`, `n_unique`, `col_min`/`col_max`, `col_fp`), `schema_fp`, `shape_fp`, `content_fp`, `row_sketch`, `confidence` |
+
+The `dataset` records come from reading R's serialization format (`.rda`/`.rds`/`.RData`) and delimited text (`.csv`/`.tab`) directly, with no R: the reader walks each object for its class, dimensions, and per-column names/types/factor levels, then makes one bounded value pass for the missing/unique/range profile and the fingerprints. The fingerprints identify the same or similar datasets across packages: `content_fp` matches identical data regardless of packaging, `schema_fp` matches the same columns and types, and `row_sketch` (a bottom-k row hash) estimates row overlap for subsets and near-duplicates. S4 objects report their class (and dimensions for common Bioconductor containers); `.R` data scripts are flagged as needing R.
 
 The `function` records are the graph's nodes (R and compiled alike, tagged by
 `lang`, each with file/line/loc) and the `call_edge` records its edges, so the

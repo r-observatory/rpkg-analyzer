@@ -3701,4 +3701,10 @@ fn main() {
         dcf.insert(k.clone(), serde_json::Value::String(v.clone()));
     }
     println!("{}", serde_json::Value::Object(dcf));
+
+    // Datasets shipped under data/ and R/sysdata.rda, read from R serialization
+    // with no R runtime.
+    for rec in rds::scan_package(&root) {
+        println!("{rec}");
+    }
 }
