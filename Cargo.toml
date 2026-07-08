@@ -5,6 +5,7 @@ license = "LicenseRef-proprietary"
 edition = "2024"
 
 [dependencies]
+blake3 = "1"
 bzip2 = "0.5"
 fancy-regex = "0.18.0"
 flate2 = "1"
