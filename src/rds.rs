@@ -550,6 +550,73 @@ fn s4_class(pairs: &[(String, &Node)]) -> (String, String) {
     (name, pkg)
 }
 
+// ---- S4 dimension extractors ------------------------------------------------
+
+fn int1(n: &Node) -> Option<i64> {
+    if let Val::Ints { vals, .. } = &n.val {
+        vals.first().map(|v| *v as i64)
+    } else {
+        None
+    }
+}
+
+// Search an S4 slot tree for the first matrix (a node with a length>=2 `dim`
+// attribute) and return (nrow, ncol). Recovers the assay dimensions of a
+// SummarizedExperiment-family object without hardcoding the exact slot chain,
+// which varies across Bioconductor versions.
+fn find_matrix_dim(node: &Node, depth: u32) -> Option<(i64, i64)> {
+    if depth == 0 {
+        return None;
+    }
+    let pairs = attr_pairs(node);
+    if let Some(dim) = attr(&pairs, "dim") {
+        if let Val::Ints { vals, .. } = &dim.val {
+            if vals.len() >= 2 {
+                return Some((vals[0] as i64, vals[1] as i64));
+            }
+        }
+    }
+    for (_, v) in &pairs {
+        if let Some(d) = find_matrix_dim(v, depth - 1) {
+            return Some(d);
+        }
+    }
+    match &node.val {
+        Val::Vec(els) => {
+            for e in els {
+                if let Some(d) = find_matrix_dim(e, depth - 1) {
+                    return Some(d);
+                }
+            }
+        }
+        Val::List { car, cdr, .. } => {
+            if let Some(d) = find_matrix_dim(car, depth - 1) {
+                return Some(d);
+            }
+            if let Some(d) = find_matrix_dim(cdr, depth - 1) {
+                return Some(d);
+            }
+        }
+        _ => {}
+    }
+    None
+}
+
+// (nrow, ncol) of an S4 DataFrame/DFrame from its nrows slot and listData length.
+fn dataframe_dims(pairs: &[(String, &Node)]) -> Option<(i64, i64)> {
+    let nrow = attr(pairs, "nrows").and_then(int1)?;
+    let ncol = attr(pairs, "listData")
+        .map(|n| if let Val::Vec(v) = &n.val { v.len() as i64 } else { 0 })
+        .unwrap_or(0);
+    Some((nrow, ncol))
+}
+
+// Element count via an elementMetadata DataFrame's nrows (GRanges and friends).
+fn element_meta_len(pairs: &[(String, &Node)]) -> Option<i64> {
+    let em = attr(pairs, "elementMetadata")?;
+    attr(&attr_pairs(em), "nrows").and_then(int1)
+}
+
 // ---- record building --------------------------------------------------------
 
 #[allow(clippy::too_many_arguments)]
@@ -568,12 +635,34 @@ fn describe(
 
     if let Val::S4 = node.val {
         let (klass, pkg) = s4_class(&pairs);
-        return json!({
+        let mut rec = json!({
             "rec": "dataset", "name": name, "file": file, "format": fmt,
             "format_version": ver, "compression": comp, "compressed_bytes": size,
             "internal": internal, "class": format!("S4:{klass}"), "s4_package": pkg,
-            "confidence": "degraded", "notes": "s4-class-only"
+            "confidence": "degraded"
         });
+        // DataFrame-like S4 (S4Vectors): dims from the nrows/listData slots.
+        if (klass == "DFrame" || klass == "DataFrame") && dataframe_dims(&pairs).is_some() {
+            let (r, c) = dataframe_dims(&pairs).unwrap();
+            rec["kind"] = json!("DataFrame");
+            rec["nrow"] = json!(r);
+            rec["ncol"] = json!(c);
+            rec["notes"] = json!("s4-dataframe");
+        } else if let Some((r, c)) = find_matrix_dim(&node, 16) {
+            // SummarizedExperiment family: assay matrix dims (features x samples).
+            rec["kind"] = json!(klass.clone());
+            rec["nrow"] = json!(r);
+            rec["ncol"] = json!(c);
+            rec["notes"] = json!("s4-assay-dims");
+        } else if let Some(l) = element_meta_len(&pairs) {
+            // GRanges and friends: length from elementMetadata.
+            rec["kind"] = json!(klass.clone());
+            rec["length"] = json!(l);
+            rec["notes"] = json!("s4-elementmetadata-length");
+        } else {
+            rec["notes"] = json!("s4-class-only");
+        }
+        return rec;
     }
 
     if class.iter().any(|c| c == "data.frame") {
