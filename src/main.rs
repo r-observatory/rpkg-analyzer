@@ -9,6 +9,8 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use tree_sitter::Parser;
 
+mod rds;
+
 // ---- file walking -----------------------------------------------------------
 
 /// All files under `root`, relative to it, excluding the .git directory.
@@ -3030,6 +3032,16 @@ fn main() {
     parser
         .set_language(&tree_sitter_r::LANGUAGE.into())
         .expect("load tree-sitter-r");
+
+    // --datasets <package_dir>: emit one `dataset` record per shipped dataset,
+    // read straight from R serialization with no R runtime.
+    if dir == "--datasets" {
+        let f = std::env::args().nth(2).expect("usage: rpkg-analyzer --datasets <package_dir>");
+        for rec in rds::scan_package(Path::new(&f)) {
+            println!("{rec}");
+        }
+        return;
+    }
 
     // Debug: --sexp <file.R> prints the parse tree, for learning node kinds.
     if dir == "--sexp" || dir == "--kinds" {
