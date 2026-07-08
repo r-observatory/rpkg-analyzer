@@ -849,8 +849,117 @@ fn read_file(path: &Path) -> Result<Vec<(String, Node, String, i32, String)>, St
     Ok(out)
 }
 
-fn stem(fname: &str) -> String {
-    fname.rsplit_once('.').map(|(s, _)| s).unwrap_or(fname).to_string()
+// Dataset name from a file name, stripping a compression suffix then the type
+// extension: "gapminder.tab.gz" -> "gapminder", "mtcars.rds" -> "mtcars".
+fn dataset_name(fname: &str) -> String {
+    let mut s = fname.to_string();
+    for suf in [".gz", ".bz2", ".xz"] {
+        if let Some(t) = s.strip_suffix(suf) {
+            s = t.to_string();
+        }
+    }
+    s.rsplit_once('.').map(|(a, _)| a.to_string()).unwrap_or(s)
+}
+
+fn is_na_text(s: &str) -> bool {
+    s.is_empty() || s.eq_ignore_ascii_case("NA") || s == "N/A" || s == "."
+}
+
+// Infer a column type from delimited-text cells, building the same Node the
+// binary path produces so the value profile and fingerprints are shared (and a
+// text dataset can match a serialized one with the same data).
+fn infer_column(cells: &[String]) -> Node {
+    let non_na: Vec<&str> = cells.iter().map(|s| s.as_str()).filter(|c| !is_na_text(c)).collect();
+    let all_int = !non_na.is_empty()
+        && non_na.iter().all(|c| !c.contains('.') && c.parse::<i32>().is_ok());
+    let all_logical = !non_na.is_empty()
+        && non_na
+            .iter()
+            .all(|c| matches!(*c, "TRUE" | "FALSE" | "T" | "F" | "true" | "false"));
+    let all_num = !non_na.is_empty() && non_na.iter().all(|c| c.parse::<f64>().is_ok());
+    if all_int {
+        let vals = cells
+            .iter()
+            .map(|c| if is_na_text(c) { NA_INT } else { c.parse().unwrap_or(NA_INT) })
+            .collect::<Vec<_>>();
+        Node { val: Val::Ints { len: vals.len(), vals, logical: false }, attr: None }
+    } else if all_logical {
+        let vals = cells
+            .iter()
+            .map(|c| {
+                if is_na_text(c) {
+                    NA_INT
+                } else if c.eq_ignore_ascii_case("true") || *c == "T" {
+                    1
+                } else {
+                    0
+                }
+            })
+            .collect::<Vec<_>>();
+        Node { val: Val::Ints { len: vals.len(), vals, logical: true }, attr: None }
+    } else if all_num {
+        let vals = cells
+            .iter()
+            .map(|c| if is_na_text(c) { f64::NAN } else { c.parse().unwrap_or(f64::NAN) })
+            .collect::<Vec<_>>();
+        Node { val: Val::Reals { len: vals.len(), vals }, attr: None }
+    } else {
+        let vals = cells
+            .iter()
+            .map(|c| if is_na_text(c) { None } else { Some(c.clone()) })
+            .collect::<Vec<_>>();
+        Node { val: Val::Str(vals), attr: None }
+    }
+}
+
+// Parse a delimited-text data file (optionally gzip'd). Returns columns, names,
+// row count, format tag, and compression.
+fn read_text(path: &Path, lower: &str) -> Option<(Vec<Node>, Vec<String>, usize, &'static str, &'static str)> {
+    let raw = std::fs::read(path).ok()?;
+    let (bytes, comp): (Vec<u8>, &'static str) = if raw.len() >= 2 && raw[0] == 0x1f && raw[1] == 0x8b {
+        use std::io::Read;
+        let mut d = flate2::read::GzDecoder::new(&raw[..]);
+        let mut o = Vec::new();
+        d.read_to_end(&mut o).ok()?;
+        (o, "gzip")
+    } else {
+        (raw, "none")
+    };
+    let text = String::from_utf8_lossy(&bytes);
+    let mut it = text.lines().filter(|l| !l.trim().is_empty());
+    let header = it.next()?;
+    let (delim, fmt) = if lower.contains(".tsv") || lower.contains(".tab") {
+        ('\t', "tab")
+    } else if lower.contains(".csv") {
+        (',', "csv")
+    } else if header.contains('\t') && header.matches('\t').count() >= header.matches(',').count() {
+        ('\t', "txt")
+    } else if header.contains(',') {
+        (',', "txt")
+    } else if header.contains(';') {
+        (';', "txt")
+    } else {
+        (',', "txt")
+    };
+    let split = |s: &str| -> Vec<String> {
+        s.split(delim).map(|f| f.trim().trim_matches('"').to_string()).collect()
+    };
+    let names = split(header);
+    let ncol = names.len();
+    if ncol == 0 {
+        return None;
+    }
+    let mut cells: Vec<Vec<String>> = vec![Vec::new(); ncol];
+    let mut nrow = 0usize;
+    for line in it {
+        let f = split(line);
+        for (j, cell) in cells.iter_mut().enumerate() {
+            cell.push(f.get(j).cloned().unwrap_or_default());
+        }
+        nrow += 1;
+    }
+    let cols: Vec<Node> = (0..ncol).map(|j| infer_column(&cells[j])).collect();
+    Some((cols, names, nrow, fmt, comp))
 }
 
 /// Emit one `dataset` record per dataset shipped under `root`'s data/ directory
@@ -872,38 +981,63 @@ pub fn scan_package(root: &Path) -> Vec<Value> {
 
     for (path, internal) in targets {
         let fname = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-        let ext = path
-            .extension()
-            .and_then(|e| e.to_str())
-            .unwrap_or("")
-            .to_lowercase();
+        let lower = fname.to_lowercase();
         let rel = format!("{}/{}", if internal { "R" } else { "data" }, fname);
         let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
-        match ext.as_str() {
-            "rda" | "rdata" | "rds" => match read_file(&path) {
+        let name = dataset_name(fname);
+
+        let is_rbin = lower.ends_with(".rda") || lower.ends_with(".rdata") || lower.ends_with(".rds");
+        let is_script = lower.ends_with(".r");
+        let is_text = !is_rbin
+            && [".csv", ".tab", ".txt", ".tsv"].iter().any(|e| lower.contains(e));
+
+        if is_rbin {
+            match read_file(&path) {
                 Ok(recs) => {
                     for (nm, node, fmt, ver, comp) in recs {
-                        let nm = if nm.is_empty() { stem(fname) } else { nm };
+                        let nm = if nm.is_empty() { name.clone() } else { nm };
                         out.push(describe(&nm, &rel, &node, &fmt, ver, &comp, internal, size));
                     }
                 }
                 Err(e) => out.push(json!({
-                    "rec": "dataset", "name": stem(fname), "file": rel,
+                    "rec": "dataset", "name": name, "file": rel,
                     "internal": internal, "compressed_bytes": size,
                     "confidence": "degraded", "notes": e
                 })),
-            },
-            "r" => out.push(json!({
-                "rec": "dataset", "name": stem(fname), "file": rel, "format": "script",
+            }
+        } else if is_script {
+            out.push(json!({
+                "rec": "dataset", "name": name, "file": rel, "format": "script",
                 "internal": internal, "compressed_bytes": size,
                 "confidence": "needs_r", "notes": "R script data (requires R)"
-            })),
-            "csv" | "txt" | "tab" | "tsv" => out.push(json!({
-                "rec": "dataset", "name": stem(fname), "file": rel, "format": ext,
-                "internal": internal, "compressed_bytes": size,
-                "confidence": "degraded", "notes": "text data"
-            })),
-            _ => {}
+            }));
+        } else if is_text {
+            match read_text(&path, &lower) {
+                Some((cols, names, nrow, fmt, comp)) => {
+                    let refs: Vec<&Node> = cols.iter().collect();
+                    let mut rec = json!({
+                        "rec": "dataset", "name": name, "file": rel, "format": fmt,
+                        "compression": comp, "compressed_bytes": size, "internal": internal,
+                        "class": "data.frame", "kind": "table", "nrow": nrow,
+                        "ncol": names.len(), "confidence": "degraded",
+                        "notes": "text: column types inferred"
+                    });
+                    if let Some(p) = profile_columns(&refs, &names) {
+                        rec["columns"] = json!(p.columns);
+                        rec["n_missing_total"] = json!(p.n_missing_total);
+                        rec["schema_fp"] = json!(p.schema_fp);
+                        rec["shape_fp"] = json!(p.shape_fp);
+                        rec["content_fp"] = json!(p.content_fp);
+                        rec["row_sketch"] = json!(p.row_sketch);
+                    }
+                    out.push(rec);
+                }
+                None => out.push(json!({
+                    "rec": "dataset", "name": name, "file": rel,
+                    "internal": internal, "compressed_bytes": size,
+                    "confidence": "degraded", "notes": "unreadable text data"
+                })),
+            }
         }
     }
     out
