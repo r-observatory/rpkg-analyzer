@@ -164,3 +164,7 @@ not treated as frameworks.
 
 `s3_methods`, `export_classes`, `export_methods`, `export_patterns`,
 `import_from`, `imports_whole`, `use_dyn_lib`.
+
+## Feedback
+
+Found a bug, a wrong number, or a missing package? Report it at [r-observatory/feedback](https://github.com/r-observatory/feedback/issues/new/choose). All feedback about R Observatory, the site, the data, and the pipelines, is tracked in one place.
