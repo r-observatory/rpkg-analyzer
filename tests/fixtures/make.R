@@ -1,6 +1,7 @@
 # Regenerates the dataset fixtures. Committed output means the suite runs
 # without R; this script exists so the inputs are reproducible and reviewable.
 # Run from the repo root: Rscript tests/fixtures/make.R
+d <- "tests/fixtures/pkg/data"
 dir.create(d, recursive = TRUE, showWarnings = FALSE)
 sv <- function(obj, name, version = 3) {
   assign(name, obj); save(list = name, file = file.path(d, paste0(name, ".rda")), version = version)
@@ -101,3 +102,45 @@ if (requireNamespace("igraph", quietly = TRUE)) {
   sv(g, "igraph_weighted", 3)
 }
 sv(array(seq_len(120) / 7, dim = c(2, 3, 4, 5)), "arr_4d_dbl", 3)
+
+# --- The Matrix class zoo, the object systems and raster ----------------------
+# Each of these used to cost the whole file it sat in rather than just itself:
+# a compiled function body is reachable from a reference class, an S7 object and
+# a raster's layer data alike, and reading one as a plain vector left the stream
+# out of step for everything that followed.
+if (requireNamespace("Matrix", quietly = TRUE)) {
+  M <- asNamespace("Matrix")
+  sp <- M$sparseMatrix
+  i <- c(1, 3, 5); j <- c(2, 4, 6)
+  sv(sp(i = i, j = j, x = c(1, 2, 3), dims = c(8, 8)), "spm_dgc")
+  sv(as(sp(i = i, j = j, x = c(1, 2, 3), dims = c(8, 8)), "RsparseMatrix"), "spm_dgr")
+  sv(sp(i = c(1, 2, 3), j = c(1, 2, 3), x = c(1, 2, 3), dims = c(5, 5), symmetric = TRUE), "spm_dsc")
+  sv(sp(i = c(2, 3), j = c(1, 2), x = c(1, 2), dims = c(4, 4), triangular = TRUE), "spm_dtc")
+  sv(sp(i = i, j = j, dims = c(8, 8)), "spm_ngc")          # pattern: no values slot
+  sv(M$Diagonal(4), "spm_unit_diag")                        # unit diagonal: nothing stored
+}
+
+Acc <- setRefClass("Acc", fields = list(balance = "numeric", owner = "character"))
+sv(Acc$new(balance = 100, owner = "a"), "oo_refclass")
+if (requireNamespace("R6", quietly = TRUE)) {
+  Cnt <- R6::R6Class("Cnt", public = list(n = 0, add = function() self$n <- self$n + 1))
+  sv(Cnt$new(), "oo_r6")
+}
+if (requireNamespace("S7", quietly = TRUE)) {
+  Pt <- S7::new_class("Pt", properties = list(x = S7::class_numeric, y = S7::class_numeric))
+  sv(Pt(x = 1, y = 2), "oo_s7")
+}
+
+if (requireNamespace("raster", quietly = TRUE)) {
+  rr <- raster::raster(nrows = 10, ncols = 20, xmn = 0, xmx = 10, ymn = 0, ymx = 5,
+                       crs = "EPSG:4326")
+  rr[] <- seq_len(200)
+  sv(rr, "raster_layer")
+  sv(raster::brick(rr, rr), "raster_brick")
+}
+
+# A compiled function saved beside real data in one file. Everything after the
+# function depends on the reader coming out of it in step.
+cmp_fun <- compiler::cmpfun(function(x, y = 2) { z <- x + y; z * 2 })
+after_compiled <- data.frame(a = 1:4, b = letters[1:4], stringsAsFactors = FALSE)
+save(cmp_fun, after_compiled, file = file.path(d, "mixed_compiled.rda"), version = 3)

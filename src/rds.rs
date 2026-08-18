@@ -29,7 +29,8 @@ const REALSXP: u8 = 14;
 const CPLXSXP: u8 = 15;
 const STRSXP: u8 = 16;
 const VECSXP: u8 = 19;
-const EXPRSXP: u8 = 21;
+const EXPRSXP: u8 = 20;
+const BCODESXP: u8 = 21;
 const RAWSXP: u8 = 24;
 const S4SXP: u8 = 25;
 const ALTREP_SXP: u8 = 238;
@@ -39,6 +40,13 @@ const GLOBALENV_SXP: u8 = 253;
 const UNBOUNDVALUE_SXP: u8 = 252;
 const MISSINGARG_SXP: u8 = 251;
 const BASENAMESPACE_SXP: u8 = 250;
+const BCREPDEF: i32 = 244;
+const BCREPREF: i32 = 243;
+const ATTRLANGSXP: i32 = 240;
+const ATTRLISTSXP: i32 = 239;
+const PERSISTSXP: u8 = 247;
+const PACKAGESXP: u8 = 248;
+const NAMESPACESXP: u8 = 249;
 const EMPTYENV_SXP: u8 = 242;
 const BASEENV_SXP: u8 = 241;
 const NILVALUE: u8 = 254;
@@ -128,6 +136,51 @@ impl<'a> Reader<'a> {
         self.p += n;
         Ok(())
     }
+    /// Code vector then constant pool.
+    fn bc_body(&mut self) -> Result<(), String> {
+        self.item()?;
+        let n = self.i32()?;
+        for _ in 0..n.max(0) {
+            let t = self.i32()?;
+            match t {
+                t if t == BCODESXP as i32 => self.bc_body()?,
+                BCREPDEF | BCREPREF | ATTRLANGSXP | ATTRLISTSXP => self.bc_lang(t)?,
+                t if t == LANGSXP as i32 || t == LISTSXP as i32 => self.bc_lang(t)?,
+                // Anything else is an ordinary object, and the tag just read is a
+                // marker rather than its flags, so it reads its own header.
+                _ => { self.item()?; }
+            }
+        }
+        Ok(())
+    }
+
+    /// The language objects inside a constant pool, which are shared by
+    /// reference within one pool and so are written in their own dialect.
+    fn bc_lang(&mut self, t: i32) -> Result<(), String> {
+        if t == BCREPREF {
+            self.i32()?;
+            return Ok(());
+        }
+        let mut t = t;
+        if t == BCREPDEF {
+            self.i32()?;
+            t = self.i32()?;
+        }
+        if t == ATTRLANGSXP || t == ATTRLISTSXP || t == LANGSXP as i32 || t == LISTSXP as i32 {
+            if t == ATTRLANGSXP || t == ATTRLISTSXP {
+                self.item()?;
+            }
+            self.item()?;
+            let car = self.i32()?;
+            self.bc_lang(car)?;
+            let cdr = self.i32()?;
+            self.bc_lang(cdr)?;
+            return Ok(());
+        }
+        self.item()?;
+        Ok(())
+    }
+
     fn maybe_attr(&mut self, ha: bool) -> Result<Option<Box<Node>>, String> {
         if ha {
             Ok(Some(Box::new(self.item()?)))
@@ -288,6 +341,34 @@ impl<'a> Reader<'a> {
             // `.internal.selfref`, so rejecting the type lost the whole file for
             // one of the most widely shipped data classes on CRAN. Like an
             // environment it takes a reference-table slot, then two items.
+            // A namespace, package or persistent-object reference. All three
+            // are written as R's string vector: a zero, a length, then that many
+            // strings, and all three take a reference-table slot. A reference
+            // class or an S7 object names its defining namespace, so rejecting
+            // the type lost every object in those files.
+            NAMESPACESXP | PACKAGESXP | PERSISTSXP => {
+                let _zero = self.i32()?;
+                let n = self.i32()?;
+                let mut parts = Vec::new();
+                for _ in 0..n.max(0) {
+                    if let Val::Char(Some(t)) = self.item()?.val {
+                        parts.push(t);
+                    }
+                }
+                let node = Node { val: Val::Sym(parts.join("::")), attr: None };
+                self.refs.push(node.clone());
+                Ok(node)
+            }
+            // Byte code. Never content in its own right, but a closure body is
+            // compiled, and a compiled body sits inside anything that carries a
+            // function: a reference class, an S7 object, a formula's environment.
+            // Reading it as a plain vector desynchronised the stream and cost the
+            // whole file, not just the object holding it.
+            BCODESXP => {
+                let _nreps = self.i32()?;
+                self.bc_body()?;
+                Ok(Node { val: Val::Nil, attr: None })
+            }
             EXTPTRSXP => {
                 let slot = self.refs.len();
                 self.refs.push(Node { val: Val::Nil, attr: None });
@@ -354,6 +435,18 @@ const CONSUMED_ATTRS: &[&str] = &[
     "class", "levels", "row.names", "names", "dim", "dimnames", "package", "nrows",
     "listData", "elementMetadata", "tsp", "index", "frequency", "crs", "bbox",
     "data", "proj4string", "coords", "coords.nrs", "comment", "label", "units",
+    ".xData", "S7_class",
+];
+
+// Slots a particular class is known for, passed by the branch that read them.
+// These stay per-class rather than global because the names are ordinary: an S7
+// object may well have a property called `x`, and suppressing it everywhere to
+// keep a sparse matrix tidy would lose the thing worth recording.
+const MATRIX_SLOTS: &[&str] = &["Dim", "Dimnames", "i", "j", "p", "x", "uplo", "diag", "factors"];
+// `file`, `legend`, `history`, `title` and `z` describe how a raster was made
+// rather than what it holds.
+const RASTER_SLOTS: &[&str] = &[
+    "ncols", "extent", "srs", "file", "legend", "history", "title", "z", "rotated", "rotation",
 ];
 
 /// Short scalar text from an attribute, for the ones worth storing whole.
@@ -381,7 +474,7 @@ fn attr_text(pairs: &[(String, &Node)], key: &str, cap: usize) -> Option<String>
 /// and makes the corpus self-describing: after one pass the set of attributes
 /// CRAN actually uses is measured rather than guessed, which is the only sound
 /// basis for deciding what to promote to a field of its own later.
-fn describe_attrs(pairs: &[(String, &Node)], out: &mut Value) {
+fn describe_attrs(pairs: &[(String, &Node)], out: &mut Value, extra: &[&str]) {
     if let Some(t) = attr_text(pairs, "label", 200) {
         out["label"] = json!(t);
     }
@@ -399,6 +492,7 @@ fn describe_attrs(pairs: &[(String, &Node)], out: &mut Value) {
         .map(|(k, _)| k.clone())
         .filter(|k| {
             !CONSUMED_ATTRS.contains(&k.as_str())
+                && !extra.contains(&k.as_str())
                 || (matches!(k.as_str(), "label" | "comment" | "units") && out.get(k).is_none())
         })
         .collect();
@@ -968,7 +1062,7 @@ fn profile_columns(cols: &[&Node], names: &[String]) -> Option<Profile> {
             }
         }
         spatial_fields(col, &mut o);
-        describe_attrs(&attr_pairs(col), &mut o);
+        describe_attrs(&attr_pairs(col), &mut o, &[]);
         col_json.push(o);
         col_fp_bytes.extend_from_slice(fp.as_bytes());
         col_fp_bytes.push(b'|');
@@ -1032,6 +1126,55 @@ fn s4_class(pairs: &[(String, &Node)]) -> (String, String) {
 }
 
 // ---- S4 dimension extractors ------------------------------------------------
+
+fn num1(n: &Node) -> Option<f64> {
+    match &n.val {
+        Val::Reals { vals, .. } => vals.first().copied(),
+        Val::Ints { vals, .. } => vals.first().map(|v| *v as f64),
+        _ => None,
+    }
+}
+
+/// The Matrix package names a class for what it is: a value type, a shape and a
+/// storage layout, in that order. Reading the name is how a symmetric matrix
+/// becomes legible, because it stores one triangle and its stored count is
+/// otherwise half of what a reader would expect for its density.
+fn matrix_class_parts(klass: &str) -> Option<(&'static str, &'static str, &'static str)> {
+    let p = klass.strip_suffix("Matrix")?;
+    if p == "p" || p == "ind" {
+        return Some(("pattern", "permutation", "index"));
+    }
+    let b = p.as_bytes();
+    if b.len() != 3 {
+        return None;
+    }
+    let value = match b[0] {
+        b'd' => "double",
+        b'l' => "logical",
+        b'n' => "pattern",
+        b'i' => "integer",
+        b'z' => "complex",
+        _ => return None,
+    };
+    let shape = match b[1] {
+        b'g' => "general",
+        b's' => "symmetric",
+        b't' => "triangular",
+        b'd' => "diagonal",
+        b'p' => "positive-definite",
+        _ => return None,
+    };
+    let storage = match b[2] {
+        b'C' => "column-compressed",
+        b'R' => "row-compressed",
+        b'T' => "triplet",
+        b'i' => "diagonal",
+        b'e' | b'y' | b'r' | b'o' => "dense",
+        b'p' => "packed",
+        _ => return None,
+    };
+    Some((value, shape, storage))
+}
 
 fn int1(n: &Node) -> Option<i64> {
     if let Val::Ints { vals, .. } = &n.val {
@@ -1116,10 +1259,23 @@ fn describe(
 
     if let Val::S4 = node.val {
         let (klass, pkg) = s4_class(&pairs);
+        // Not everything arriving here is S4. A reference class and an R6 object
+        // are environments wearing a class, and S7 sets the S4 bit for
+        // compatibility, so all three used to be labelled S4 and were not.
+        let system = if class.iter().any(|c| c == "R6") {
+            "R6"
+        } else if class.iter().any(|c| c == "S7_object") || attr(&pairs, "S7_class").is_some() {
+            "S7"
+        } else if attr(&pairs, ".xData").is_some() {
+            "RefClass"
+        } else {
+            "S4"
+        };
         let mut rec = json!({
             "rec": "dataset", "name": name, "file": file, "format": fmt,
             "format_version": ver, "compression": comp, "compressed_bytes": size,
-            "internal": internal, "class": format!("S4:{klass}"), "s4_package": pkg,
+            "internal": internal, "class": format!("{system}:{klass}"), "s4_package": pkg,
+            "object_system": system,
             "confidence": "degraded"
         });
         // sp: the spatial classes are S4 whose slots are the attribute list, so
@@ -1183,7 +1339,7 @@ fn describe(
             } else {
                 rec["notes"] = json!("sp-spatial-geometry-only");
             }
-            describe_attrs(&pairs, &mut rec);
+            describe_attrs(&pairs, &mut rec, &[]);
             return rec;
         }
         // Matrix and other S4 classes state their shape in a `Dim` slot, which
@@ -1200,7 +1356,34 @@ fn describe(
                 // is the non-zero count, and it is the number that means
                 // anything: reporting a 100x100 with three entries as 10,000
                 // cells describes the grid it is embedded in, not the data.
-                let stored = attr(&pairs, "x").map(col_len).unwrap_or(0);
+                let parts = matrix_class_parts(&klass);
+                if let Some((value, shape, storage)) = parts {
+                    rec["matrix_value_type"] = json!(value);
+                    rec["matrix_shape"] = json!(shape);
+                    rec["matrix_storage"] = json!(storage);
+                }
+                // Which triangle a symmetric or triangular matrix keeps. It does
+                // not change any count, but without it the shape above is the
+                // only thing saying why the count is roughly half the grid.
+                if let Some(u) = attr_text(&pairs, "uplo", 4) {
+                    rec["matrix_uplo"] = json!(u);
+                }
+                // A unit diagonal is not written down. Its entries are still
+                // non-zero, so a matrix marked this way carries min(nrow, ncol)
+                // more than its slots hold, and n_stored counts them.
+                let unit_diag = attr_text(&pairs, "diag", 4).as_deref() == Some("U");
+                if attr(&pairs, "diag").is_some() {
+                    rec["matrix_diag"] = json!(if unit_diag { "unit" } else { "stored" });
+                }
+                // A pattern matrix records only where the non-zeros are and has
+                // no values slot at all, so counting the values slot called it
+                // empty and fell through to describing the dense grid instead.
+                let x = attr(&pairs, "x");
+                let idx = attr(&pairs, "i").or_else(|| attr(&pairs, "j"));
+                let stored = match x {
+                    Some(n) if col_len(n) > 0 => col_len(n),
+                    _ => idx.map(col_len).unwrap_or(0),
+                } + if unit_diag { r.min(c) as usize } else { 0 };
                 if stored > 0 {
                     rec["n_stored"] = json!(stored);
                     let cells = r.saturating_mul(c);
@@ -1212,11 +1395,17 @@ fn describe(
                     // Fingerprint the values actually stored, so two matrices
                     // holding the same data dedup even though the class wrapping
                     // them says nothing about it.
-                    if let Some(x) = attr(&pairs, "x") {
-                        let mut cols: Vec<&Node> = vec![x];
-                        if let Some(i) = attr(&pairs, "i") {
-                            cols.push(i);
-                        }
+                    let mut cols: Vec<&Node> = Vec::new();
+                    if let Some(x) = x {
+                        cols.push(x);
+                    }
+                    if let Some(i) = idx {
+                        cols.push(i);
+                    }
+                    if let Some(pp) = attr(&pairs, "p") {
+                        cols.push(pp);
+                    }
+                    if !cols.is_empty() {
                         let names: Vec<String> =
                             cols.iter().enumerate().map(|(k, _)| format!("s{k}")).collect();
                         if let Some(pr) = profile_columns(&cols, &names) {
@@ -1231,7 +1420,91 @@ fn describe(
                 } else {
                     rec["length"] = json!(r.saturating_mul(c));
                 }
-                describe_attrs(&pairs, &mut rec);
+                describe_attrs(&pairs, &mut rec, MATRIX_SLOTS);
+                return rec;
+            }
+        }
+
+        // raster predates terra and is largely superseded by it, but its objects
+        // are still bundled widely, and every one of them was arriving as a
+        // class name. The grid is in plain `nrows`/`ncols` slots; what made this
+        // look hard was the layer data underneath, which is byte-compiled and
+        // used to desynchronise the read.
+        if klass.starts_with("Raster") {
+            if let (Some(nr), Some(nc)) = (
+                attr(&pairs, "nrows").and_then(int1),
+                attr(&pairs, "ncols").and_then(int1),
+            ) {
+                rec["kind"] = json!(klass.clone());
+                rec["nrow"] = json!(nr);
+                rec["ncol"] = json!(nc);
+                rec["length"] = json!(nr.saturating_mul(nc));
+                rec["is_spatial"] = json!(true);
+                if let Some(e) = attr(&pairs, "extent") {
+                    let ep = attr_pairs(e);
+                    let g = |k: &str| attr(&ep, k).and_then(num1);
+                    if let (Some(x0), Some(y0), Some(x1), Some(y1)) =
+                        (g("xmin"), g("ymin"), g("xmax"), g("ymax"))
+                    {
+                        rec["bbox"] = json!([x0, y0, x1, y1]);
+                    }
+                }
+                // `srs` holds the WKT on current versions, `crs` the older
+                // proj4 string, and files in the wild carry either.
+                // `srs` carries whichever form the file was written with: an
+                // authority string on the short path, full WKT on the long one.
+                if let Some(t) = attr_text(&pairs, "srs", 4000) {
+                    if !t.is_empty() {
+                        rec["crs_input"] = json!(t.chars().take(128).collect::<String>());
+                        if let Some(rest) = t.strip_prefix("EPSG:") {
+                            if let Ok(code) = rest.trim().parse::<i64>() {
+                                rec["crs_epsg"] = json!(code);
+                            }
+                        } else if t.contains("ID[") || t.contains("AUTHORITY[") {
+                            rec["crs_wkt"] = json!(t.chars().take(128).collect::<String>());
+                            if let Some(code) = wkt_epsg(&t) {
+                                rec["crs_epsg"] = json!(code);
+                            }
+                        }
+                    }
+                }
+                if rec.get("crs_input").is_none() {
+                    if let Some(cr) = attr(&pairs, "crs") {
+                        let cp = attr_pairs(cr);
+                        if let Some(t) = attr_text(&cp, "projargs", 128) {
+                            if !t.is_empty() {
+                                rec["crs_input"] = json!(t);
+                            }
+                        }
+                    }
+                }
+                // A layer keeps its cells in the `data` slot, and a stack or a
+                // brick keeps one name per layer there.
+                if let Some(d) = attr(&pairs, "data") {
+                    let dp = attr_pairs(d);
+                    if let Some(nm) = attr(&dp, "names") {
+                        let n = col_len(nm);
+                        if n > 0 {
+                            rec["n_layers"] = json!(n as i64);
+                        }
+                    }
+                    if let Some(v) = attr(&dp, "values") {
+                        if col_len(v) > 0 {
+                            let cols = vec![v];
+                            let names = vec!["values".to_string()];
+                            if let Some(pr) = profile_columns(&cols, &names) {
+                                rec["n_missing_total"] = json!(pr.n_missing_total);
+                                rec["schema_fp"] = json!(pr.schema_fp);
+                                rec["shape_fp"] = json!(pr.shape_fp);
+                                rec["content_fp"] = json!(pr.content_fp);
+                                rec["row_sketch"] = json!(pr.row_sketch);
+                                rec["confidence"] = json!("exact");
+                            }
+                        }
+                    }
+                }
+                rec["notes"] = json!("raster-grid");
+                describe_attrs(&pairs, &mut rec, RASTER_SLOTS);
                 return rec;
             }
         }
@@ -1272,7 +1545,7 @@ fn describe(
                 rec["kind"] = json!(klass.clone());
                 rec["is_spatial"] = json!(true);
                 rec["notes"] = json!("terra-packed");
-                describe_attrs(&pairs, &mut rec);
+                describe_attrs(&pairs, &mut rec, &["definition"]);
                 return rec;
             }
         }
@@ -1297,7 +1570,7 @@ fn describe(
         } else {
             rec["notes"] = json!("s4-class-only");
         }
-        describe_attrs(&pairs, &mut rec);
+        describe_attrs(&pairs, &mut rec, &[]);
         return rec;
     }
 
@@ -1353,7 +1626,7 @@ fn describe(
                 rec["notes"] = json!("value scan skipped (size cap)");
             }
         }
-        describe_attrs(&pairs, &mut rec);
+        describe_attrs(&pairs, &mut rec, &[]);
         return rec;
     }
 
@@ -1387,7 +1660,7 @@ fn describe(
                 rec["has_dimnames"] = json!(!matches!(dn.val, Val::Nil));
             }
             series_fields(&pairs, &mut rec);
-            describe_attrs(&pairs, &mut rec);
+            describe_attrs(&pairs, &mut rec, &[]);
             // A matrix is a table of values like any other, so it gets a real
             // fingerprint rather than being dropped for want of one. Column-major
             // storage means column j is a contiguous run, so the flat vector
@@ -1471,7 +1744,7 @@ fn describe(
             }
         }
     }
-    describe_attrs(&pairs, &mut rec);
+    describe_attrs(&pairs, &mut rec, &[]);
     if kind == "vector" || kind == "list" {
         if let Some(p) = profile_columns(&[node], std::slice::from_ref(&name.to_string())) {
             rec["n_missing_total"] = json!(p.n_missing_total);
@@ -1941,6 +2214,82 @@ mod tests {
     /// An empty table is a fact, not a failure. It used to be reported as
     /// "value scan skipped (size cap)", naming a cause that had not happened.
     #[test]
+    fn compiled_code_does_not_cost_the_rest_of_its_file() {
+        // The regression this whole reader exists for: a compiled function body
+        // used to be read as a plain vector, which left the stream out of step
+        // and lost every object saved after it.
+        let r = by_name("after_compiled");
+        assert_eq!(s(&r, "confidence"), "exact");
+        assert_eq!(r["nrow"], 4);
+        assert_eq!(r["ncol"], 2);
+    }
+
+    #[test]
+    fn a_pattern_matrix_counts_its_positions_not_its_grid() {
+        // It has no values slot at all, so counting values called it empty and
+        // fell back to describing the 8x8 grid it is embedded in.
+        let r = by_name("spm_ngc");
+        assert_eq!(s(&r, "matrix_value_type"), "pattern");
+        assert_eq!(r["n_stored"], 3);
+        assert_eq!(r["n_cells"], 64);
+        assert_eq!(s(&r, "confidence"), "exact");
+        assert!(!s(&r, "content_fp").is_empty());
+    }
+
+    #[test]
+    fn a_row_compressed_matrix_is_read_like_a_column_one() {
+        // It indexes with `j` where the column form uses `i`.
+        let r = by_name("spm_dgr");
+        assert_eq!(s(&r, "matrix_storage"), "row-compressed");
+        assert_eq!(r["n_stored"], 3);
+        assert!(!s(&r, "content_fp").is_empty());
+    }
+
+    #[test]
+    fn a_symmetric_matrix_says_it_keeps_one_triangle() {
+        // Without the shape, its stored count reads as half the non-zeros it has.
+        let r = by_name("spm_dsc");
+        assert_eq!(s(&r, "matrix_shape"), "symmetric");
+        assert!(!s(&r, "matrix_uplo").is_empty());
+    }
+
+    #[test]
+    fn a_unit_diagonal_is_counted_though_it_is_not_stored() {
+        let r = by_name("spm_unit_diag");
+        assert_eq!(s(&r, "matrix_diag"), "unit");
+        assert_eq!(r["n_stored"], 4);
+    }
+
+    #[test]
+    fn the_object_systems_are_told_apart() {
+        // All three are environments or S4-flagged objects and all three used to
+        // be labelled S4, which is wrong for every one of them.
+        assert_eq!(s(&by_name("oo_refclass"), "object_system"), "RefClass");
+        assert_eq!(s(&by_name("oo_r6"), "object_system"), "R6");
+        assert_eq!(s(&by_name("oo_s7"), "object_system"), "S7");
+    }
+
+    #[test]
+    fn a_raster_reports_its_grid_and_its_ground() {
+        let r = by_name("raster_layer");
+        assert_eq!(r["nrow"], 10);
+        assert_eq!(r["ncol"], 20);
+        assert_eq!(r["n_layers"], 1);
+        assert_eq!(r["crs_epsg"], 4326);
+        assert_eq!(r["bbox"], serde_json::json!([0.0, 0.0, 10.0, 5.0]));
+        assert_eq!(s(&r, "confidence"), "exact");
+    }
+
+    #[test]
+    fn a_multi_layer_raster_counts_its_layers_and_reads_its_wkt() {
+        // This one writes the projection as full WKT, where the single layer
+        // writes the short authority form. The code has to come out of both.
+        let r = by_name("raster_brick");
+        assert_eq!(r["n_layers"], 2);
+        assert_eq!(r["crs_epsg"], 4326);
+    }
+
+    #[test]
     fn a_zero_row_frame_is_described_not_blamed() {
         let r = by_name("frame_zero_rows");
         assert_eq!(s(&r, "confidence"), "exact");
@@ -2046,12 +2395,25 @@ mod tests {
     #[test]
     fn every_fixture_is_readable() {
         let recs = records();
-        assert_eq!(recs.len(), 32, "one record per fixture");
-        for r in &recs {
-            let name = s(r, "name");
+        assert_eq!(recs.len(), 45, "one record per saved object");
+        // Not everything saved under data/ is data. These carry behaviour rather
+        // than observations, so there is nothing to fingerprint; what they must
+        // still do is read cleanly, because a file that fails mid-object takes
+        // every object after it down as well.
+        let objects = [
+            "oo_r6", "oo_refclass", "oo_s7", "cmp_fun",
             // terra keeps its values in a raw blob, so the grid is described but
             // the cells are not fingerprinted.
-            if name == "terra_packed" {
+            "terra_packed",
+        ];
+        for r in &recs {
+            let name = s(r, "name");
+            let notes = s(r, "notes");
+            assert!(
+                !notes.contains("unhandled") && !notes.contains("truncated"),
+                "{name} did not read: {notes}"
+            );
+            if objects.contains(&name.as_str()) {
                 continue;
             }
             assert_ne!(s(r, "confidence"), "degraded", "{name} degraded");
