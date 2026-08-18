@@ -29,6 +29,7 @@ const REALSXP: u8 = 14;
 const CPLXSXP: u8 = 15;
 const STRSXP: u8 = 16;
 const VECSXP: u8 = 19;
+const EXPRSXP: u8 = 21;
 const RAWSXP: u8 = 24;
 const S4SXP: u8 = 25;
 const ALTREP_SXP: u8 = 238;
@@ -241,7 +242,7 @@ impl<'a> Reader<'a> {
                 let attr = self.maybe_attr(ha)?;
                 Ok(Node { val: Val::Blob { len: n }, attr })
             }
-            VECSXP => {
+            VECSXP | EXPRSXP => {
                 let n = self.vlen()?;
                 let mut els = Vec::with_capacity(n.min(1 << 16));
                 for _ in 0..n {
@@ -262,11 +263,13 @@ impl<'a> Reader<'a> {
                 Ok(Node { val: Val::List { tag, car, cdr }, attr })
             }
             S4SXP => {
-                let attr = if ha {
-                    self.item().ok().map(Box::new)
-                } else {
-                    None
-                };
+                // Propagate rather than swallow. `.ok()` here turned a failed
+                // read into a silent resume from a desynchronized position, so
+                // the object came back with a truncated slot list and the bytes
+                // after it were parsed as further top-level objects: one raster
+                // produced two records, the second of them garbage. A failure
+                // has to end the file, not quietly corrupt it.
+                let attr = self.maybe_attr(ha)?;
                 Ok(Node { val: Val::S4, attr })
             }
             // ALTREP: a compact or deferred representation standing in for an
@@ -1188,11 +1191,87 @@ fn describe(
         // a sparse matrix reported a class name and no shape at all.
         if let Some(Val::Ints { vals, .. }) = attr(&pairs, "Dim").map(|n| &n.val) {
             if vals.len() >= 2 {
+                let (r, c) = (vals[0] as i64, vals[1] as i64);
                 rec["kind"] = json!(klass.clone());
-                rec["nrow"] = json!(vals[0] as i64);
-                rec["ncol"] = json!(vals[1] as i64);
-                rec["length"] = json!(vals[0] as i64 * vals[1] as i64);
+                rec["nrow"] = json!(r);
+                rec["ncol"] = json!(c);
                 rec["notes"] = json!("s4-dim-slot");
+                // The `x` slot holds the stored values. For a sparse matrix that
+                // is the non-zero count, and it is the number that means
+                // anything: reporting a 100x100 with three entries as 10,000
+                // cells describes the grid it is embedded in, not the data.
+                let stored = attr(&pairs, "x").map(col_len).unwrap_or(0);
+                if stored > 0 {
+                    rec["n_stored"] = json!(stored);
+                    let cells = r.saturating_mul(c);
+                    if cells > 0 {
+                        rec["density"] = json!((stored as f64 / cells as f64 * 1e6).round() / 1e6);
+                    }
+                    rec["length"] = json!(stored as i64);
+                    rec["n_cells"] = json!(cells);
+                    // Fingerprint the values actually stored, so two matrices
+                    // holding the same data dedup even though the class wrapping
+                    // them says nothing about it.
+                    if let Some(x) = attr(&pairs, "x") {
+                        let mut cols: Vec<&Node> = vec![x];
+                        if let Some(i) = attr(&pairs, "i") {
+                            cols.push(i);
+                        }
+                        let names: Vec<String> =
+                            cols.iter().enumerate().map(|(k, _)| format!("s{k}")).collect();
+                        if let Some(pr) = profile_columns(&cols, &names) {
+                            rec["n_missing_total"] = json!(pr.n_missing_total);
+                            rec["schema_fp"] = json!(pr.schema_fp);
+                            rec["shape_fp"] = json!(pr.shape_fp);
+                            rec["content_fp"] = json!(pr.content_fp);
+                            rec["row_sketch"] = json!(pr.row_sketch);
+                            rec["confidence"] = json!("exact");
+                        }
+                    }
+                } else {
+                    rec["length"] = json!(r.saturating_mul(c));
+                }
+                describe_attrs(&pairs, &mut rec);
+                return rec;
+            }
+        }
+
+        // terra ships rasters and vectors through wrap(), whose S4 form keeps
+        // the whole geometry in a `definition` string. Parsing it is the only
+        // way to get the grid: the values slot alone made an 8x12 raster look
+        // like a 96x1 matrix.
+        if klass.starts_with("Packed") {
+            if let Some(def) = attr_text(&pairs, "definition", 400) {
+                let num = |key: &str| -> Option<i64> {
+                    let i = def.find(key)?;
+                    def[i + key.len()..]
+                        .chars()
+                        .take_while(|c| c.is_ascii_digit())
+                        .collect::<String>()
+                        .parse()
+                        .ok()
+                };
+                if let (Some(nc), Some(nr)) = (num("ncols="), num("nrows=")) {
+                    rec["nrow"] = json!(nr);
+                    rec["ncol"] = json!(nc);
+                    rec["length"] = json!(nr.saturating_mul(nc));
+                }
+                if let Some(n) = num("nlyrs=") {
+                    rec["n_layers"] = json!(n);
+                }
+                for k in ["xmin=", "xmax=", "ymin=", "ymax="] {
+                    let _ = k;
+                }
+                if let Some(i) = def.find("crs='") {
+                    let crs: String =
+                        def[i + 5..].chars().take_while(|c| *c != '\'').collect();
+                    if !crs.is_empty() {
+                        rec["crs_input"] = json!(crs);
+                    }
+                }
+                rec["kind"] = json!(klass.clone());
+                rec["is_spatial"] = json!(true);
+                rec["notes"] = json!("terra-packed");
                 describe_attrs(&pairs, &mut rec);
                 return rec;
             }
@@ -1365,6 +1444,33 @@ fn describe(
         "confidence": "exact"
     });
     series_fields(&pairs, &mut rec);
+    // igraph stores a graph as a bare list of ten: vertex count, directed flag,
+    // then the two edge-endpoint vectors. Without reading it a graph reported
+    // "a list of length 10", which describes igraph's layout rather than the
+    // graph.
+    if class.iter().any(|c| c == "igraph") {
+        if let Val::Vec(items) = &node.val {
+            if items.len() >= 4 {
+                // igraph writes the vertex count as a double, so reading only
+                // integers found nothing.
+                let nv = match &items[0].val {
+                    Val::Reals { vals, .. } => vals.first().map(|v| *v as i64),
+                    Val::Ints { vals, .. } => vals.first().map(|v| *v as i64),
+                    _ => None,
+                };
+                if let Some(n) = nv {
+                    rec["n_vertices"] = json!(n);
+                }
+                let edges = col_len(&items[2]);
+                rec["n_edges"] = json!(edges);
+                if let Val::Ints { vals, .. } = &items[1].val {
+                    rec["directed"] = json!(vals.first().copied().unwrap_or(0) != 0);
+                }
+                rec["kind"] = json!("graph");
+                rec["length"] = json!(edges as i64);
+            }
+        }
+    }
     describe_attrs(&pairs, &mut rec);
     if kind == "vector" || kind == "list" {
         if let Some(p) = profile_columns(&[node], std::slice::from_ref(&name.to_string())) {
@@ -1875,23 +1981,77 @@ mod tests {
 
     /// Matrix states its shape in a Dim slot; without reading it a sparse matrix
     /// was a class name and nothing else.
+    ///
+    /// `length` is the count of values actually stored, not the dense product.
+    /// A 100x100 holding three entries is three numbers in a grid, and calling
+    /// that 10,000 describes the grid rather than the data; the dense figure is
+    /// kept beside it as n_cells.
     #[test]
-    fn an_s4_dim_slot_gives_a_shape() {
+    fn a_sparse_matrix_reports_what_it_stores() {
         let r = by_name("sparse_matrix");
         assert_eq!(r["nrow"], 2);
         assert_eq!(r["ncol"], 2);
-        assert_eq!(r["length"], 4);
+        assert_eq!(r["n_cells"], 4, "the grid it sits in");
+        assert_eq!(r["n_stored"], 2, "the values it actually holds");
+        assert_eq!(r["length"], 2, "and that is what its size means");
+        assert!(!s(&r, "content_fp").is_empty(), "fingerprinted from the stored values");
+    }
+
+    /// A hundred-by-hundred matrix holding three values: density is what
+    /// distinguishes it from a dense one, and the dense count hides that.
+    #[test]
+    fn a_large_sparse_matrix_reports_its_density() {
+        let r = by_name("sparse_big");
+        assert_eq!(r["n_cells"], 10000);
+        assert_eq!(r["n_stored"], 3);
+        assert!(r["density"].as_f64().unwrap() < 0.001);
+        assert_eq!(s(&r, "confidence"), "exact");
+    }
+
+    /// terra ships rasters through wrap(), which keeps the grid in a definition
+    /// string. Reading only the values slot made an 8x12 raster a 96x1 matrix.
+    #[test]
+    fn a_packed_raster_reports_its_grid_not_its_value_vector() {
+        let r = by_name("terra_packed");
+        assert_eq!(r["nrow"], 8);
+        assert_eq!(r["ncol"], 12);
+        assert_eq!(r["length"], 96);
+        assert_eq!(r["n_layers"], 1);
+        assert_eq!(s(&r, "crs_input"), "OGC:CRS84");
+        assert_eq!(r["is_spatial"], true);
+    }
+
+    /// A graph reported "a list of length 10", which describes igraph's own
+    /// layout rather than the graph.
+    #[test]
+    fn a_graph_reports_vertices_and_edges() {
+        let ring = by_name("igraph_ring");
+        assert_eq!(s(&ring, "kind"), "graph");
+        assert_eq!(ring["n_vertices"], 10);
+        assert_eq!(ring["n_edges"], 10);
+        assert_eq!(ring["directed"], false);
+
+        let w = by_name("igraph_weighted");
+        assert_eq!(w["n_vertices"], 20, "read as a double, not an integer");
+    }
+
+    #[test]
+    fn a_four_dimensional_array_keeps_its_whole_extent() {
+        let r = by_name("arr_4d_dbl");
+        assert_eq!(r["n_dim"], 4);
+        assert_eq!(r["dim"], serde_json::json!([2, 3, 4, 5]));
+        assert_eq!(r["length"], 120);
     }
 
     #[test]
     fn every_fixture_is_readable() {
         let recs = records();
-        assert_eq!(recs.len(), 26, "one record per fixture");
-        // sparse_matrix is S4 with no materialized value vector, so it carries a
-        // shape but no fingerprint. Everything else must be fully read.
+        assert_eq!(recs.len(), 32, "one record per fixture");
         for r in &recs {
             let name = s(r, "name");
-            if name == "sparse_matrix" {
+            // terra keeps its values in a raw blob, so the grid is described but
+            // the cells are not fingerprinted.
+            if name == "terra_packed" {
                 continue;
             }
             assert_ne!(s(r, "confidence"), "degraded", "{name} degraded");
