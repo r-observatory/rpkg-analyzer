@@ -2046,15 +2046,20 @@ fn read_text(path: &Path, fname: &str) -> Option<(Vec<Node>, Vec<String>, usize,
     // read.table's row-names rule: a header one field shorter than the body
     // means the first field of each row names it rather than being data.
     let has_row_names = rows.first().map(|r| r.len() == ncol + 1).unwrap_or(false);
+    // read.table defaults to fill = FALSE and refuses a file whose rows do not
+    // all hold the same number of fields. Padding a short row instead invented a
+    // table: two tabs in a row collapse to one separator under the whitespace
+    // rule, so a file with an empty cell is one data() cannot load at all, and
+    // reporting a tidy frame for it describes something nobody can get.
+    let want = if has_row_names { ncol + 1 } else { ncol };
+    if rows.iter().any(|r| r.len() != want) {
+        return None;
+    }
     if has_row_names {
         for r in rows.iter_mut() {
-            if !r.is_empty() {
-                r.remove(0);
-            }
+            r.remove(0);
         }
     }
-    // A short row is padded and a long one is truncated, so the frame stays
-    // rectangular rather than losing a column to one ragged line.
     let mut cells: Vec<Vec<String>> = vec![Vec::new(); ncol];
     for r in &rows {
         for (j, cell) in cells.iter_mut().enumerate() {
@@ -2149,7 +2154,7 @@ pub fn scan_package(root: &Path) -> Vec<Value> {
                 None => out.push(json!({
                     "rec": "dataset", "name": name, "file": rel,
                     "internal": internal, "compressed_bytes": size,
-                    "confidence": "degraded", "notes": "unreadable text data"
+                    "confidence": "degraded", "notes": "text: data() cannot load this file"
                 })),
             }
         }
@@ -2396,6 +2401,35 @@ mod tests {
     }
 
     #[test]
+    fn a_ragged_file_is_not_padded_into_a_table() {
+        // Two tabs in a row collapse to one separator under the whitespace rule,
+        // so read.table refuses the file. Padding the short row instead reported
+        // a tidy frame for something data() cannot load at all.
+        let r = by_name("ws_ragged");
+        assert_eq!(s(&r, "confidence"), "degraded");
+        assert!(s(&r, "content_fp").is_empty());
+    }
+
+    #[test]
+    fn a_value_holding_a_space_is_split_the_way_r_splits_it() {
+        // R gets three columns here, but only because the leftmost field becomes
+        // a row name and the space inside the value acts as a separator. The
+        // catalogue should agree with what a caller actually loads.
+        let r = by_name("ws_value_has_space");
+        assert_eq!(r["nrow"], 2);
+        assert_eq!(r["ncol"], 3);
+        assert_eq!(cols(&r), ["name", "city", "n"]);
+    }
+
+    #[test]
+    fn quotes_survive_whitespace_separation() {
+        let r = by_name("ws_quoted");
+        assert_eq!(r["ncol"], 2);
+        assert_eq!(r["nrow"], 2);
+        assert_eq!(r["columns"][0]["n_unique"], 2);
+    }
+
+    #[test]
     fn a_comment_does_not_become_data() {
         let r = by_name("txt_comments");
         assert_eq!(r["nrow"], 2);
@@ -2619,7 +2653,7 @@ mod tests {
     #[test]
     fn every_fixture_is_readable() {
         let recs = records();
-        assert_eq!(recs.len(), 56, "one record per saved object");
+        assert_eq!(recs.len(), 59, "one record per saved object");
         // Not everything saved under data/ is data. These carry behaviour rather
         // than observations, so there is nothing to fingerprint; what they must
         // still do is read cleanly, because a file that fails mid-object takes
@@ -2630,9 +2664,15 @@ mod tests {
             // the cells are not fingerprinted.
             "terra_packed",
         ];
+        // Deliberately broken: R refuses it, so we must too.
+        let unloadable = ["ws_ragged"];
         for r in &recs {
             let name = s(r, "name");
             let notes = s(r, "notes");
+            if unloadable.contains(&name.as_str()) {
+                assert_eq!(s(r, "confidence"), "degraded", "{name} should not load");
+                continue;
+            }
             assert!(
                 !notes.contains("unhandled") && !notes.contains("truncated"),
                 "{name} did not read: {notes}"
