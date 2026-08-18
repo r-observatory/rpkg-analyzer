@@ -1,0 +1,4 @@
+# a note about the file
+x y
+1 2
+3 4  # trailing note

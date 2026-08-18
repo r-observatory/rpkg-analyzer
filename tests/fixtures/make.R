@@ -144,3 +144,36 @@ if (requireNamespace("raster", quietly = TRUE)) {
 cmp_fun <- compiler::cmpfun(function(x, y = 2) { z <- x + y; z * 2 })
 after_compiled <- data.frame(a = 1:4, b = letters[1:4], stringsAsFactors = FALSE)
 save(cmp_fun, after_compiled, file = file.path(d, "mixed_compiled.rda"), version = 3)
+
+# --- The text formats data() accepts -----------------------------------------
+# Every one of these is read a fixed way that does not follow from its name:
+# .txt and .tab split on runs of whitespace rather than on tabs, .csv splits on
+# a semicolon, and a header one field short means the first column names the
+# rows. The .dat and .tsv files are here to stay unreadable: data() has no entry
+# for them, so nothing in data/ with those names can be loaded.
+wl <- function(lines, name) writeLines(lines, file.path(d, name))
+wl(c("grade   sex   score",
+     "    6   M        43",
+     "    7   F        88",
+     "    8   M        61"), "txt_plain.txt")
+wl(c("  Expt  Run  Speed",         # header one short: first field names the row
+     "001    1    1    850",
+     "002    1    2    740",
+     "003    2    1    900"), "tab_rownames.tab")
+wl(c("height;weight;sex", "1.7;65;F", "1.8;80;M"), "csv_semicolon.csv")
+wl(c("height,weight,sex", "1.7,65,F", "1.8,80,M"), "csv_comma.csv")
+wl(c("city;pop", '"Paris, France";2140000', '"Lyon, France";515000'), "csv_quoted.csv")
+wl(c("# a note about the file", "x y", "1 2", "3 4  # trailing note"), "txt_comments.txt")
+wl(c("a b", "1 2", "3 4"), "notdata.dat")
+wl(c("a\tb", "1\t2"), "notdata.tsv")
+for (cf in list(list("gz", gzfile), list("bz2", bzfile), list("xz", xzfile))) {
+  con <- cf[[2]](file.path(d, paste0("txt_", cf[[1]], ".txt.", cf[[1]])), "wt")
+  writeLines(c("k v", "1 10", "2 20", "3 30"), con); close(con)
+}
+
+# The same table written both ways. Reading the text file the way data() does
+# is what lets the two carry one fingerprint and dedup against each other.
+same_as_text <- data.frame(g = c("a","b","a"), n = c(1L,2L,3L), v = c(1.5,2.5,3.5),
+                           stringsAsFactors = FALSE)
+sv(same_as_text, "same_as_rda")
+wl(c("g n v", "a 1 1.5", "b 2 2.5", "a 3 3.5"), "same_as_text.txt")

@@ -1899,52 +1899,175 @@ fn infer_column(cells: &[String]) -> Node {
 
 // Parse a delimited-text data file (optionally gzip'd). Returns columns, names,
 // row count, format tag, and compression.
-fn read_text(path: &Path, lower: &str) -> Option<(Vec<Node>, Vec<String>, usize, &'static str, &'static str)> {
+// R's data() recognises a closed list of extensions and reads each one a fixed
+// way. It never sniffs the file. `.tab`, `.txt` and `.TXT` go through
+// read.table's default separator, which is a run of whitespace and not a tab;
+// `.csv` and `.CSV` are read with a semicolon, which is not the usual meaning of
+// the name. Guessing instead of following the list produced a different table
+// from the one anybody loading the package gets: the whitespace files collapsed
+// into a single column carrying the whole header as its name.
+const WS: char = '\0';
+const DATA_TEXT_EXTS: &[(&str, char)] = &[
+    ("tab", WS), ("txt", WS), ("TXT", WS),
+    ("tab.gz", WS), ("txt.gz", WS),
+    ("tab.bz2", WS), ("txt.bz2", WS),
+    ("tab.xz", WS), ("txt.xz", WS),
+    ("csv", ';'), ("CSV", ';'),
+    ("csv.gz", ';'), ("csv.bz2", ';'), ("csv.xz", ';'),
+];
+
+/// The separator R would use for this file, or None if data() cannot load it at
+/// all. `.dat`, `.tsv` and `.rds` are not on the list: a file with one of those
+/// names sits in data/ unreachable, so reporting it as a dataset would describe
+/// something no user can load.
+pub fn text_data_sep(fname: &str) -> Option<char> {
+    DATA_TEXT_EXTS.iter().find_map(|(ext, sep)| {
+        let suffix = format!(".{ext}");
+        (fname.len() > suffix.len() && fname.ends_with(&suffix)).then_some(*sep)
+    })
+}
+
+/// read.table's field splitter: quotes protect a separator, an unquoted # ends
+/// the line, and under the whitespace separator a run counts once.
+fn split_fields(line: &str, sep: char) -> Vec<String> {
+    match split_quoted(line, sep, true) {
+        Some(f) => f,
+        // An apostrophe in an unquoted field opens a quote that never closes.
+        // R treats that as a broken file; read the line literally instead of
+        // swallowing the rest of it.
+        None => split_quoted(line, sep, false).unwrap_or_default(),
+    }
+}
+
+fn split_quoted(line: &str, sep: char, quoting: bool) -> Option<Vec<String>> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut quote: Option<char> = None;
+    let mut started = false;
+    for c in line.chars() {
+        match quote {
+            Some(q) => {
+                if c == q {
+                    quote = None;
+                } else {
+                    cur.push(c);
+                }
+            }
+            None => {
+                if c == '#' {
+                    break;
+                } else if quoting && (c == '"' || c == '\'') {
+                    quote = Some(c);
+                    started = true;
+                } else if sep == WS && c.is_whitespace() {
+                    if started {
+                        out.push(std::mem::take(&mut cur));
+                        started = false;
+                    }
+                } else if sep != WS && c == sep {
+                    out.push(std::mem::take(&mut cur));
+                    started = false;
+                } else {
+                    cur.push(c);
+                    started = true;
+                }
+            }
+        }
+    }
+    if quote.is_some() {
+        return None;
+    }
+    if started || sep != WS {
+        out.push(cur);
+    }
+    Some(out.iter().map(|f| f.trim().to_string()).collect())
+}
+
+/// R runs header names through make.names, so the name recorded here is the one
+/// a caller sees, and the schema fingerprint is taken over the same strings.
+fn make_names(raw: &str) -> String {
+    let mut out: String = raw
+        .chars()
+        .map(|c| if c.is_alphanumeric() || c == '.' || c == '_' { c } else { '.' })
+        .collect();
+    let first = out.chars().next().unwrap_or('.');
+    let second = out.chars().nth(1);
+    if out.is_empty()
+        || first.is_ascii_digit()
+        || first == '_'
+        || (first == '.' && second.map(|c| c.is_ascii_digit()).unwrap_or(false))
+    {
+        out.insert(0, 'X');
+    }
+    out
+}
+
+fn read_text(path: &Path, fname: &str) -> Option<(Vec<Node>, Vec<String>, usize, &'static str, &'static str)> {
+    let sep = text_data_sep(fname)?;
     let raw = std::fs::read(path).ok()?;
     let (bytes, comp): (Vec<u8>, &'static str) = if raw.len() >= 2 && raw[0] == 0x1f && raw[1] == 0x8b {
         use std::io::Read;
-        let mut d = flate2::read::GzDecoder::new(&raw[..]);
         let mut o = Vec::new();
-        d.read_to_end(&mut o).ok()?;
+        flate2::read::GzDecoder::new(&raw[..]).read_to_end(&mut o).ok()?;
         (o, "gzip")
+    } else if raw.starts_with(b"BZh") {
+        use std::io::Read;
+        let mut o = Vec::new();
+        bzip2::read::BzDecoder::new(&raw[..]).read_to_end(&mut o).ok()?;
+        (o, "bzip2")
+    } else if raw.starts_with(&[0xfd, b'7', b'z', b'X', b'Z', 0x00]) {
+        use std::io::Read;
+        let mut o = Vec::new();
+        xz2::read::XzDecoder::new(&raw[..]).read_to_end(&mut o).ok()?;
+        (o, "xz")
     } else {
         (raw, "none")
     };
     let text = String::from_utf8_lossy(&bytes);
-    let mut it = text.lines().filter(|l| !l.trim().is_empty());
-    let header = it.next()?;
-    let (delim, fmt) = if lower.contains(".tsv") || lower.contains(".tab") {
-        ('\t', "tab")
-    } else if lower.contains(".csv") {
-        (',', "csv")
-    } else if header.contains('\t') && header.matches('\t').count() >= header.matches(',').count() {
-        ('\t', "txt")
-    } else if header.contains(',') {
-        (',', "txt")
-    } else if header.contains(';') {
-        (';', "txt")
-    } else {
-        (',', "txt")
-    };
-    let split = |s: &str| -> Vec<String> {
-        s.split(delim).map(|f| f.trim().trim_matches('"').to_string()).collect()
-    };
-    let names = split(header);
+    let fmt = if sep == WS { "tab" } else { "csv" };
+
+    let mut rows: Vec<Vec<String>> = Vec::new();
+    let mut header: Option<Vec<String>> = None;
+    for line in text.lines() {
+        let f = split_fields(line, sep);
+        if f.is_empty() || f.iter().all(|x| x.is_empty()) {
+            continue;
+        }
+        match header {
+            None => header = Some(f),
+            Some(_) => rows.push(f),
+        }
+    }
+    let mut names: Vec<String> = header?.iter().map(|n| make_names(n)).collect();
     let ncol = names.len();
     if ncol == 0 {
         return None;
     }
-    let mut cells: Vec<Vec<String>> = vec![Vec::new(); ncol];
-    let mut nrow = 0usize;
-    for line in it {
-        let f = split(line);
-        for (j, cell) in cells.iter_mut().enumerate() {
-            cell.push(f.get(j).cloned().unwrap_or_default());
+    // read.table's row-names rule: a header one field shorter than the body
+    // means the first field of each row names it rather than being data.
+    let has_row_names = rows.first().map(|r| r.len() == ncol + 1).unwrap_or(false);
+    if has_row_names {
+        for r in rows.iter_mut() {
+            if !r.is_empty() {
+                r.remove(0);
+            }
         }
-        nrow += 1;
+    }
+    // A short row is padded and a long one is truncated, so the frame stays
+    // rectangular rather than losing a column to one ragged line.
+    let mut cells: Vec<Vec<String>> = vec![Vec::new(); ncol];
+    for r in &rows {
+        for (j, cell) in cells.iter_mut().enumerate() {
+            cell.push(r.get(j).cloned().unwrap_or_default());
+        }
+    }
+    for (j, n) in names.iter_mut().enumerate() {
+        if n.is_empty() {
+            *n = format!("V{}", j + 1);
+        }
     }
     let cols: Vec<Node> = (0..ncol).map(|j| infer_column(&cells[j])).collect();
-    Some((cols, names, nrow, fmt, comp))
+    Some((cols, names, rows.len(), fmt, comp))
 }
 
 /// Emit one `dataset` record per dataset shipped under `root`'s data/ directory
@@ -1973,8 +2096,10 @@ pub fn scan_package(root: &Path) -> Vec<Value> {
 
         let is_rbin = lower.ends_with(".rda") || lower.ends_with(".rdata") || lower.ends_with(".rds");
         let is_script = lower.ends_with(".r");
-        let is_text = !is_rbin
-            && [".csv", ".tab", ".txt", ".tsv"].iter().any(|e| lower.contains(e));
+        // Only the extensions data() actually dispatches on. A .tsv or a .dat
+        // in data/ is not loadable, so describing one would put a dataset in the
+        // catalogue that nobody can reach.
+        let is_text = !is_rbin && text_data_sep(fname).is_some();
 
         if is_rbin {
             match read_file(&path) {
@@ -1997,7 +2122,7 @@ pub fn scan_package(root: &Path) -> Vec<Value> {
                 "confidence": "needs_r", "notes": "R script data (requires R)"
             }));
         } else if is_text {
-            match read_text(&path, &lower) {
+            match read_text(&path, fname) {
                 Some((cols, names, nrow, fmt, comp)) => {
                     let refs: Vec<&Node> = cols.iter().collect();
                     let mut rec = json!({
@@ -2213,6 +2338,97 @@ mod tests {
 
     /// An empty table is a fact, not a failure. It used to be reported as
     /// "value scan skipped (size cap)", naming a cause that had not happened.
+    fn cols(r: &Value) -> Vec<String> {
+        r["columns"]
+            .as_array()
+            .map(|a| a.iter().map(|c| s(c, "name")).collect())
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn a_whitespace_table_is_not_split_on_tabs() {
+        // read.table's default separator is a run of whitespace. Splitting on
+        // the tab character instead collapsed these files into one column
+        // carrying the entire header as its name.
+        let r = by_name("txt_plain");
+        assert_eq!(r["nrow"], 3);
+        assert_eq!(r["ncol"], 3);
+        assert_eq!(cols(&r), ["grade", "sex", "score"]);
+    }
+
+    #[test]
+    fn a_header_one_field_short_names_the_rows() {
+        // Four fields per row against three names means the first is a row name
+        // rather than data, which is how R reads it.
+        let r = by_name("tab_rownames");
+        assert_eq!(r["ncol"], 3);
+        assert_eq!(cols(&r), ["Expt", "Run", "Speed"]);
+        assert_eq!(r["nrow"], 3);
+        // The shape alone does not prove it: dropping the rule keeps three
+        // columns and shifts the values along by one. Expt is 1, 1, 2 once the
+        // row names are out of the way, and 1, 2, 3 while they are still in it.
+        assert_eq!(r["columns"][0]["col_max"], 2);
+    }
+
+    #[test]
+    fn a_csv_under_data_is_separated_by_semicolons() {
+        // Not what the name suggests, but it is what data() does, so a comma
+        // file put here really does load as a single column and the catalogue
+        // should say so rather than quietly reading it the sensible way.
+        let semi = by_name("csv_semicolon");
+        assert_eq!(semi["ncol"], 3);
+        assert_eq!(cols(&semi), ["height", "weight", "sex"]);
+        let comma = by_name("csv_comma");
+        assert_eq!(comma["ncol"], 1);
+        assert_eq!(cols(&comma), ["height.weight.sex"]);
+    }
+
+    #[test]
+    fn quotes_protect_a_separator_inside_a_field() {
+        let r = by_name("csv_quoted");
+        assert_eq!(r["ncol"], 2);
+        assert_eq!(cols(&r), ["city", "pop"]);
+        assert_eq!(r["nrow"], 2);
+    }
+
+    #[test]
+    fn a_comment_does_not_become_data() {
+        let r = by_name("txt_comments");
+        assert_eq!(r["nrow"], 2);
+        assert_eq!(r["ncol"], 2);
+        assert_eq!(cols(&r), ["x", "y"]);
+    }
+
+    #[test]
+    fn all_three_compressions_are_read() {
+        for (name, comp) in [("txt_gz", "gzip"), ("txt_bz2", "bzip2"), ("txt_xz", "xz")] {
+            let r = by_name(name);
+            assert_eq!(s(&r, "compression"), comp, "{name}");
+            assert_eq!(r["nrow"], 3, "{name}");
+            assert_eq!(r["ncol"], 2, "{name}");
+        }
+    }
+
+    #[test]
+    fn a_file_data_cannot_load_is_not_called_a_dataset() {
+        // .dat and .tsv have no entry in data(), so a file with either name sits
+        // in data/ unreachable. Reporting one would put a dataset in the
+        // catalogue that nobody can load.
+        assert!(
+            records().iter().all(|r| s(r, "name") != "notdata"),
+            "a format data() cannot load was reported as a dataset"
+        );
+    }
+
+    #[test]
+    fn one_table_written_two_ways_carries_one_fingerprint() {
+        let a = by_name("same_as_rda");
+        let b = by_name("same_as_text");
+        assert!(!s(&a, "content_fp").is_empty());
+        assert_eq!(s(&a, "content_fp"), s(&b, "content_fp"));
+        assert_eq!(s(&a, "schema_fp"), s(&b, "schema_fp"));
+    }
+
     #[test]
     fn compiled_code_does_not_cost_the_rest_of_its_file() {
         // The regression this whole reader exists for: a compiled function body
@@ -2395,7 +2611,7 @@ mod tests {
     #[test]
     fn every_fixture_is_readable() {
         let recs = records();
-        assert_eq!(recs.len(), 45, "one record per saved object");
+        assert_eq!(recs.len(), 56, "one record per saved object");
         // Not everything saved under data/ is data. These carry behaviour rather
         // than observations, so there is nothing to fingerprint; what they must
         // still do is read cleanly, because a file that fails mid-object takes
@@ -2416,7 +2632,11 @@ mod tests {
             if objects.contains(&name.as_str()) {
                 continue;
             }
-            assert_ne!(s(r, "confidence"), "degraded", "{name} degraded");
+            // A text file declares no types, so they are inferred and the record
+            // says so. It still has to profile.
+            if !notes.starts_with("text:") {
+                assert_ne!(s(r, "confidence"), "degraded", "{name} degraded");
+            }
             assert!(!s(r, "content_fp").is_empty(), "{name} has no fingerprint");
         }
     }
