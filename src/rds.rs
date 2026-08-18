@@ -345,6 +345,69 @@ impl<'a> Reader<'a> {
     }
 }
 
+/// Attribute names this reader consumes by name. Everything else is metadata an
+/// author chose to attach, and is reported rather than silently ignored.
+const CONSUMED_ATTRS: &[&str] = &[
+    "class", "levels", "row.names", "names", "dim", "dimnames", "package", "nrows",
+    "listData", "elementMetadata", "tsp", "index", "frequency", "crs", "bbox",
+    "data", "proj4string", "coords", "coords.nrs", "comment", "label", "units",
+];
+
+/// Short scalar text from an attribute, for the ones worth storing whole.
+fn attr_text(pairs: &[(String, &Node)], key: &str, cap: usize) -> Option<String> {
+    let v = attr(pairs, key)?;
+    let t = match &v.val {
+        Val::Str(items) => items.first().and_then(|x| x.clone())?,
+        Val::Sym(x) => x.clone(),
+        Val::Char(Some(x)) => x.clone(),
+        _ => return None,
+    };
+    if t.is_empty() {
+        return None;
+    }
+    Some(t.chars().take(cap).collect())
+}
+
+/// Human-written description and any attribute names this reader does not
+/// otherwise consume.
+///
+/// Authors attach a great deal of metadata that nothing was looking at: `label`
+/// and `variable.labels` from the survey packages, `units`, base R's `comment`,
+/// readr's `spec`, tsibble's `key`, and one-off things like a source URL or a
+/// licence. Recording the NAMES of whatever is not consumed costs a short list
+/// and makes the corpus self-describing: after one pass the set of attributes
+/// CRAN actually uses is measured rather than guessed, which is the only sound
+/// basis for deciding what to promote to a field of its own later.
+fn describe_attrs(pairs: &[(String, &Node)], out: &mut Value) {
+    if let Some(t) = attr_text(pairs, "label", 200) {
+        out["label"] = json!(t);
+    }
+    if let Some(t) = attr_text(pairs, "comment", 400) {
+        out["comment"] = json!(t);
+    }
+    if let Some(t) = attr_text(pairs, "units", 40) {
+        out["units"] = json!(t);
+    }
+    // An attribute this reader tried to read but could not extract a value from
+    // (units is sometimes a list rather than a string) still gets reported by
+    // name. Dropping it would say it was not there, which is a different claim.
+    let mut other: Vec<String> = pairs
+        .iter()
+        .map(|(k, _)| k.clone())
+        .filter(|k| {
+            !CONSUMED_ATTRS.contains(&k.as_str())
+                || (matches!(k.as_str(), "label" | "comment" | "units") && out.get(k).is_none())
+        })
+        .collect();
+    other.sort();
+    other.dedup();
+    if !other.is_empty() {
+        // Bounded: a pathological object cannot turn this into a payload.
+        other.truncate(24);
+        out["attrs_other"] = json!(other);
+    }
+}
+
 /// Authority code from a WKT string, taken from the last ID[...] clause.
 ///
 /// WKT2 nests ID clauses (the datum and the ellipsoid carry their own), and the
@@ -902,6 +965,7 @@ fn profile_columns(cols: &[&Node], names: &[String]) -> Option<Profile> {
             }
         }
         spatial_fields(col, &mut o);
+        describe_attrs(&attr_pairs(col), &mut o);
         col_json.push(o);
         col_fp_bytes.extend_from_slice(fp.as_bytes());
         col_fp_bytes.push(b'|');
@@ -1116,7 +1180,22 @@ fn describe(
             } else {
                 rec["notes"] = json!("sp-spatial-geometry-only");
             }
+            describe_attrs(&pairs, &mut rec);
             return rec;
+        }
+        // Matrix and other S4 classes state their shape in a `Dim` slot, which
+        // is an ordinary integer pair sitting in the attribute list. Without it
+        // a sparse matrix reported a class name and no shape at all.
+        if let Some(Val::Ints { vals, .. }) = attr(&pairs, "Dim").map(|n| &n.val) {
+            if vals.len() >= 2 {
+                rec["kind"] = json!(klass.clone());
+                rec["nrow"] = json!(vals[0] as i64);
+                rec["ncol"] = json!(vals[1] as i64);
+                rec["length"] = json!(vals[0] as i64 * vals[1] as i64);
+                rec["notes"] = json!("s4-dim-slot");
+                describe_attrs(&pairs, &mut rec);
+                return rec;
+            }
         }
         // DataFrame-like S4 (S4Vectors): dims from the nrows/listData slots.
         if (klass == "DFrame" || klass == "DataFrame") && dataframe_dims(&pairs).is_some() {
@@ -1139,6 +1218,7 @@ fn describe(
         } else {
             rec["notes"] = json!("s4-class-only");
         }
+        describe_attrs(&pairs, &mut rec);
         return rec;
     }
 
@@ -1194,6 +1274,7 @@ fn describe(
                 rec["notes"] = json!("value scan skipped (size cap)");
             }
         }
+        describe_attrs(&pairs, &mut rec);
         return rec;
     }
 
@@ -1227,6 +1308,7 @@ fn describe(
                 rec["has_dimnames"] = json!(!matches!(dn.val, Val::Nil));
             }
             series_fields(&pairs, &mut rec);
+            describe_attrs(&pairs, &mut rec);
             // A matrix is a table of values like any other, so it gets a real
             // fingerprint rather than being dropped for want of one. Column-major
             // storage means column j is a contiguous run, so the flat vector
@@ -1283,6 +1365,7 @@ fn describe(
         "confidence": "exact"
     });
     series_fields(&pairs, &mut rec);
+    describe_attrs(&pairs, &mut rec);
     if kind == "vector" || kind == "list" {
         if let Some(p) = profile_columns(&[node], std::slice::from_ref(&name.to_string())) {
             rec["n_missing_total"] = json!(p.n_missing_total);
@@ -1759,12 +1842,58 @@ mod tests {
         assert!(!s(&r, "content_fp").is_empty());
     }
 
+    /// Authors attach far more metadata than this reader consumes by name.
+    /// Reporting the names of what is left makes the corpus self-describing:
+    /// after one pass, what CRAN actually uses is measured rather than guessed.
+    #[test]
+    fn unconsumed_attributes_are_named_not_ignored() {
+        let r = by_name("author_metadata");
+        let names: Vec<String> = serde_json::from_value(r["attrs_other"].clone()).unwrap();
+        for want in ["collected", "license", "source_url"] {
+            assert!(names.iter().any(|n| n == want), "{want} should be reported");
+        }
+        // The names this reader does consume are not repeated back as unknowns.
+        assert!(!names.iter().any(|n| n == "class" || n == "names" || n == "row.names"));
+    }
+
+    /// A human-written description of the data, which nothing was reading.
+    #[test]
+    fn a_label_and_a_comment_are_captured() {
+        assert_eq!(s(&by_name("labelled_frame"), "label"), "Survey wave 1");
+        assert_eq!(s(&by_name("commented"), "comment"), "Collected 2019, see vignette");
+    }
+
+    /// The survey packages put the label on the column, not the object.
+    #[test]
+    fn a_column_carries_its_own_label_and_units() {
+        let r = by_name("hmisc_labels");
+        let cols: Vec<Value> = serde_json::from_value(r["columns"].clone()).unwrap();
+        let c = cols.iter().find(|c| s(c, "name") == "wt").expect("the wt column");
+        assert_eq!(s(c, "label"), "Body weight");
+        assert_eq!(s(c, "units"), "kg");
+    }
+
+    /// Matrix states its shape in a Dim slot; without reading it a sparse matrix
+    /// was a class name and nothing else.
+    #[test]
+    fn an_s4_dim_slot_gives_a_shape() {
+        let r = by_name("sparse_matrix");
+        assert_eq!(r["nrow"], 2);
+        assert_eq!(r["ncol"], 2);
+        assert_eq!(r["length"], 4);
+    }
+
     #[test]
     fn every_fixture_is_readable() {
         let recs = records();
-        assert_eq!(recs.len(), 21, "one record per fixture");
+        assert_eq!(recs.len(), 26, "one record per fixture");
+        // sparse_matrix is S4 with no materialized value vector, so it carries a
+        // shape but no fingerprint. Everything else must be fully read.
         for r in &recs {
             let name = s(r, "name");
+            if name == "sparse_matrix" {
+                continue;
+            }
             assert_ne!(s(r, "confidence"), "degraded", "{name} degraded");
             assert!(!s(r, "content_fp").is_empty(), "{name} has no fingerprint");
         }
