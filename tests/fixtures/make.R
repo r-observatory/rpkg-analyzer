@@ -29,3 +29,29 @@ sv(factor(c("a","b","a","c")), "fac", 2)
 sv(as.Date("2020-01-01") + 0:9, "dates", 2)
 sv(as.POSIXct("2020-01-01 10:00", tz = "UTC") + 0:4, "times", 2)
 cat("fixtures:", length(list.files(d)), "\n")
+
+# Real objects from real packages, committed so the suite needs neither sf, sp,
+# data.table nor zoo installed. Each caught something a hand-built imitation did
+# not: sf's own nc example names its CRS rather than declaring an EPSG code, and
+# every data.table carries an external pointer.
+if (requireNamespace("sf", quietly = TRUE)) {
+  nc <- sf::st_read(system.file("shape/nc.shp", package = "sf"), quiet = TRUE)
+  sv(nc, "real_sf_nc", 3)
+  sv(sf::st_as_sf(data.frame(id = 1:5, x = 1:5, y = 5:1), coords = c("x", "y"), crs = 3857),
+     "real_sf_points", 3)
+}
+if (requireNamespace("sp", quietly = TRUE)) {
+  sv(sp::SpatialPointsDataFrame(cbind(c(1, 2, 3), c(4, 5, 6)), data.frame(v = c(10, 20, 30)),
+                                proj4string = sp::CRS("+proj=longlat +datum=WGS84")),
+     "real_sp_points", 3)
+}
+if (requireNamespace("data.table", quietly = TRUE)) {
+  sv(data.table::data.table(id = 1:100, grp = rep(letters[1:4], 25), val = seq_len(100) / 7),
+     "real_datatable", 3)
+  sv(data.table::data.table(a = 1:3, b = letters[1:3]), "a_datatable", 3)
+}
+sv(AirPassengers, "real_ts_air", 3)
+if (requireNamespace("zoo", quietly = TRUE)) {
+  sv(zoo::zoo(seq_len(50) / 3, as.Date("2020-01-01") + 0:49), "real_zoo_date", 3)
+}
+sv(data.frame(a = integer(0), b = character(0)), "frame_zero_rows", 3)
