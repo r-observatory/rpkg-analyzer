@@ -16,6 +16,9 @@ use std::path::Path;
 
 const SYMSXP: u8 = 1;
 const CLOSXP: u8 = 3;
+const PROMSXP: u8 = 5;
+const DOTSXP: u8 = 17;
+const EXTPTRSXP: u8 = 22;
 const ENVSXP: u8 = 4;
 const LANGSXP: u8 = 6;
 const LISTSXP: u8 = 2;
@@ -247,7 +250,7 @@ impl<'a> Reader<'a> {
                 let attr = self.maybe_attr(ha)?;
                 Ok(Node { val: Val::Vec(els), attr })
             }
-            LISTSXP | LANGSXP => {
+            LISTSXP | LANGSXP | CLOSXP | PROMSXP | DOTSXP => {
                 let attr = self.maybe_attr(ha)?;
                 let tag = if hg {
                     Box::new(self.item()?)
@@ -278,6 +281,20 @@ impl<'a> Reader<'a> {
             // must be consumed exactly, because an environment occupies a slot
             // in the reference table and a closure carries three payload items.
             // Skipping either by erroring loses every object in the file.
+            // An external pointer. data.table puts one on every table as
+            // `.internal.selfref`, so rejecting the type lost the whole file for
+            // one of the most widely shipped data classes on CRAN. Like an
+            // environment it takes a reference-table slot, then two items.
+            EXTPTRSXP => {
+                let slot = self.refs.len();
+                self.refs.push(Node { val: Val::Nil, attr: None });
+                let _prot = self.item()?;
+                let _tag = self.item()?;
+                let attr = self.maybe_attr(ha)?;
+                let node = Node { val: Val::Nil, attr };
+                self.refs[slot] = node.clone();
+                Ok(node)
+            }
             ENVSXP => {
                 // Reserve the reference slot before descending, so any REFSXP
                 // written after this one resolves to the right index.
@@ -295,16 +312,6 @@ impl<'a> Reader<'a> {
                 let node = Node { val: Val::S4, attr };
                 self.refs[slot] = node.clone();
                 Ok(node)
-            }
-            CLOSXP => {
-                let attr = self.maybe_attr(ha)?;
-                if hg {
-                    let _tag = self.item()?;
-                }
-                let _env = self.item()?;
-                let _formals = self.item()?;
-                let _body = self.item()?;
-                Ok(Node { val: Val::S4, attr })
             }
             ALTREP_SXP => {
                 let info = self.item()?;
@@ -336,6 +343,34 @@ impl<'a> Reader<'a> {
             other => Err(format!("unhandled SEXPTYPE {other}")),
         }
     }
+}
+
+/// Authority code from a WKT string, taken from the last ID[...] clause.
+///
+/// WKT2 nests ID clauses (the datum and the ellipsoid carry their own), and the
+/// one describing the CRS itself is the outermost, which is written last.
+fn wkt_epsg(wkt: &str) -> Option<i64> {
+    let mut found = None;
+    let mut rest = wkt;
+    while let Some(i) = rest.find("ID[") {
+        let tail = &rest[i + 3..];
+        let end = match tail.find(']') {
+            Some(e) => e,
+            None => break,
+        };
+        let body = &tail[..end];
+        let mut parts = body.splitn(2, ',');
+        let auth = parts.next().unwrap_or("").trim().trim_matches('"');
+        if auth.eq_ignore_ascii_case("EPSG") {
+            if let Some(code) = parts.next() {
+                if let Ok(n) = code.trim().trim_matches('"').parse::<i64>() {
+                    found = Some(n);
+                }
+            }
+        }
+        rest = &tail[end..];
+    }
+    found
 }
 
 /// Coordinate-reference and extent fields for a geometry column.
@@ -377,9 +412,22 @@ fn spatial_fields(col: &Node, o: &mut Value) {
                             }
                         }
                     }
-                    // A WKT2 string runs to a few KB and the value is in having
-                    // it at all, not in storing every axis definition.
-                    "wkt" => o["crs_wkt"] = json!(first.chars().take(512).collect::<String>()),
+                    "wkt" => {
+                        // The authority code is the LAST thing in a WKT2 string,
+                        // so it has to be read before truncating: sf's own nc
+                        // example names its CRS "NAD27" rather than "EPSG:4267",
+                        // and the only 4267 in the object is that trailing ID.
+                        if let Some(code) = wkt_epsg(first) {
+                            o["crs_epsg"] = json!(code);
+                        }
+                        // 128, not 512. Measured on real sf objects the WKT was
+                        // 76% of everything a geometry column adds, for text that
+                        // mostly restates crs_epsg. The head carries the CRS name
+                        // and datum, which is what a reader wants when there is no
+                        // authority code; the axis definitions are not worth
+                        // 50,000 copies.
+                        o["crs_wkt"] = json!(first.chars().take(128).collect::<String>());
+                    }
                     _ => {}
                 }
             }
@@ -764,12 +812,23 @@ struct Profile {
 // Profile a set of columns (a data frame, or a single atomic vector as one
 // column). Returns None if values were not materialized (over the cap).
 fn profile_columns(cols: &[&Node], names: &[String]) -> Option<Profile> {
-    // A column with materialized values; a value-less (capped) column aborts.
+    // Two different things used to be one. A column whose values were never
+    // materialized (over the cap, or a type this reader skips) genuinely cannot
+    // be profiled. A frame with no rows can: its schema is known, its content is
+    // empty, and an empty table is a fact rather than a failure. Conflating them
+    // reported every zero-row dataset as "value scan skipped (size cap)", which
+    // named a cause that had not happened.
     let n = cols.iter().map(|c| col_len(c)).min().unwrap_or(0);
-    let any_lenless = cols.iter().any(|c| col_len(c) == 0 && !matches!(c.val, Val::Str(_)));
-    if n == 0 || any_lenless {
+    // Materialized is the test, not non-empty: `integer(0)` is a column whose
+    // values were read and there are none of them, while a capped or skipped
+    // column has no values to read at all. Only the second can defeat a profile.
+    let any_unread = cols.iter().any(|c| {
+        !matches!(c.val, Val::Ints { .. } | Val::Reals { .. } | Val::Str(_) | Val::Vec(_))
+    });
+    if any_unread {
         return None;
     }
+    let _ = n;
 
     let mut col_json = Vec::with_capacity(cols.len());
     let mut col_fp_bytes: Vec<u8> = Vec::new();
@@ -996,6 +1055,69 @@ fn describe(
             "internal": internal, "class": format!("S4:{klass}"), "s4_package": pkg,
             "confidence": "degraded"
         });
+        // sp: the spatial classes are S4 whose slots are the attribute list, so
+        // the attributes carry the whole object. A Spatial*DataFrame keeps its
+        // table in `data`, its extent in `bbox` and its projection in
+        // `proj4string`, none of which was read: an sp object arrived as a class
+        // name and nothing else.
+        let sp_data = attr(&pairs, "data");
+        let sp_bbox = attr(&pairs, "bbox");
+        if sp_bbox.is_some() || klass.starts_with("Spatial") {
+            rec["kind"] = json!(klass.clone());
+            rec["is_spatial"] = json!(true);
+            if let Some(d) = sp_data {
+                let dp = attr_pairs(d);
+                if let Some(r) = nrow_of(attr(&dp, "row.names")) {
+                    rec["nrow"] = json!(r);
+                }
+                if let Val::Vec(cols) = &d.val {
+                    rec["ncol"] = json!(cols.len());
+                    let names = attr(&dp, "names").map(str_vec).unwrap_or_default();
+                    let refs: Vec<&Node> = cols.iter().collect();
+                    if let Some(pr) = profile_columns(&refs, &names) {
+                        rec["n_missing_total"] = json!(pr.n_missing_total);
+                        rec["schema_fp"] = json!(pr.schema_fp);
+                        rec["shape_fp"] = json!(pr.shape_fp);
+                        rec["content_fp"] = json!(pr.content_fp);
+                        rec["row_sketch"] = json!(pr.row_sketch);
+                        rec["columns"] = json!(pr.columns);
+                    }
+                }
+            }
+            // bbox is a 2x2 matrix stored column-major as xmin, ymin, xmax, ymax.
+            if let Some(Val::Reals { vals, .. }) = sp_bbox.map(|n| &n.val) {
+                if vals.len() >= 4 {
+                    rec["bbox"] = json!(vals[..4]);
+                }
+            }
+            if let Some(pj) = attr(&pairs, "proj4string") {
+                let pp = attr_pairs(pj);
+                if let Some(args) = attr(&pp, "projargs") {
+                    let txt = str_vec(args);
+                    if let Some(first) = txt.first() {
+                        if !first.is_empty() {
+                            rec["crs_input"] = json!(first);
+                            if let Some(i) = first.find("+init=epsg:") {
+                                let code: String = first[i + 11..]
+                                    .chars()
+                                    .take_while(|c| c.is_ascii_digit())
+                                    .collect();
+                                if let Ok(n) = code.parse::<i64>() {
+                                    rec["crs_epsg"] = json!(n);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            if rec.get("content_fp").is_some() {
+                rec["confidence"] = json!("exact");
+                rec["notes"] = json!("sp-spatial");
+            } else {
+                rec["notes"] = json!("sp-spatial-geometry-only");
+            }
+            return rec;
+        }
         // DataFrame-like S4 (S4Vectors): dims from the nrows/listData slots.
         if (klass == "DFrame" || klass == "DataFrame") && dataframe_dims(&pairs).is_some() {
             let (r, c) = dataframe_dims(&pairs).unwrap();
@@ -1566,10 +1688,81 @@ mod tests {
         assert!(!s(&r, "content_fp").is_empty());
     }
 
+    /// Real sf, not a hand-built imitation. The nc example names its CRS
+    /// "NAD27" and puts the authority code only in the trailing ID clause of a
+    /// WKT longer than the stored cap, so reading the code after truncating
+    /// silently lost it.
+    #[test]
+    fn a_real_sf_object_yields_its_epsg_from_the_wkt() {
+        let r = by_name("real_sf_nc");
+        assert_eq!(s(&r, "confidence"), "exact");
+        let cols: Vec<Value> = serde_json::from_value(r["columns"].clone()).unwrap();
+        let g = cols.iter().find(|c| c["is_geometry"] == true).expect("a geometry column");
+        assert_eq!(g["crs_epsg"], 4267, "read from ID[\"EPSG\",4267] at the end of the WKT");
+        assert_eq!(s(g, "crs_input"), "NAD27", "which is not an EPSG string");
+        assert_eq!(s(g, "geom_type"), "MULTIPOLYGON");
+        assert_eq!(g["n_geometries"], 100);
+    }
+
+    #[test]
+    fn a_projected_sf_object_keeps_its_declared_code() {
+        let r = by_name("real_sf_points");
+        let cols: Vec<Value> = serde_json::from_value(r["columns"].clone()).unwrap();
+        let g = cols.iter().find(|c| c["is_geometry"] == true).unwrap();
+        assert_eq!(g["crs_epsg"], 3857);
+        assert_eq!(s(g, "geom_type"), "POINT");
+    }
+
+    /// sp is S4 and its slots are the attribute list: the table in `data`, the
+    /// extent in `bbox`, the projection in `proj4string`. None was read, so an
+    /// sp object arrived as a class name and nothing else.
+    #[test]
+    fn an_sp_object_is_more_than_its_class_name() {
+        let r = by_name("real_sp_points");
+        assert_eq!(s(&r, "confidence"), "exact");
+        assert_eq!(r["nrow"], 3, "from the data slot");
+        assert_eq!(r["is_spatial"], true);
+        assert!(r["bbox"].is_array(), "and an extent");
+        assert!(!s(&r, "content_fp").is_empty());
+    }
+
+    /// Every data.table carries `.internal.selfref`, an external pointer. The
+    /// type was unhandled, and because that aborts the stream it lost the file.
+    #[test]
+    fn a_data_table_survives_its_external_pointer() {
+        for n in ["real_datatable", "a_datatable"] {
+            let r = by_name(n);
+            assert_eq!(s(&r, "confidence"), "exact", "{n}");
+            assert!(!s(&r, "content_fp").is_empty(), "{n} has no fingerprint");
+        }
+    }
+
+    #[test]
+    fn real_series_objects_report_their_span() {
+        let air = by_name("real_ts_air");
+        assert_eq!(air["ts_frequency"], 12.0);
+        assert_eq!(air["ts_start"], 1949.0);
+        assert_eq!(air["length"], 144);
+
+        let z = by_name("real_zoo_date");
+        assert_eq!(z["index_n"], 50);
+        assert_eq!(s(&z, "index_class"), "Date", "so the index numbers mean days");
+    }
+
+    /// An empty table is a fact, not a failure. It used to be reported as
+    /// "value scan skipped (size cap)", naming a cause that had not happened.
+    #[test]
+    fn a_zero_row_frame_is_described_not_blamed() {
+        let r = by_name("frame_zero_rows");
+        assert_eq!(s(&r, "confidence"), "exact");
+        assert_eq!(r["nrow"], 0);
+        assert!(!s(&r, "content_fp").is_empty());
+    }
+
     #[test]
     fn every_fixture_is_readable() {
         let recs = records();
-        assert_eq!(recs.len(), 13, "one record per fixture");
+        assert_eq!(recs.len(), 21, "one record per fixture");
         for r in &recs {
             let name = s(r, "name");
             assert_ne!(s(r, "confidence"), "degraded", "{name} degraded");
