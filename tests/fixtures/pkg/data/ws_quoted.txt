@@ -1,0 +1,3 @@
+name	n
+"New York"	1
+"Los Angeles"	2

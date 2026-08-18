@@ -180,3 +180,12 @@ wl(c("g n v", "a 1 1.5", "b 2 2.5", "a 3 3.5"), "same_as_text.txt")
 # data() has no entry for .rds, and in an installed package data/Rdata.rds is
 # the lazy-load index rather than a dataset.
 saveRDS(data.frame(a = 1:3), file.path(d, "notdata.rds"))
+
+# Whitespace separation is not the same as tab separation, and these are the
+# places the two come apart. R reads all of them one fixed way, so the catalogue
+# describes what a caller gets rather than what the file looks like it means.
+wl(c("name\tcity\tn",              # a value holding a space is split by it, and
+     "ann\tNew York\t1",           # the leftmost field then reads as a row name
+     "bob\tLos Angeles\t2"), "ws_value_has_space.txt")
+wl(c("a\tb\tc", "1\t\t3", "4\t5\t6"), "ws_ragged.tab")   # empty cell: read.table refuses
+wl(c("name\tn", '"New York"\t1', '"Los Angeles"\t2'), "ws_quoted.txt")
