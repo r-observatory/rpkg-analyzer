@@ -55,3 +55,29 @@ if (requireNamespace("zoo", quietly = TRUE)) {
   sv(zoo::zoo(seq_len(50) / 3, as.Date("2020-01-01") + 0:49), "real_zoo_date", 3)
 }
 sv(data.frame(a = integer(0), b = character(0)), "frame_zero_rows", 3)
+
+# Metadata patterns authors actually use, none of which was being read.
+lb <- c(1, 2, 1, 3)
+attr(lb, "label")  <- "Respondent age band"
+attr(lb, "labels") <- c(Young = 1, Middle = 2, Old = 3)
+attr(lb, "format.stata") <- "%9.0g"
+class(lb) <- c("haven_labelled", "vctrs_vctr", "double")
+lf <- data.frame(x = 1:4); lf$age <- lb; attr(lf, "label") <- "Survey wave 1"
+sv(lf, "labelled_frame", 3)
+
+hm <- data.frame(wt = c(1.5, 2.5))
+attr(hm$wt, "label") <- "Body weight"; attr(hm$wt, "units") <- "kg"
+sv(hm, "hmisc_labels", 3)
+
+cm <- data.frame(a = 1:3); comment(cm) <- "Collected 2019, see vignette"
+sv(cm, "commented", 3)
+
+am <- data.frame(z = 1:3)
+attr(am, "source_url") <- "https://example.org/data.csv"
+attr(am, "license")    <- "CC-BY-4.0"
+attr(am, "collected")  <- as.Date("2021-05-04")
+sv(am, "author_metadata", 3)
+
+if (requireNamespace("Matrix", quietly = TRUE)) {
+  sv(Matrix::Matrix(c(1, 0, 0, 2), 2, 2, sparse = TRUE), "sparse_matrix", 3)
+}
