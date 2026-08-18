@@ -15,6 +15,9 @@ use std::collections::HashSet;
 use std::path::Path;
 
 const SYMSXP: u8 = 1;
+const CLOSXP: u8 = 3;
+const ENVSXP: u8 = 4;
+const LANGSXP: u8 = 6;
 const LISTSXP: u8 = 2;
 const CHARSXP: u8 = 9;
 const LGLSXP: u8 = 10;
@@ -25,6 +28,15 @@ const STRSXP: u8 = 16;
 const VECSXP: u8 = 19;
 const RAWSXP: u8 = 24;
 const S4SXP: u8 = 25;
+const ALTREP_SXP: u8 = 238;
+// Singleton markers: a type byte and nothing else. R writes these where a slot
+// holds one of its well-known constants.
+const GLOBALENV_SXP: u8 = 253;
+const UNBOUNDVALUE_SXP: u8 = 252;
+const MISSINGARG_SXP: u8 = 251;
+const BASENAMESPACE_SXP: u8 = 250;
+const EMPTYENV_SXP: u8 = 242;
+const BASEENV_SXP: u8 = 241;
 const NILVALUE: u8 = 254;
 const REFSXP: u8 = 255;
 const NA_INT: i32 = i32::MIN;
@@ -129,7 +141,13 @@ impl<'a> Reader<'a> {
         let ha = f & (1 << 9) != 0;
         let hg = f & (1 << 10) != 0;
         match t {
-            0 | NILVALUE => Ok(Node { val: Val::Nil, attr: None }),
+            // No payload follows any of these, so consuming the type byte is
+            // the whole job. Erroring on them lost the file for the sake of a
+            // marker that carries no data.
+            0 | NILVALUE | GLOBALENV_SXP | UNBOUNDVALUE_SXP | MISSINGARG_SXP
+            | BASENAMESPACE_SXP | EMPTYENV_SXP | BASEENV_SXP => {
+                Ok(Node { val: Val::Nil, attr: None })
+            }
             REFSXP => {
                 let mut idx = (f >> 8) as usize;
                 if idx == 0 {
@@ -229,7 +247,7 @@ impl<'a> Reader<'a> {
                 let attr = self.maybe_attr(ha)?;
                 Ok(Node { val: Val::Vec(els), attr })
             }
-            LISTSXP => {
+            LISTSXP | LANGSXP => {
                 let attr = self.maybe_attr(ha)?;
                 let tag = if hg {
                     Box::new(self.item()?)
@@ -248,8 +266,263 @@ impl<'a> Reader<'a> {
                 };
                 Ok(Node { val: Val::S4, attr })
             }
+            // ALTREP: a compact or deferred representation standing in for an
+            // ordinary vector. Modern R writes these by default at serialization
+            // version 3, so a reader that rejects them loses the whole file, not
+            // just the one column: `data.frame(id = 1:5)` round-trips as nothing
+            // at all. The payload is always three items, so even a class this
+            // does not know how to expand can be stepped over without
+            // desynchronizing the stream.
+            // An environment or a closure inside a dataset: a model fit or a
+            // saved workspace object. Neither is data worth profiling, but both
+            // must be consumed exactly, because an environment occupies a slot
+            // in the reference table and a closure carries three payload items.
+            // Skipping either by erroring loses every object in the file.
+            ENVSXP => {
+                // Reserve the reference slot before descending, so any REFSXP
+                // written after this one resolves to the right index.
+                let slot = self.refs.len();
+                self.refs.push(Node { val: Val::S4, attr: None });
+                let _locked = self.i32()?;
+                let _enclos = self.item()?;
+                let _frame = self.item()?;
+                let _hashtab = self.item()?;
+                let attr_node = self.item()?;
+                let attr = match attr_node.val {
+                    Val::Nil => None,
+                    _ => Some(Box::new(attr_node)),
+                };
+                let node = Node { val: Val::S4, attr };
+                self.refs[slot] = node.clone();
+                Ok(node)
+            }
+            CLOSXP => {
+                let attr = self.maybe_attr(ha)?;
+                if hg {
+                    let _tag = self.item()?;
+                }
+                let _env = self.item()?;
+                let _formals = self.item()?;
+                let _body = self.item()?;
+                Ok(Node { val: Val::S4, attr })
+            }
+            ALTREP_SXP => {
+                let info = self.item()?;
+                let state = self.item()?;
+                let attr_node = self.item()?;
+                let attr = match attr_node.val {
+                    Val::Nil => None,
+                    _ => Some(Box::new(attr_node)),
+                };
+                let cls = altrep_class(&info).unwrap_or_default();
+                let val = match cls.as_str() {
+                    // state is c(length, start, step); expand it back to the
+                    // vector R would have materialized on access.
+                    "compact_intseq" => expand_seq(&state, true),
+                    "compact_realseq" => expand_seq(&state, false),
+                    // A wrapper carries the real vector as the first element of
+                    // its state and adds only metadata, so unwrap to it.
+                    _ if cls.starts_with("wrap_") => first_element(&state).map(|n| n.val.clone()),
+                    // Anything else: the state is usually the materialized data
+                    // (deferred_string, and the expanded form of any compact
+                    // class), so prefer it over failing the file.
+                    _ => Some(state.val.clone()),
+                };
+                match val {
+                    Some(v) => Ok(Node { val: v, attr }),
+                    None => Ok(Node { val: state.val, attr }),
+                }
+            }
             other => Err(format!("unhandled SEXPTYPE {other}")),
         }
+    }
+}
+
+/// Coordinate-reference and extent fields for a geometry column.
+///
+/// An sf object is an ordinary data frame whose geometry column carries the
+/// spatial metadata as its own attributes, so nothing here needs a new decode:
+/// the per-column loop already builds this column's attribute list to find
+/// factor levels. Without these fields a spatial dataset is indistinguishable
+/// from any other table, which is why nothing on the site could say where in the
+/// world a dataset describes.
+fn spatial_fields(col: &Node, o: &mut Value) {
+    let pairs = attr_pairs(col);
+    let class = attr(&pairs, "class").map(str_vec).unwrap_or_default();
+    if !class.iter().any(|c| c.starts_with("sfc")) {
+        return;
+    }
+    // sfc_POINT/sfc -> POINT
+    if let Some(g) = class.iter().find(|c| c.starts_with("sfc_")) {
+        o["geom_type"] = json!(g.trim_start_matches("sfc_"));
+    }
+    o["is_geometry"] = json!(true);
+    if let Val::Vec(items) = &col.val {
+        o["n_geometries"] = json!(items.len());
+    }
+    if let Some(crs) = attr(&pairs, "crs") {
+        // crs is a two-element list of (input, wkt), tagged by `names`.
+        let cp = attr_pairs(crs);
+        let names = attr(&cp, "names").map(str_vec).unwrap_or_default();
+        if let Val::Vec(items) = &crs.val {
+            for (i, nm) in names.iter().enumerate() {
+                let txt = items.get(i).map(str_vec).unwrap_or_default();
+                let Some(first) = txt.first() else { continue };
+                match nm.as_str() {
+                    "input" => {
+                        o["crs_input"] = json!(first);
+                        if let Some(code) = first.strip_prefix("EPSG:") {
+                            if let Ok(n) = code.parse::<i64>() {
+                                o["crs_epsg"] = json!(n);
+                            }
+                        }
+                    }
+                    // A WKT2 string runs to a few KB and the value is in having
+                    // it at all, not in storing every axis definition.
+                    "wkt" => o["crs_wkt"] = json!(first.chars().take(512).collect::<String>()),
+                    _ => {}
+                }
+            }
+        }
+    }
+    if let Some(Val::Reals { vals, .. }) = attr(&pairs, "bbox").map(|n| &n.val) {
+        if vals.len() >= 4 {
+            o["bbox"] = json!(vals[..4]);
+        }
+    }
+}
+
+/// Time-index fields for a series object, from attributes the reader already
+/// decodes and has never looked at.
+///
+/// `tsp` is c(start, end, frequency) on ts and mts. zoo and xts instead carry an
+/// explicit `index` vector, whose first and last values give the same span, and
+/// whose own class says whether those numbers are days or seconds.
+fn series_fields(pairs: &[(String, &Node)], rec: &mut Value) {
+    if let Some(Val::Reals { vals, .. }) = attr(pairs, "tsp").map(|n| &n.val) {
+        if vals.len() >= 3 {
+            rec["ts_start"] = json!(vals[0]);
+            rec["ts_end"] = json!(vals[1]);
+            rec["ts_frequency"] = json!(vals[2]);
+        }
+    }
+    if let Some(idx) = attr(pairs, "index") {
+        let nums: Option<(f64, f64, usize)> = match &idx.val {
+            Val::Reals { vals, .. } if !vals.is_empty() => {
+                Some((vals[0], vals[vals.len() - 1], vals.len()))
+            }
+            Val::Ints { vals, .. } if !vals.is_empty() => {
+                Some((vals[0] as f64, vals[vals.len() - 1] as f64, vals.len()))
+            }
+            _ => None,
+        };
+        if let Some((lo, hi, n)) = nums {
+            rec["index_start"] = json!(lo);
+            rec["index_end"] = json!(hi);
+            rec["index_n"] = json!(n);
+            // The index's own class is what makes those numbers meaningful:
+            // days since epoch for Date, seconds for POSIXct.
+            let icls = attr_pairs(idx);
+            let c = attr(&icls, "class").map(str_vec).unwrap_or_default();
+            if !c.is_empty() {
+                rec["index_class"] = json!(c.join("/"));
+            }
+        }
+    }
+    if let Some(Val::Reals { vals, .. }) = attr(pairs, "frequency").map(|n| &n.val) {
+        if !vals.is_empty() {
+            rec["ts_frequency"] = json!(vals[0]);
+        }
+    }
+}
+
+/// Split a column-major flat vector into per-column nodes.
+///
+/// Returns None past the value cap or when the payload is not a materialized
+/// atomic vector, so the caller keeps structure and drops the fingerprint rather
+/// than reporting one it could not compute.
+fn slice_matrix(node: &Node, nrow: usize, ncol: usize) -> Option<Vec<Node>> {
+    if nrow == 0 || ncol == 0 || nrow.checked_mul(ncol)? > CELL_CAP {
+        return None;
+    }
+    let take = |lo: usize, hi: usize| -> Option<Val> {
+        match &node.val {
+            Val::Ints { vals, logical, .. } if vals.len() >= hi => Some(Val::Ints {
+                len: hi - lo,
+                vals: vals[lo..hi].to_vec(),
+                logical: *logical,
+            }),
+            Val::Reals { vals, .. } if vals.len() >= hi => {
+                Some(Val::Reals { len: hi - lo, vals: vals[lo..hi].to_vec() })
+            }
+            Val::Str(v) if v.len() >= hi => Some(Val::Str(v[lo..hi].to_vec())),
+            _ => None,
+        }
+    };
+    let mut out = Vec::with_capacity(ncol);
+    for j in 0..ncol {
+        let val = take(j * nrow, (j + 1) * nrow)?;
+        out.push(Node { val, attr: None });
+    }
+    Some(out)
+}
+
+// ---- ALTREP helpers ---------------------------------------------------------
+
+/// The serialized ALTREP class is a pairlist whose first element is the class
+/// name symbol. Only the name is needed to decide how to expand the state.
+fn altrep_class(info: &Node) -> Option<String> {
+    match &info.val {
+        Val::Sym(s) => Some(s.clone()),
+        Val::List { car, .. } => match &car.val {
+            Val::Sym(s) => Some(s.clone()),
+            _ => None,
+        },
+        Val::Vec(items) => items.first().and_then(|n| match &n.val {
+            Val::Sym(s) => Some(s.clone()),
+            _ => None,
+        }),
+        _ => None,
+    }
+}
+
+/// First element of a state container, for the wrap_* classes whose payload is
+/// the wrapped vector followed by metadata.
+fn first_element(state: &Node) -> Option<&Node> {
+    match &state.val {
+        Val::Vec(items) => items.first(),
+        Val::List { car, .. } => Some(car.as_ref()),
+        _ => None,
+    }
+}
+
+/// Expand a compact sequence state of c(length, start, step).
+///
+/// Materializing keeps every downstream consumer (value pass, fingerprint, per
+/// column profile) working on an ordinary vector with no special cases. Past
+/// CELL_CAP the length is kept and the values dropped, which is how the reader
+/// already treats complex and raw.
+fn expand_seq(state: &Node, want_int: bool) -> Option<Val> {
+    let p = match &state.val {
+        Val::Reals { vals, .. } if vals.len() >= 3 => vals.clone(),
+        Val::Ints { vals, .. } if vals.len() >= 3 => vals.iter().map(|&v| v as f64).collect(),
+        _ => return None,
+    };
+    let n = if p[0].is_finite() && p[0] >= 0.0 { p[0] as usize } else { return None };
+    let (start, step) = (p[1], p[2]);
+    if n > CELL_CAP {
+        return Some(Val::Blob { len: n });
+    }
+    if want_int {
+        let vals = (0..n)
+            .map(|i| {
+                let v = start + step * i as f64;
+                if v.is_finite() && v.abs() < i32::MAX as f64 { v as i32 } else { NA_INT }
+            })
+            .collect();
+        Some(Val::Ints { len: n, vals, logical: false })
+    } else {
+        Some(Val::Reals { len: n, vals: (0..n).map(|i| start + step * i as f64).collect() })
     }
 }
 
@@ -377,6 +650,17 @@ fn push_cell(buf: &mut Vec<u8>, col: &Node, i: usize, levels: Option<&[Option<St
                 true
             }
         },
+        Val::Vec(items) => match items.get(i) {
+            Some(el) => {
+                buf.push(1);
+                buf.extend_from_slice(&digest_node(el, 0).to_be_bytes());
+                false
+            }
+            None => {
+                buf.push(0);
+                true
+            }
+        },
         _ => {
             buf.push(0);
             true
@@ -389,8 +673,78 @@ fn col_len(col: &Node) -> usize {
         Val::Ints { vals, .. } => vals.len(),
         Val::Reals { vals, .. } => vals.len(),
         Val::Str(v) => v.len(),
+        // A list column is a column. Reporting zero here made the whole frame
+        // abort, which is why an sf object, whose geometry is a list column,
+        // produced no fingerprint and was dropped downstream entirely.
+        Val::Vec(v) => v.len(),
         _ => 0,
     }
+}
+
+/// Order-sensitive digest of a node's contents, for hashing a list cell.
+///
+/// A list element is an arbitrary tree (an sf geometry is a list of coordinate
+/// matrices), so the cell is represented by a digest of that tree rather than by
+/// its bytes. Two geometrically identical features digest the same; two
+/// different ones do not, which is all the fingerprint needs.
+fn digest_node(n: &Node, depth: u32) -> u64 {
+    if depth > 12 {
+        return FNV_OFFSET;
+    }
+    let mut h = match &n.val {
+        Val::Nil => fnv(b"nil"),
+        Val::Sym(s) => fnv(s.as_bytes()),
+        Val::Char(Some(s)) => fnv(s.as_bytes()),
+        Val::Char(None) => fnv(b"na"),
+        Val::Str(v) => {
+            let mut acc = fnv(b"str");
+            for x in v {
+                acc ^= match x {
+                    Some(s) => fnv(s.as_bytes()),
+                    None => fnv(b"na"),
+                };
+                acc = acc.wrapping_mul(FNV_PRIME);
+            }
+            acc
+        }
+        Val::Ints { vals, .. } => {
+            let mut acc = fnv(b"int");
+            for v in vals {
+                acc ^= fnv(&v.to_be_bytes());
+                acc = acc.wrapping_mul(FNV_PRIME);
+            }
+            acc
+        }
+        Val::Reals { vals, .. } => {
+            let mut acc = fnv(b"real");
+            for v in vals {
+                acc ^= fnv(&v.to_be_bytes());
+                acc = acc.wrapping_mul(FNV_PRIME);
+            }
+            acc
+        }
+        Val::Blob { len } => fnv(&(*len as u64).to_be_bytes()),
+        Val::Vec(items) => {
+            let mut acc = fnv(b"vec");
+            for it in items {
+                acc ^= digest_node(it, depth + 1);
+                acc = acc.wrapping_mul(FNV_PRIME);
+            }
+            acc
+        }
+        Val::List { car, cdr, .. } => {
+            digest_node(car, depth + 1) ^ digest_node(cdr, depth + 1).wrapping_mul(FNV_PRIME)
+        }
+        Val::S4 => fnv(b"s4"),
+    };
+    // Fold in the attribute list so two structurally equal values with different
+    // classes are not treated as the same cell.
+    for (k, v) in attr_pairs(n) {
+        if k == "class" {
+            h ^= fnv(k.as_bytes()) ^ digest_node(v, depth + 1);
+        }
+    }
+    h
 }
 
 fn hex128(h: &blake3::Hash) -> String {
@@ -488,6 +842,7 @@ fn profile_columns(cols: &[&Node], names: &[String]) -> Option<Profile> {
                 o["col_max"] = json!(mx);
             }
         }
+        spatial_fields(col, &mut o);
         col_json.push(o);
         col_fp_bytes.extend_from_slice(fp.as_bytes());
         col_fp_bytes.push(b'|');
@@ -722,22 +1077,67 @@ fn describe(
 
     if let Some(dim) = attr(&pairs, "dim") {
         if let Val::Ints { vals, .. } = &dim.val {
-            let (nr, nc) = if vals.len() >= 2 {
-                (Some(vals[0] as i64), Some(vals[1] as i64))
+            let extent: Vec<i64> = vals.iter().map(|&v| v as i64).collect();
+            // Only a two-dimensional array is a matrix. Reporting the first two
+            // extents of a 2x3x4 array as nrow and ncol did not describe it, it
+            // described a different object.
+            let n_dim = extent.len();
+            let (nr, nc) = if n_dim == 2 {
+                (Some(extent[0]), Some(extent[1]))
             } else {
                 (None, None)
             };
+            let total: i64 = extent.iter().copied().filter(|d| *d >= 0).product();
+            let kind = if n_dim == 2 { "matrix" } else { "array" };
             let cls = if class.is_empty() {
-                "matrix".to_string()
+                kind.to_string()
             } else {
                 class.join("/")
             };
-            return json!({
+            let mut rec = json!({
                 "rec": "dataset", "name": name, "file": file, "format": fmt,
                 "format_version": ver, "compression": comp, "compressed_bytes": size,
-                "internal": internal, "class": cls, "kind": "matrix",
-                "nrow": nr, "ncol": nc, "confidence": "exact"
+                "internal": internal, "class": cls, "kind": kind,
+                "nrow": nr, "ncol": nc, "dim": extent, "n_dim": n_dim,
+                "length": total, "confidence": "exact"
             });
+            if let Some(dn) = attr(&pairs, "dimnames") {
+                rec["has_dimnames"] = json!(!matches!(dn.val, Val::Nil));
+            }
+            series_fields(&pairs, &mut rec);
+            // A matrix is a table of values like any other, so it gets a real
+            // fingerprint rather than being dropped for want of one. Column-major
+            // storage means column j is a contiguous run, so the flat vector
+            // slices into columns without copying the values twice.
+            // Two dimensions slice into columns; anything else is fingerprinted
+            // as the flat vector it is, so a 3-D array still dedups against an
+            // identical copy instead of being dropped for want of a fingerprint.
+            let sliced = if n_dim == 2 {
+                let (r, c) = (extent[0].max(0) as usize, extent[1].max(0) as usize);
+                slice_matrix(node, r, c)
+            } else {
+                None
+            };
+            {
+                let flat = [node];
+                let (refs, names): (Vec<&Node>, Vec<String>) = match &sliced {
+                    Some(cols) => (
+                        cols.iter().collect(),
+                        (0..cols.len()).map(|j| format!("V{}", j + 1)).collect(),
+                    ),
+                    None => (flat.to_vec(), vec![name.to_string()]),
+                };
+                {
+                    if let Some(p) = profile_columns(&refs, &names) {
+                        rec["n_missing_total"] = json!(p.n_missing_total);
+                        rec["schema_fp"] = json!(p.schema_fp);
+                        rec["shape_fp"] = json!(p.shape_fp);
+                        rec["content_fp"] = json!(p.content_fp);
+                        rec["row_sketch"] = json!(p.row_sketch);
+                    }
+                }
+            }
+            return rec;
         }
     }
 
@@ -760,7 +1160,8 @@ fn describe(
         "internal": internal, "class": cls, "kind": kind, "length": len,
         "confidence": "exact"
     });
-    if kind == "vector" {
+    series_fields(&pairs, &mut rec);
+    if kind == "vector" || kind == "list" {
         if let Some(p) = profile_columns(&[node], std::slice::from_ref(&name.to_string())) {
             rec["n_missing_total"] = json!(p.n_missing_total);
             rec["n_unique"] = json!(p.columns.first().and_then(|c| c.get("n_unique")).cloned().unwrap_or(json!(null)));
@@ -1041,4 +1442,138 @@ pub fn scan_package(root: &Path) -> Vec<Value> {
         }
     }
     out
+}
+
+// ---- tests ------------------------------------------------------------------
+//
+// The fixtures under tests/fixtures/pkg/data are generated by
+// tests/fixtures/make.R and committed, so the suite needs no R to run. Each one
+// exists for a case that used to be read wrongly or not at all.
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::Value;
+
+    fn records() -> Vec<Value> {
+        scan_package(Path::new("tests/fixtures/pkg"))
+    }
+    fn by_name(name: &str) -> Value {
+        records()
+            .into_iter()
+            .find(|r| r["name"] == name)
+            .unwrap_or_else(|| panic!("no dataset record named {name}"))
+    }
+    fn s(v: &Value, k: &str) -> String {
+        v[k].as_str().unwrap_or_default().to_string()
+    }
+
+    /// Modern R writes 1:n as a compact sequence. A reader that rejects the type
+    /// loses every object in the file, not just that column.
+    #[test]
+    fn altrep_frame_is_read_not_dropped() {
+        let r = by_name("altrep_frame");
+        assert_eq!(r["nrow"], 5, "the frame has five rows");
+        assert_eq!(r["ncol"], 2, "and two columns");
+        assert_eq!(s(&r, "confidence"), "exact");
+        assert!(!s(&r, "content_fp").is_empty(), "and a fingerprint");
+    }
+
+    /// The whole point of expanding rather than skipping: the same data written
+    /// either way has to dedup, or a compact copy hides from the shared-data
+    /// discovery entirely.
+    #[test]
+    fn altrep_and_plain_agree_on_the_fingerprint() {
+        let (a, b) = (by_name("altrep_frame"), by_name("plain_frame"));
+        assert_eq!(s(&a, "content_fp"), s(&b, "content_fp"));
+        assert_eq!(s(&a, "schema_fp"), s(&b, "schema_fp"));
+    }
+
+    #[test]
+    fn compact_and_wrapped_vectors_keep_their_length() {
+        assert_eq!(by_name("altrep_seq")["length"], 10);
+        assert_eq!(by_name("altrep_wrap")["length"], 3);
+    }
+
+    /// A 2x3x4 array is not a 2x3 matrix. Reporting the first two extents as
+    /// nrow and ncol described a different object.
+    #[test]
+    fn a_three_dimensional_array_is_not_a_matrix() {
+        let r = by_name("arr_3d");
+        assert_eq!(s(&r, "kind"), "array");
+        assert_eq!(r["n_dim"], 3);
+        assert_eq!(r["dim"], serde_json::json!([2, 3, 4]));
+        assert!(r["nrow"].is_null(), "a 3-D array has no single row count");
+        assert_eq!(r["length"], 24, "but it does have a size");
+    }
+
+    #[test]
+    fn matrices_are_fingerprinted_and_sized() {
+        let r = by_name("mat_named");
+        assert_eq!(s(&r, "kind"), "matrix");
+        assert_eq!((r["nrow"].clone(), r["ncol"].clone()), (3.into(), 4.into()));
+        assert_eq!(r["length"], 12, "rows times columns");
+        assert!(!s(&r, "content_fp").is_empty(), "matrices are data too");
+        assert_eq!(r["has_dimnames"], true);
+    }
+
+    /// A list column made col_len report zero, which aborted the profile for the
+    /// entire frame. That is why an sf object produced no fingerprint and was
+    /// dropped before it reached storage.
+    #[test]
+    fn a_frame_with_a_list_column_still_profiles() {
+        let r = by_name("sf_like");
+        assert_eq!(s(&r, "confidence"), "exact");
+        assert!(!s(&r, "content_fp").is_empty());
+        assert_eq!(r["ncol"], 2);
+    }
+
+    #[test]
+    fn a_geometry_column_carries_its_crs_and_extent() {
+        let r = by_name("sf_like");
+        let cols: Vec<Value> = serde_json::from_value(r["columns"].clone()).unwrap();
+        let g = cols.iter().find(|c| c["is_geometry"] == true).expect("a geometry column");
+        assert_eq!(g["crs_epsg"], 4326);
+        assert_eq!(s(g, "geom_type"), "POINT");
+        assert_eq!(g["n_geometries"], 3);
+        assert_eq!(g["bbox"], serde_json::json!([1.0, 2.0, 5.0, 6.0]));
+    }
+
+    #[test]
+    fn a_time_series_reports_its_span_and_frequency() {
+        let r = by_name("ts_month");
+        assert_eq!(r["ts_frequency"], 12.0, "monthly");
+        assert_eq!(r["ts_start"], 1949.0);
+        assert!(r["ts_end"].as_f64().unwrap() > 1952.0);
+    }
+
+    /// An mts is a matrix, so the span has to survive that branch too.
+    #[test]
+    fn a_multivariate_series_keeps_both_shape_and_span() {
+        let r = by_name("ts_multi");
+        assert_eq!(s(&r, "kind"), "matrix");
+        assert_eq!(r["ncol"], 2);
+        assert_eq!(r["ts_frequency"], 4.0, "quarterly");
+        assert_eq!(r["ts_start"], 2000.0);
+    }
+
+    /// Lists were a third of the dataset records and none of them carried a
+    /// fingerprint, so none of them reached storage.
+    #[test]
+    fn a_plain_list_is_fingerprinted() {
+        let r = by_name("plain_list");
+        assert_eq!(s(&r, "kind"), "list");
+        assert_eq!(r["length"], 3);
+        assert!(!s(&r, "content_fp").is_empty());
+    }
+
+    #[test]
+    fn every_fixture_is_readable() {
+        let recs = records();
+        assert_eq!(recs.len(), 13, "one record per fixture");
+        for r in &recs {
+            let name = s(r, "name");
+            assert_ne!(s(r, "confidence"), "degraded", "{name} degraded");
+            assert!(!s(r, "content_fp").is_empty(), "{name} has no fingerprint");
+        }
+    }
 }
