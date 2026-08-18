@@ -2094,7 +2094,11 @@ pub fn scan_package(root: &Path) -> Vec<Value> {
         let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
         let name = dataset_name(fname);
 
-        let is_rbin = lower.ends_with(".rda") || lower.ends_with(".rdata") || lower.ends_with(".rds");
+        // data() loads .rda and .RData, and nothing else binary. A .rds in data/
+        // is unreachable, and in an installed package data/Rdata.rds is the
+        // lazy-load index rather than a dataset: reading it named a dataset
+        // "Rdata" once per package and gave it a fingerprint.
+        let is_rbin = lower.ends_with(".rda") || lower.ends_with(".rdata");
         let is_script = lower.ends_with(".r");
         // Only the extensions data() actually dispatches on. A .tsv or a .dat
         // in data/ is not loadable, so describing one would put a dataset in the
@@ -2417,6 +2421,10 @@ mod tests {
         assert!(
             records().iter().all(|r| s(r, "name") != "notdata"),
             "a format data() cannot load was reported as a dataset"
+        );
+        assert!(
+            records().iter().all(|r| s(r, "file") != "data/notdata.rds"),
+            ".rds is not loadable from data/ and must not be reported"
         );
     }
 

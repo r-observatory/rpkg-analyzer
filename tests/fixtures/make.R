@@ -177,3 +177,6 @@ same_as_text <- data.frame(g = c("a","b","a"), n = c(1L,2L,3L), v = c(1.5,2.5,3.
                            stringsAsFactors = FALSE)
 sv(same_as_text, "same_as_rda")
 wl(c("g n v", "a 1 1.5", "b 2 2.5", "a 3 3.5"), "same_as_text.txt")
+# data() has no entry for .rds, and in an installed package data/Rdata.rds is
+# the lazy-load index rather than a dataset.
+saveRDS(data.frame(a = 1:3), file.path(d, "notdata.rds"))
