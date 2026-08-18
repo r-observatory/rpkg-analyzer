@@ -81,3 +81,23 @@ sv(am, "author_metadata", 3)
 if (requireNamespace("Matrix", quietly = TRUE)) {
   sv(Matrix::Matrix(c(1, 0, 0, 2), 2, 2, sparse = TRUE), "sparse_matrix", 3)
 }
+
+# Sparse matrices, packed rasters, graphs and higher-rank arrays.
+if (requireNamespace("Matrix", quietly = TRUE)) {
+  sv(Matrix::sparseMatrix(i = c(1, 3, 5), j = c(2, 4, 6), x = c(1.5, 2.5, 3.5),
+                          dims = c(100, 100)), "sparse_big", 3)
+  sv(methods::as(Matrix::Matrix(c(1, 0, 0, 0, 2, 0, 0, 0, 3), 3, 3, sparse = TRUE),
+                 "TsparseMatrix"), "sparse_dgt", 3)
+}
+if (requireNamespace("terra", quietly = TRUE)) {
+  tr <- terra::rast(nrows = 8, ncols = 12)
+  terra::values(tr) <- 1:96
+  sv(terra::wrap(tr), "terra_packed", 3)
+}
+if (requireNamespace("igraph", quietly = TRUE)) {
+  sv(igraph::make_ring(10), "igraph_ring", 3)
+  g <- igraph::sample_gnp(20, 0.2)
+  igraph::V(g)$name <- paste0("n", 1:20)
+  sv(g, "igraph_weighted", 3)
+}
+sv(array(seq_len(120) / 7, dim = c(2, 3, 4, 5)), "arr_4d_dbl", 3)
