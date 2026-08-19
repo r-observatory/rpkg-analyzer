@@ -2271,6 +2271,11 @@ pub fn extdata_inventory(root: &Path) -> Value {
     let mut unread: std::collections::BTreeMap<String, (i64, i64)> = Default::default();
     let mut bytes: i64 = 0;
     let mut largest: i64 = 0;
+    // The names of the files we do not open. A file we read carries its own path
+    // on its own record; one we leave shut has nothing else to say what it is,
+    // and "gz 1/11.0M" is a great deal less use than dm3_upstream2000.fa.gz.
+    // Capped, and the counts above give the true total when the list is short.
+    let mut unread_files: Vec<String> = Vec::new();
     for p in &files {
         let fname = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
         let lower = fname.to_lowercase();
@@ -2281,7 +2286,16 @@ pub fn extdata_inventory(root: &Path) -> Value {
             Some((_, e)) if !e.is_empty() && e.len() <= 12 => e.to_string(),
             _ => "none".to_string(),
         };
-        let side = if extdata_is_readable(&lower) { &mut read } else { &mut unread };
+        let readable = extdata_is_readable(&lower);
+        if !readable && unread_files.len() < EXTDATA_NAME_CAP {
+            // Relative to the directory, so nesting stays visible.
+            unread_files.push(
+                p.strip_prefix(&ext_root)
+                    .map(|r| r.to_string_lossy().replace('\\', "/"))
+                    .unwrap_or_else(|_| fname.to_string()),
+            );
+        }
+        let side = if readable { &mut read } else { &mut unread };
         let slot = side.entry(ext).or_default();
         slot.0 += 1;
         slot.1 += n;
@@ -2299,6 +2313,7 @@ pub fn extdata_inventory(root: &Path) -> Value {
         "largest_bytes": largest,
         "read": shape(read),
         "unread": shape(unread),
+        "unread_files": unread_files,
     })
 }
 
@@ -2319,6 +2334,7 @@ fn extdata_is_readable(lower: &str) -> bool {
 const EXTDATA_DEPTH: u32 = 3;
 const EXTDATA_PARSE_LIMIT: u64 = 8 << 20;
 const EXTDATA_FILE_CAP: usize = 200;
+const EXTDATA_NAME_CAP: usize = 100;
 
 fn walk_extdata(dir: &Path, depth: u32, out: &mut Vec<std::path::PathBuf>) {
     if depth == 0 || out.len() >= EXTDATA_FILE_CAP {
@@ -2632,6 +2648,9 @@ mod tests {
             .sum();
         assert_eq!(summed, inv["bytes"].as_i64().unwrap());
         assert!(inv["largest_bytes"].as_i64().unwrap_or(0) > 0);
+        // The file we do not open is still named, and named relative to the
+        // directory so a nested one is distinguishable from a top-level one.
+        assert_eq!(inv["unread_files"], serde_json::json!(["ext_ignored.xlsx"]));
     }
 
     #[test]
