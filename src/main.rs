@@ -3442,7 +3442,7 @@ fn main() {
     // --- emit NDJSON ---
     let summary = serde_json::json!({
         "rec": "summary",
-        "extdata_unread": rds::extdata_inventory(&root),
+        "extdata": rds::extdata_inventory(&root),
         "package": package,
         "version": version,
         "license": legal.license,

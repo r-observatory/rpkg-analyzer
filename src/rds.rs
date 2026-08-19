@@ -2175,14 +2175,11 @@ pub fn scan_package(root: &Path) -> Vec<Value> {
             if size > EXTDATA_PARSE_LIMIT {
                 continue;
             }
-            let bin = lower.ends_with(".rds") || lower.ends_with(".rda") || lower.ends_with(".rdata");
-            let txt = !bin
-                && [".csv", ".tsv", ".tab", ".txt", ".psv", ".dat"]
-                    .iter()
-                    .any(|e| lower.contains(e));
-            if !bin && !txt {
+            if !extdata_is_readable(&lower) {
                 continue;
             }
+            let bin = lower.ends_with(".rds") || lower.ends_with(".rda") || lower.ends_with(".rdata");
+            let txt = !bin;
             (bin, false, txt)
         } else {
             (is_rbin, is_script, is_text)
@@ -2245,46 +2242,58 @@ pub fn scan_package(root: &Path) -> Vec<Value> {
     out
 }
 
-/// What sits under inst/extdata that we do not read, counted by extension.
+/// What a package keeps under inst/extdata, counted by extension.
 ///
-/// Reading a spreadsheet or a shapefile is a parser each, and building one
-/// before knowing how much data is behind it is guesswork. This rides along on
-/// the summary record, where a new field reaches the database on its own, so a
-/// single pass over the archive answers whether any of those parsers is worth
-/// writing.
+/// R points authors here for data files that are not datasets, so what is in
+/// here is a different question from what a package exports: nothing loads it
+/// by name and much of it is not tabular at all. The inventory answers whether
+/// a package has such files and roughly what they are, without opening the ones
+/// that would need a parser of their own.
+///
+/// `read` counts the files that also produced a dataset record, `unread` the
+/// rest. It rides the summary record, which reaches the database without any
+/// change to the pipeline, so this survives even if the per-file records do not.
 pub fn extdata_inventory(root: &Path) -> Value {
     let ext_root = {
         let src = root.join("inst").join("extdata");
         if src.is_dir() { src } else { root.join("extdata") }
     };
+    if !ext_root.is_dir() {
+        return Value::Null;
+    }
     let mut files = Vec::new();
     walk_extdata(&ext_root, EXTDATA_DEPTH, &mut files);
-    let mut counts: std::collections::BTreeMap<String, i64> = Default::default();
-    let mut bytes: std::collections::BTreeMap<String, i64> = Default::default();
+    let mut read: std::collections::BTreeMap<String, i64> = Default::default();
+    let mut unread: std::collections::BTreeMap<String, i64> = Default::default();
+    let mut bytes: i64 = 0;
     for p in &files {
         let fname = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
         let lower = fname.to_lowercase();
-        let readable = lower.ends_with(".rds")
-            || lower.ends_with(".rda")
-            || lower.ends_with(".rdata")
-            || [".csv", ".tsv", ".tab", ".txt", ".psv", ".dat"]
-                .iter()
-                .any(|e| lower.contains(e));
-        if readable {
-            continue;
-        }
+        bytes += std::fs::metadata(p).map(|m| m.len()).unwrap_or(0) as i64;
         let ext = match lower.rsplit_once('.') {
             Some((_, e)) if !e.is_empty() && e.len() <= 12 => e.to_string(),
             _ => "none".to_string(),
         };
-        *counts.entry(ext.clone()).or_default() += 1;
-        *bytes.entry(ext).or_default() +=
-            std::fs::metadata(p).map(|m| m.len()).unwrap_or(0) as i64;
+        let side = if extdata_is_readable(&lower) { &mut read } else { &mut unread };
+        *side.entry(ext).or_default() += 1;
     }
-    if counts.is_empty() {
-        return Value::Null;
-    }
-    json!({ "files": counts, "bytes": bytes })
+    json!({
+        "files": files.len() as i64,
+        "bytes": bytes,
+        "read": read,
+        "unread": unread,
+    })
+}
+
+/// The formats worth opening here: the ones we would expect under data/ anyway.
+/// A spreadsheet or an image is left to the inventory.
+fn extdata_is_readable(lower: &str) -> bool {
+    lower.ends_with(".rds")
+        || lower.ends_with(".rda")
+        || lower.ends_with(".rdata")
+        || [".csv", ".tsv", ".tab", ".txt", ".psv", ".dat"]
+            .iter()
+            .any(|e| lower.contains(e))
 }
 
 /// How deep to follow directories under inst/extdata, and how much of a file to
@@ -2584,6 +2593,25 @@ mod tests {
                 s(&r, "name")
             );
         }
+    }
+
+    #[test]
+    fn the_inventory_says_what_extdata_holds_without_opening_it() {
+        let inv = extdata_inventory(Path::new("tests/fixtures/pkg"));
+        assert_eq!(inv["files"], 5);
+        // The formats we would expect under data/ anyway, opened and counted.
+        assert_eq!(inv["read"]["csv"], 2);
+        assert_eq!(inv["read"]["rds"], 1);
+        assert_eq!(inv["read"]["tsv"], 1);
+        // A spreadsheet is listed and left shut.
+        assert_eq!(inv["unread"]["xlsx"], 1);
+        assert!(inv["bytes"].as_i64().unwrap_or(0) > 0);
+    }
+
+    #[test]
+    fn a_package_without_extdata_says_so() {
+        let inv = extdata_inventory(Path::new("tests/fixtures"));
+        assert!(inv.is_null());
     }
 
     #[test]
