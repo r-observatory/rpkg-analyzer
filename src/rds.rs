@@ -2263,25 +2263,42 @@ pub fn extdata_inventory(root: &Path) -> Value {
     }
     let mut files = Vec::new();
     walk_extdata(&ext_root, EXTDATA_DEPTH, &mut files);
-    let mut read: std::collections::BTreeMap<String, i64> = Default::default();
-    let mut unread: std::collections::BTreeMap<String, i64> = Default::default();
+    // Size per extension, not just per directory. A file we read carries its own
+    // byte count on its record the way one under data/ does; a file we do not
+    // read has no record to carry anything, and one total for the directory
+    // cannot say whether it is four sequence files or four text files.
+    let mut read: std::collections::BTreeMap<String, (i64, i64)> = Default::default();
+    let mut unread: std::collections::BTreeMap<String, (i64, i64)> = Default::default();
     let mut bytes: i64 = 0;
+    let mut largest: i64 = 0;
     for p in &files {
         let fname = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
         let lower = fname.to_lowercase();
-        bytes += std::fs::metadata(p).map(|m| m.len()).unwrap_or(0) as i64;
+        let n = std::fs::metadata(p).map(|m| m.len()).unwrap_or(0) as i64;
+        bytes += n;
+        largest = largest.max(n);
         let ext = match lower.rsplit_once('.') {
             Some((_, e)) if !e.is_empty() && e.len() <= 12 => e.to_string(),
             _ => "none".to_string(),
         };
         let side = if extdata_is_readable(&lower) { &mut read } else { &mut unread };
-        *side.entry(ext).or_default() += 1;
+        let slot = side.entry(ext).or_default();
+        slot.0 += 1;
+        slot.1 += n;
     }
+    let shape = |m: std::collections::BTreeMap<String, (i64, i64)>| -> Value {
+        Value::Object(
+            m.into_iter()
+                .map(|(k, (n, b))| (k, json!({ "n": n, "bytes": b })))
+                .collect(),
+        )
+    };
     json!({
         "files": files.len() as i64,
         "bytes": bytes,
-        "read": read,
-        "unread": unread,
+        "largest_bytes": largest,
+        "read": shape(read),
+        "unread": shape(unread),
     })
 }
 
@@ -2600,12 +2617,21 @@ mod tests {
         let inv = extdata_inventory(Path::new("tests/fixtures/pkg"));
         assert_eq!(inv["files"], 5);
         // The formats we would expect under data/ anyway, opened and counted.
-        assert_eq!(inv["read"]["csv"], 2);
-        assert_eq!(inv["read"]["rds"], 1);
-        assert_eq!(inv["read"]["tsv"], 1);
-        // A spreadsheet is listed and left shut.
-        assert_eq!(inv["unread"]["xlsx"], 1);
-        assert!(inv["bytes"].as_i64().unwrap_or(0) > 0);
+        assert_eq!(inv["read"]["csv"]["n"], 2);
+        assert_eq!(inv["read"]["rds"]["n"], 1);
+        assert_eq!(inv["read"]["tsv"]["n"], 1);
+        // A spreadsheet is listed and left shut, but its size is still known:
+        // that is the whole point of listing something we do not open.
+        assert_eq!(inv["unread"]["xlsx"]["n"], 1);
+        assert!(inv["unread"]["xlsx"]["bytes"].as_i64().unwrap_or(0) > 0);
+        // The per-extension sizes account for the directory total.
+        let summed: i64 = ["read", "unread"]
+            .iter()
+            .flat_map(|k| inv[k].as_object().unwrap().values())
+            .map(|v| v["bytes"].as_i64().unwrap_or(0))
+            .sum();
+        assert_eq!(summed, inv["bytes"].as_i64().unwrap());
+        assert!(inv["largest_bytes"].as_i64().unwrap_or(0) > 0);
     }
 
     #[test]
