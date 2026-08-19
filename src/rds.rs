@@ -2245,6 +2245,48 @@ pub fn scan_package(root: &Path) -> Vec<Value> {
     out
 }
 
+/// What sits under inst/extdata that we do not read, counted by extension.
+///
+/// Reading a spreadsheet or a shapefile is a parser each, and building one
+/// before knowing how much data is behind it is guesswork. This rides along on
+/// the summary record, where a new field reaches the database on its own, so a
+/// single pass over the archive answers whether any of those parsers is worth
+/// writing.
+pub fn extdata_inventory(root: &Path) -> Value {
+    let ext_root = {
+        let src = root.join("inst").join("extdata");
+        if src.is_dir() { src } else { root.join("extdata") }
+    };
+    let mut files = Vec::new();
+    walk_extdata(&ext_root, EXTDATA_DEPTH, &mut files);
+    let mut counts: std::collections::BTreeMap<String, i64> = Default::default();
+    let mut bytes: std::collections::BTreeMap<String, i64> = Default::default();
+    for p in &files {
+        let fname = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        let lower = fname.to_lowercase();
+        let readable = lower.ends_with(".rds")
+            || lower.ends_with(".rda")
+            || lower.ends_with(".rdata")
+            || [".csv", ".tsv", ".tab", ".txt", ".psv", ".dat"]
+                .iter()
+                .any(|e| lower.contains(e));
+        if readable {
+            continue;
+        }
+        let ext = match lower.rsplit_once('.') {
+            Some((_, e)) if !e.is_empty() && e.len() <= 12 => e.to_string(),
+            _ => "none".to_string(),
+        };
+        *counts.entry(ext.clone()).or_default() += 1;
+        *bytes.entry(ext).or_default() +=
+            std::fs::metadata(p).map(|m| m.len()).unwrap_or(0) as i64;
+    }
+    if counts.is_empty() {
+        return Value::Null;
+    }
+    json!({ "files": counts, "bytes": bytes })
+}
+
 /// How deep to follow directories under inst/extdata, and how much of a file to
 /// take on. The tail is long: a package may keep an 11 MB sequence file here,
 /// and fingerprinting one describes nothing a reader would ask about.
