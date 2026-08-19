@@ -3025,8 +3025,18 @@ fn graph_stats(n: usize, edges: &[(usize, usize)]) -> Network {
 
 // ---- main -------------------------------------------------------------------
 
+/// The version that produced a record. A consumer storing results needs to know
+/// which build wrote them, so it can tell data it has already collected from
+/// data a newer build would describe differently.
+const ANALYZER_VERSION: &str = env!("CARGO_PKG_VERSION");
+
 fn main() {
     let dir = std::env::args().nth(1).expect("usage: rpkg-analyzer <package_dir>");
+
+    if dir == "--version" || dir == "-V" {
+        println!("rpkg-analyzer {ANALYZER_VERSION}");
+        return;
+    }
 
     let mut parser = Parser::new();
     parser
@@ -3442,6 +3452,7 @@ fn main() {
     // --- emit NDJSON ---
     let summary = serde_json::json!({
         "rec": "summary",
+        "analyzer_version": ANALYZER_VERSION,
         "extdata": rds::extdata_inventory(&root),
         "package": package,
         "version": version,
