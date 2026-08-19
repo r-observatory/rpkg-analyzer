@@ -2002,30 +2002,28 @@ fn make_names(raw: &str) -> String {
     out
 }
 
-fn read_text(path: &Path, fname: &str) -> Option<(Vec<Node>, Vec<String>, usize, &'static str, &'static str)> {
-    let sep = text_data_sep(fname)?;
-    let raw = std::fs::read(path).ok()?;
+fn decompress_text(raw: Vec<u8>) -> Option<(String, &'static str)> {
+    use std::io::Read;
     let (bytes, comp): (Vec<u8>, &'static str) = if raw.len() >= 2 && raw[0] == 0x1f && raw[1] == 0x8b {
-        use std::io::Read;
         let mut o = Vec::new();
         flate2::read::GzDecoder::new(&raw[..]).read_to_end(&mut o).ok()?;
         (o, "gzip")
     } else if raw.starts_with(b"BZh") {
-        use std::io::Read;
         let mut o = Vec::new();
         bzip2::read::BzDecoder::new(&raw[..]).read_to_end(&mut o).ok()?;
         (o, "bzip2")
     } else if raw.starts_with(&[0xfd, b'7', b'z', b'X', b'Z', 0x00]) {
-        use std::io::Read;
         let mut o = Vec::new();
         xz2::read::XzDecoder::new(&raw[..]).read_to_end(&mut o).ok()?;
         (o, "xz")
     } else {
         (raw, "none")
     };
-    let text = String::from_utf8_lossy(&bytes);
-    let fmt = if sep == WS { "tab" } else { "csv" };
+    Some((String::from_utf8_lossy(&bytes).into_owned(), comp))
+}
 
+/// Split a delimited table that has already been read into memory.
+fn parse_table(text: &str, sep: char) -> Option<(Vec<Node>, Vec<String>, usize)> {
     let mut rows: Vec<Vec<String>> = Vec::new();
     let mut header: Option<Vec<String>> = None;
     for line in text.lines() {
@@ -2072,7 +2070,34 @@ fn read_text(path: &Path, fname: &str) -> Option<(Vec<Node>, Vec<String>, usize,
         }
     }
     let cols: Vec<Node> = (0..ncol).map(|j| infer_column(&cells[j])).collect();
-    Some((cols, names, rows.len(), fmt, comp))
+    Some((cols, names, rows.len()))
+}
+
+/// A file under data/, read by the rules data() applies to its extension.
+fn read_text(path: &Path, fname: &str) -> Option<(Vec<Node>, Vec<String>, usize, &'static str, &'static str)> {
+    let sep = text_data_sep(fname)?;
+    let (text, comp) = decompress_text(std::fs::read(path).ok()?)?;
+    let fmt = if sep == WS { "tab" } else { "csv" };
+    let (cols, names, nrow) = parse_table(&text, sep)?;
+    Some((cols, names, nrow, fmt, comp))
+}
+
+/// A file under inst/extdata, where none of data()'s conventions apply. Nothing
+/// loads these by name, so the extension carries no promise: a .csv here is an
+/// ordinary comma-separated file rather than the semicolon one data() expects.
+/// The separator is the one the header actually uses.
+fn read_text_free(path: &Path) -> Option<(Vec<Node>, Vec<String>, usize, &'static str, &'static str)> {
+    let (text, comp) = decompress_text(std::fs::read(path).ok()?)?;
+    let header = text.lines().find(|l| !l.trim().is_empty())?;
+    let (sep, fmt) = [(',', "csv"), ('\t', "tsv"), (';', "csv"), ('|', "psv")]
+        .into_iter()
+        .map(|(c, f)| (c, f, header.matches(c).count()))
+        .filter(|(_, _, n)| *n > 0)
+        .max_by_key(|(_, _, n)| *n)
+        .map(|(c, f, _)| (c, f))
+        .unwrap_or((WS, "txt"));
+    let (cols, names, nrow) = parse_table(&text, sep)?;
+    Some((cols, names, nrow, fmt, comp))
 }
 
 /// Emit one `dataset` record per dataset shipped under `root`'s data/ directory
@@ -2091,11 +2116,44 @@ pub fn scan_package(root: &Path) -> Vec<Value> {
     if sys.exists() {
         targets.push((sys, true));
     }
+    let n_loadable = targets.len();
+    // inst/extdata is where R tells authors to put data files that are not
+    // datasets. Nothing loads them by name, so they are absent from the
+    // catalogue entirely, and it is often the only real-world data a package
+    // carries. Walked rather than listed: some packages nest a whole package
+    // tree under here.
+    // A source tree keeps it at inst/extdata; installing strips the inst/, so
+    // an installed tree keeps it at extdata. Accept either.
+    let mut extra: Vec<std::path::PathBuf> = Vec::new();
+    let ext_root = {
+        let src = root.join("inst").join("extdata");
+        if src.is_dir() { src } else { root.join("extdata") }
+    };
+    walk_extdata(&ext_root, EXTDATA_DEPTH, &mut extra);
+    for p in extra {
+        targets.push((p, false));
+    }
 
-    for (path, internal) in targets {
+    for (i, (path, internal)) in targets.into_iter().enumerate() {
         let fname = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
         let lower = fname.to_lowercase();
-        let rel = format!("{}/{}", if internal { "R" } else { "data" }, fname);
+        let from_extdata = i >= n_loadable;
+        let origin_dir = if from_extdata {
+            "extdata"
+        } else if internal {
+            "sysdata"
+        } else {
+            "data"
+        };
+        let rel = if from_extdata {
+            let tail = path
+                .strip_prefix(&ext_root)
+                .map(|r| r.to_string_lossy().replace('\\', "/"))
+                .unwrap_or_else(|_| fname.to_string());
+            format!("inst/extdata/{tail}")
+        } else {
+            format!("{}/{}", if internal { "R" } else { "data" }, fname)
+        };
         let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
         let name = dataset_name(fname);
 
@@ -2110,6 +2168,27 @@ pub fn scan_package(root: &Path) -> Vec<Value> {
         // catalogue that nobody can reach.
         let is_text = !is_rbin && text_data_sep(fname).is_some();
 
+        // Under extdata the extension promises nothing, so anything we have a
+        // reader for is worth reading and the rest is left alone: a catalogue
+        // row for a .xlsx we cannot open carries no more than its own name.
+        let (is_rbin, is_script, is_text) = if from_extdata {
+            if size > EXTDATA_PARSE_LIMIT {
+                continue;
+            }
+            let bin = lower.ends_with(".rds") || lower.ends_with(".rda") || lower.ends_with(".rdata");
+            let txt = !bin
+                && [".csv", ".tsv", ".tab", ".txt", ".psv", ".dat"]
+                    .iter()
+                    .any(|e| lower.contains(e));
+            if !bin && !txt {
+                continue;
+            }
+            (bin, false, txt)
+        } else {
+            (is_rbin, is_script, is_text)
+        };
+
+        let before = out.len();
         if is_rbin {
             match read_file(&path) {
                 Ok(recs) => {
@@ -2131,7 +2210,8 @@ pub fn scan_package(root: &Path) -> Vec<Value> {
                 "confidence": "needs_r", "notes": "R script data (requires R)"
             }));
         } else if is_text {
-            match read_text(&path, fname) {
+            let read = if from_extdata { read_text_free(&path) } else { read_text(&path, fname) };
+            match read {
                 Some((cols, names, nrow, fmt, comp)) => {
                     let refs: Vec<&Node> = cols.iter().collect();
                     let mut rec = json!({
@@ -2158,8 +2238,37 @@ pub fn scan_package(root: &Path) -> Vec<Value> {
                 })),
             }
         }
+        for r in out[before..].iter_mut() {
+            r["origin_dir"] = json!(origin_dir);
+        }
     }
     out
+}
+
+/// How deep to follow directories under inst/extdata, and how much of a file to
+/// take on. The tail is long: a package may keep an 11 MB sequence file here,
+/// and fingerprinting one describes nothing a reader would ask about.
+const EXTDATA_DEPTH: u32 = 3;
+const EXTDATA_PARSE_LIMIT: u64 = 8 << 20;
+const EXTDATA_FILE_CAP: usize = 200;
+
+fn walk_extdata(dir: &Path, depth: u32, out: &mut Vec<std::path::PathBuf>) {
+    if depth == 0 || out.len() >= EXTDATA_FILE_CAP {
+        return;
+    }
+    let Ok(rd) = std::fs::read_dir(dir) else { return };
+    let mut paths: Vec<_> = rd.flatten().map(|e| e.path()).collect();
+    paths.sort();
+    for p in paths {
+        if out.len() >= EXTDATA_FILE_CAP {
+            return;
+        }
+        if p.is_dir() {
+            walk_extdata(&p, depth - 1, out);
+        } else {
+            out.push(p);
+        }
+    }
 }
 
 // ---- tests ------------------------------------------------------------------
@@ -2398,6 +2507,54 @@ mod tests {
         assert_eq!(r["ncol"], 2);
         assert_eq!(cols(&r), ["city", "pop"]);
         assert_eq!(r["nrow"], 2);
+    }
+
+    #[test]
+    fn the_same_bytes_mean_different_things_by_directory() {
+        // Identical content in both places. Under data/ the semicolon rule makes
+        // it one column; under extdata no rule applies and it is an ordinary
+        // comma file. Reading extdata by data()'s rules would flatten it.
+        let under_data = by_name("csv_comma");
+        let under_ext = by_name("ext_comma");
+        assert_eq!(under_data["ncol"], 1);
+        assert_eq!(under_ext["ncol"], 3);
+        assert_eq!(cols(&under_ext), ["height", "weight", "sex"]);
+    }
+
+    #[test]
+    fn an_rds_is_read_under_extdata_though_not_under_data() {
+        // data() cannot load a .rds, so one under data/ is not a dataset. Under
+        // extdata nothing is loaded by name anyway, and the file is readable.
+        let r = by_name("ext_object");
+        assert_eq!(r["nrow"], 4);
+        assert_eq!(r["ncol"], 2);
+        assert!(!s(&r, "content_fp").is_empty());
+        assert!(records().iter().all(|r| s(r, "file") != "data/notdata.rds"));
+    }
+
+    #[test]
+    fn every_record_says_which_directory_it_came_from() {
+        for r in records() {
+            let d = s(&r, "origin_dir");
+            assert!(
+                ["data", "sysdata", "extdata"].contains(&d.as_str()),
+                "{} has no origin: {d:?}",
+                s(&r, "name")
+            );
+        }
+    }
+
+    #[test]
+    fn a_format_we_have_no_reader_for_is_left_alone() {
+        // A row carrying only a filename is not worth the storage.
+        assert!(records().iter().all(|r| s(r, "name") != "ext_ignored"));
+    }
+
+    #[test]
+    fn extdata_is_walked_into_its_subdirectories() {
+        let r = by_name("ext_nested");
+        assert_eq!(s(&r, "origin_dir"), "extdata");
+        assert_eq!(s(&r, "file"), "inst/extdata/nested/ext_nested.csv");
     }
 
     #[test]
@@ -2653,7 +2810,7 @@ mod tests {
     #[test]
     fn every_fixture_is_readable() {
         let recs = records();
-        assert_eq!(recs.len(), 59, "one record per saved object");
+        assert_eq!(recs.len(), 63, "one record per saved object");
         // Not everything saved under data/ is data. These carry behaviour rather
         // than observations, so there is nothing to fingerprint; what they must
         // still do is read cleanly, because a file that fails mid-object takes

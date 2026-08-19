@@ -189,3 +189,16 @@ wl(c("name\tcity\tn",              # a value holding a space is split by it, and
      "bob\tLos Angeles\t2"), "ws_value_has_space.txt")
 wl(c("a\tb\tc", "1\t\t3", "4\t5\t6"), "ws_ragged.tab")   # empty cell: read.table refuses
 wl(c("name\tn", '"New York"\t1', '"Los Angeles"\t2'), "ws_quoted.txt")
+
+# --- inst/extdata -------------------------------------------------------------
+# The same bytes mean different things depending on which directory they sit in.
+# data() applies its rules only under data/; nothing loads a file under extdata
+# by name, so the extension carries no promise and a .csv here is an ordinary
+# comma-separated file.
+e <- file.path(dirname(d), "inst", "extdata")
+dir.create(file.path(e, "nested"), recursive = TRUE, showWarnings = FALSE)
+writeLines(c("height,weight,sex", "1.7,65,F", "1.8,80,M"), file.path(e, "ext_comma.csv"))
+saveRDS(data.frame(a = 1:4, b = c("w","x","y","z")), file.path(e, "ext_object.rds"))
+writeLines(c("a\tb", "1\tx", "2\ty"), file.path(e, "ext_tabbed.tsv"))
+writeLines("not something we open", file.path(e, "ext_ignored.xlsx"))
+writeLines(c("k,v", "1,10"), file.path(e, "nested", "ext_nested.csv"))
