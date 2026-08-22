@@ -56,6 +56,16 @@ const NA_INT: i32 = i32::MIN;
 // Above this many cells in one vector, skip the value pass and keep structure
 // only, so a pathologically large object cannot blow up time or memory.
 const CELL_CAP: usize = 8_000_000;
+
+/// How many columns get a per-column record in the emitted schema.
+///
+/// The schema is one JSON object per column, so its size tracks the width of the
+/// object and nothing else. A document-term matrix runs to six figures of
+/// columns, which is megabytes of description for something no reader scrolls
+/// through and no page renders: the consumer draws a few hundred rows at most.
+/// The true width is reported as ncol regardless, so capping the detail loses the
+/// tail rather than the fact.
+const COLUMN_DETAIL_CAP: usize = 512;
 // Bottom-k row sketch size (KMV), for Jaccard/containment between datasets.
 const SKETCH_K: usize = 32;
 
@@ -1063,7 +1073,15 @@ fn profile_columns(cols: &[&Node], names: &[String]) -> Option<Profile> {
         }
         spatial_fields(col, &mut o);
         describe_attrs(&attr_pairs(col), &mut o, &[]);
-        col_json.push(o);
+        // Emit detail for the leading columns only. The cap is on what is
+        // WRITTEN, never on what is hashed: col_fp_bytes below still covers every
+        // column, so content_fp is unchanged and the content-addressed store does
+        // not see a new identity for data that has not moved. ncol is recorded
+        // separately from the true column count, so a reader can still see how
+        // many there are and tell that this list is the first of them.
+        if col_json.len() < COLUMN_DETAIL_CAP {
+            col_json.push(o);
+        }
         col_fp_bytes.extend_from_slice(fp.as_bytes());
         col_fp_bytes.push(b'|');
         cell_hashes.push(ch);
@@ -2019,7 +2037,28 @@ fn decompress_text(raw: Vec<u8>) -> Option<(String, &'static str)> {
     } else {
         (raw, "none")
     };
-    Some((String::from_utf8_lossy(&bytes).into_owned(), comp))
+    // readLines ends a line at \n, at \r\n, and at a lone \r. Rust's str::lines
+    // ends one at \n and nothing else, so a file written with classic Mac endings
+    // arrived as ONE line: the table reader took the whole thing for a header with
+    // nothing under it and reported a frame of zero rows carrying one column per
+    // field in the file. One such file came out as 2,537,269 columns whose
+    // per-column schema ran to 306 MB.
+    //
+    // \r\n is unambiguous and always folds. A LONE \r only folds in a file that
+    // has no \n anywhere, which is what a classic Mac file looks like. The
+    // narrower rule matters because fields are split a line at a time and quoting
+    // is applied within a line: a \r inside a quoted field of an otherwise
+    // LF-terminated file is data, and folding it would break the row into two and
+    // cost the whole file, since a row of the wrong width is refused.
+    let lossy = String::from_utf8_lossy(&bytes);
+    // Most files carry no \r at all, and those pay one scan rather than a rewrite.
+    let text = if lossy.contains('\r') {
+        let folded = lossy.replace("\r\n", "\n");
+        if folded.contains('\n') { folded } else { folded.replace('\r', "\n") }
+    } else {
+        lossy.into_owned()
+    };
+    Some((text, comp))
 }
 
 /// Split a delimited table that has already been read into memory.
@@ -2039,6 +2078,13 @@ fn parse_table(text: &str, sep: char) -> Option<(Vec<Node>, Vec<String>, usize)>
     let mut names: Vec<String> = header?.iter().map(|n| make_names(n)).collect();
     let ncol = names.len();
     if ncol == 0 {
+        return None;
+    }
+    // A header with nothing under it is a line of text, not a table. Every
+    // per-column statistic would be vacuous, and profiling it emits a record
+    // asserting a dataset where none exists. This is also the shape a misread
+    // file collapses to, so refusing it is the second guard on the same failure.
+    if rows.is_empty() {
         return None;
     }
     // read.table's row-names rule: a header one field shorter than the body
@@ -2959,5 +3005,109 @@ mod tests {
             }
             assert!(!s(r, "content_fp").is_empty(), "{name} has no fingerprint");
         }
+    }
+
+    /// A file written with classic Mac line endings is still a table.
+    ///
+    /// `str::lines()` splits on \n only, so a bare-\r file used to arrive as one
+    /// line: the whole thing became the header, `rows` stayed empty, and the
+    /// result was a "data frame" of zero rows and one column per field in the
+    /// file. That is how a 2,537,269-column record with a 306 MB schema was made.
+    #[test]
+    fn cr_only_line_endings_parse_as_rows_not_as_one_header() {
+        let text = "a,b,c\r1,2,3\r4,5,6\r";
+        let (cols, names, nrow) = parse_table(&normalize_for_test(text), ',')
+            .expect("a CR-terminated file is a table");
+        assert_eq!(names.len(), 3, "three columns, not one per field in the file");
+        assert_eq!(nrow, 2, "and two data rows");
+        assert_eq!(cols.len(), 3);
+    }
+
+    #[test]
+    fn crlf_line_endings_parse_as_rows() {
+        let (_, names, nrow) = parse_table(&normalize_for_test("a\tb\r\n1\t2\r\n3\t4\r\n"), '\t')
+            .expect("a CRLF file is a table");
+        assert_eq!(names.len(), 2);
+        assert_eq!(nrow, 2);
+    }
+
+    /// The normalization the readers apply, so these tests exercise the same rule
+    /// decompress_text applies rather than restating it.
+    fn normalize_for_test(t: &str) -> String {
+        t.replace("\r\n", "\n").replace('\r', "\n")
+    }
+
+    /// The one above tests parse_table against text already normalized, which
+    /// proves nothing about who normalizes it. This drives the real reader over a
+    /// real file, which is the path a package takes.
+    #[test]
+    fn read_text_free_normalizes_line_endings_off_disk() {
+        let dir = std::env::temp_dir().join(format!("rpkg_cr_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Wide and CR-only, the shape that produced a 2.5M-column record.
+        let width = 300usize;
+        let header: Vec<String> = (0..width).map(|i| format!("v{i}")).collect();
+        let row: Vec<String> = (0..width).map(|i| i.to_string()).collect();
+        let cr = format!("{}\r{}\r{}\r", header.join("\t"), row.join("\t"), row.join("\t"));
+        let path = dir.join("cr_only.tsv");
+        std::fs::write(&path, cr.as_bytes()).unwrap();
+
+        let (cols, names, nrow, fmt, _comp) =
+            read_text_free(&path).expect("a CR-only file still reads");
+        assert_eq!(names.len(), width, "one column per field in the HEADER, not in the file");
+        assert_eq!(nrow, 2, "both data rows were seen");
+        assert_eq!(cols.len(), width);
+        assert_eq!(fmt, "tsv", "the separator is sniffed from the real header line");
+
+        // The defect this replaces: one line means one row of fields, so ncol
+        // would have been width * 3 and nrow 0.
+        assert_ne!(names.len(), width * 3, "the whole file is not the header");
+
+        std::fs::remove_file(&path).ok();
+        std::fs::remove_dir(&dir).ok();
+    }
+
+    /// A header with nothing under it is a line of text, not a dataset. Every
+    /// per-column statistic would be vacuous.
+    #[test]
+    fn a_header_with_no_rows_is_not_a_table() {
+        assert!(parse_table("a,b,c\n", ',').is_none(), "header only is refused");
+        assert!(parse_table("a,b,c", ',').is_none(), "header with no terminator is refused");
+        assert!(parse_table("\n\n", ',').is_none(), "blank lines are refused");
+        assert!(parse_table("a,b\n1,2\n", ',').is_some(), "a header plus a row is a table");
+    }
+
+    /// Per-column detail is capped, and the cap must not move a fingerprint: the
+    /// hash covers every column even when the emitted list stops.
+    #[test]
+    fn wide_frames_cap_emitted_detail_without_moving_the_fingerprint() {
+        let width = COLUMN_DETAIL_CAP + 40;
+        let mut header = Vec::with_capacity(width);
+        let mut row = Vec::with_capacity(width);
+        for i in 0..width {
+            header.push(format!("c{i}"));
+            row.push(i.to_string());
+        }
+        let text = format!("{}\n{}\n", header.join(","), row.join(","));
+        let (cols, names, _) = parse_table(&text, ',').expect("a wide table still parses");
+        let refs: Vec<&Node> = cols.iter().collect();
+        let p = profile_columns(&refs, &names).expect("a wide frame profiles");
+
+        assert_eq!(p.columns.len(), COLUMN_DETAIL_CAP, "the emitted list stops at the cap");
+        assert_eq!(names.len(), width, "while the real width is untouched");
+
+        // Changing a column PAST the cap must still change content_fp, which is
+        // what proves the hash was not truncated along with the list.
+        let mut row2 = row.clone();
+        row2[width - 1] = "999999".to_string();
+        let text2 = format!("{}\n{}\n", header.join(","), row2.join(","));
+        let (cols2, names2, _) = parse_table(&text2, ',').unwrap();
+        let refs2: Vec<&Node> = cols2.iter().collect();
+        let p2 = profile_columns(&refs2, &names2).unwrap();
+        assert_ne!(
+            p.content_fp, p2.content_fp,
+            "a column beyond the cap still contributes to the content fingerprint"
+        );
     }
 }
