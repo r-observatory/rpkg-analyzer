@@ -1434,6 +1434,23 @@ fn emit_margin(rec: &mut Value, side: &str, mut m: Vec<f64>) {
 /// `over` says what was summarised, because it is not always every cell. A
 /// sparse matrix holds only its non-zeros, and a mean taken over those is a
 /// different number from a mean over the grid they sit in.
+/// What an object with values and no columns holds.
+///
+/// A length alone does not distinguish a column of numbers from a column of
+/// names. Read off the value rather than off the profile, so an object whose
+/// bytes are not kept, a raw or a complex vector or a grid the cell cap
+/// skipped, still says what its cells are.
+fn lift_element_type(rec: &mut Value, values: &Node) {
+    let (ty, is_factor, nlev) = base_type(values);
+    rec["type"] = json!(ty);
+    if is_factor {
+        rec["is_factor"] = json!(true);
+        if nlev >= 0 {
+            rec["n_levels"] = json!(nlev);
+        }
+    }
+}
+
 fn lift_value_summary(rec: &mut Value, values: &Node, over: &'static str) {
     let name = "values".to_string();
     let Some(p) = profile_columns(&[values], std::slice::from_ref(&name)) else { return };
@@ -3529,6 +3546,12 @@ fn describe(
             margin_fields(&pairs, &mut rec);
             series_fields(&pairs, &mut rec);
             describe_attrs(&pairs, &mut rec, &[]);
+            // What the grid holds. Read off the value the way a bare vector
+            // reads it, rather than picked out of the summary below, which is
+            // where it used to come from: a grid whose cells the cap skipped
+            // has no summary and so stopped saying what its cells are, while
+            // the vector in the same position went on saying it.
+            lift_element_type(&mut rec, node);
             // A grid has no columns to hang a summary on, so it is described
             // whole. Without this a matrix said how big it was and nothing
             // about what was in it.
@@ -3687,18 +3710,7 @@ fn describe(
     }
     describe_attrs(&pairs, &mut rec, &[]);
     if kind == "vector" || kind == "list" {
-        // What a vector holds, which the record said nothing about: a length
-        // alone does not distinguish a column of numbers from a column of
-        // names. Taken from the value rather than from the profile, so a raw
-        // or complex vector, whose bytes are not kept, still says what it is.
-        let (ty, is_factor, nlev) = base_type(node);
-        rec["type"] = json!(ty);
-        if is_factor {
-            rec["is_factor"] = json!(true);
-            if nlev >= 0 {
-                rec["n_levels"] = json!(nlev);
-            }
-        }
+        lift_element_type(&mut rec, node);
         if let Some(p) = profile_columns(&[node], std::slice::from_ref(&name.to_string())) {
             if let Some(total) = p.n_missing_total {
                 rec["n_missing_total"] = json!(total);
@@ -6902,6 +6914,25 @@ mod tests {
              walk still being made",
             nr * nc
         );
+    }
+
+    /// What a grid holds, whether or not its cells were read.
+    ///
+    /// The element type is read off the object and has nothing to do with the
+    /// value pass. A grid took its `type` out of the summary over its cells,
+    /// so once the summary stopped being taken over cells nobody read, the
+    /// type went with it: a 3000 by 3000 matrix of doubles came back saying
+    /// nothing about what was in it. The bare vector in the same position has
+    /// always said, because it reads the type off the value.
+    #[test]
+    fn a_grid_says_what_it_holds_whether_or_not_its_cells_were_read() {
+        let read = by_name("mat_named"); // matrix(1:12, nrow = 3)
+        assert_eq!(s(&read, "type"), "integer", "a grid whose cells were read");
+
+        let skipped = describe_here("big_matrix", &dropped_grid(3000, 3000));
+        assert_eq!(s(&skipped, "type"), "numeric", "and one whose cells were not");
+        let v = describe_here("big_vector", &dropped_reals(CELL_CAP + 1));
+        assert_eq!(s(&v, "type"), s(&skipped, "type"), "the two paths agree");
     }
 
     /// One type is not on its own a reason to give up per-column detail. A
