@@ -1285,7 +1285,9 @@ fn hex128(h: &blake3::Hash) -> String {
 struct Profile {
     detail: ColumnDetail,
     columns: Vec<Value>,
-    n_missing_total: u64,
+    /// None where no column produced a count, which is a frame or a vector of
+    /// nothing but complex values.
+    n_missing_total: Option<u64>,
     schema_fp: String,
     shape_fp: String,
     content_fp: String,
@@ -1455,8 +1457,8 @@ fn lift_value_summary(rec: &mut Value, values: &Node, over: &'static str) {
     if let Some(v) = c.get("n_unique") {
         rec["n_unique"] = v.clone();
     }
-    if rec.get("n_missing_total").is_none() {
-        rec["n_missing_total"] = json!(p.n_missing_total);
+    if let (None, Some(total)) = (rec.get("n_missing_total"), p.n_missing_total) {
+        rec["n_missing_total"] = json!(total);
     }
     if any {
         rec["summary_over"] = json!(over);
@@ -1675,7 +1677,9 @@ fn skipped_fingerprints(cols: &[&Node], names: &[String]) -> Option<(String, Str
 /// matter of noticing which fields are missing.
 fn attach_profile(rec: &mut Value, p: Profile, cols: &[&Node]) {
     rec["column_detail"] = json!(p.detail.name());
-    rec["n_missing_total"] = json!(p.n_missing_total);
+    if let Some(total) = p.n_missing_total {
+        rec["n_missing_total"] = json!(total);
+    }
     rec["schema_fp"] = json!(p.schema_fp);
     rec["shape_fp"] = json!(p.shape_fp);
     rec["content_fp"] = json!(p.content_fp);
@@ -2264,6 +2268,9 @@ fn profile_columns(cols: &[&Node], names: &[String]) -> Option<Profile> {
     let mut col_fp_bytes: Vec<u8> = Vec::new();
     let mut cell_hashes: Vec<Vec<u64>> = Vec::with_capacity(cols.len());
     let mut n_missing_total = 0u64;
+    // Whether any column produced one. A frame of nothing but complex columns
+    // has no total to report, only a sum over counts nobody took.
+    let mut n_missing_counted = false;
     let mut schema_src = String::new();
     let mut shape_src = String::new();
 
@@ -2474,7 +2481,17 @@ fn profile_columns(cols: &[&Node], names: &[String]) -> Option<Profile> {
             }
         }
         let fp = hex128(&hasher.finalize());
-        n_missing_total += n_missing;
+        // A complex vector is hashed whole rather than cell by cell, so no
+        // value of one was ever looked at and none of them was ever found
+        // missing: the count came back 0 on a column where three of ten are
+        // NA. Raw is the other side of that. Its cells were not looked at
+        // either, and R has no missing raw value to look for, so 0 is a fact
+        // about the type rather than a count nobody took.
+        let counts_missing = ty != "complex";
+        if counts_missing {
+            n_missing_total += n_missing;
+            n_missing_counted = true;
+        }
 
         let name = names.get(j).cloned().unwrap_or_default();
         let btype = if is_factor { "factor" } else { ty };
@@ -2484,10 +2501,10 @@ fn profile_columns(cols: &[&Node], names: &[String]) -> Option<Profile> {
         // is_factor is not written when false: it says the same thing as the
         // type, and a field repeated on every column of every dataset to say
         // "no" is a tenth of what the column list costs.
-        let mut o = json!({
-            "name": name, "type": ty,
-            "n_missing": n_missing, "col_fp": fp
-        });
+        let mut o = json!({ "name": name, "type": ty, "col_fp": fp });
+        if counts_missing {
+            o["n_missing"] = json!(n_missing);
+        }
         // Left out rather than reported as one, which is what the shared
         // digest would make it.
         if !is_opaque {
@@ -2786,7 +2803,7 @@ fn profile_columns(cols: &[&Node], names: &[String]) -> Option<Profile> {
     Some(Profile {
         detail,
         columns: col_json,
-        n_missing_total,
+        n_missing_total: n_missing_counted.then_some(n_missing_total),
         schema_fp,
         shape_fp,
         content_fp,
@@ -3133,7 +3150,9 @@ fn describe(
                         let names: Vec<String> =
                             cols.iter().enumerate().map(|(k, _)| format!("s{k}")).collect();
                         if let Some(pr) = profile_columns(&cols, &names) {
-                            rec["n_missing_total"] = json!(pr.n_missing_total);
+                            if let Some(total) = pr.n_missing_total {
+                                rec["n_missing_total"] = json!(total);
+                            }
                             rec["schema_fp"] = json!(pr.schema_fp);
                             rec["shape_fp"] = json!(pr.shape_fp);
                             rec["content_fp"] = json!(pr.content_fp);
@@ -3274,7 +3293,9 @@ fn describe(
                             let cols = vec![v];
                             let names = vec!["values".to_string()];
                             if let Some(pr) = profile_columns(&cols, &names) {
-                                rec["n_missing_total"] = json!(pr.n_missing_total);
+                                if let Some(total) = pr.n_missing_total {
+                                    rec["n_missing_total"] = json!(total);
+                                }
                                 rec["schema_fp"] = json!(pr.schema_fp);
                                 rec["shape_fp"] = json!(pr.shape_fp);
                                 rec["content_fp"] = json!(pr.content_fp);
@@ -3546,7 +3567,9 @@ fn describe(
                 };
                 {
                     if let Some(p) = profile_columns(&refs, &names) {
-                        rec["n_missing_total"] = json!(p.n_missing_total);
+                        if let Some(total) = p.n_missing_total {
+                            rec["n_missing_total"] = json!(total);
+                        }
                         rec["schema_fp"] = json!(p.schema_fp);
                         rec["shape_fp"] = json!(p.shape_fp);
                         rec["content_fp"] = json!(p.content_fp);
@@ -3677,7 +3700,9 @@ fn describe(
             }
         }
         if let Some(p) = profile_columns(&[node], std::slice::from_ref(&name.to_string())) {
-            rec["n_missing_total"] = json!(p.n_missing_total);
+            if let Some(total) = p.n_missing_total {
+                rec["n_missing_total"] = json!(total);
+            }
             rec["n_unique"] = json!(p.columns.first().and_then(|c| c.get("n_unique")).cloned().unwrap_or(json!(null)));
             // The summary the profile already worked out, which was being
             // kept only for the columns of a table: a time series or a zoo is
@@ -5169,6 +5194,45 @@ mod tests {
         assert_eq!(f["n_levels"], 3);
     }
 
+    /// A complex column with missing values in it.
+    ///
+    /// The reader hashes a complex vector whole rather than cell by cell, so
+    /// it never looks at a value of one and never finds one missing. The count
+    /// came back 0 on a column where three of ten are NA, which is the same
+    /// thing as a distinct count of 1 over one digest: a number nobody took,
+    /// written down as a measurement. R has no missing raw value, so a raw
+    /// column's 0 is a fact about the type and stays.
+    #[test]
+    fn a_complex_column_counts_nothing_it_never_looked_at() {
+        let r = by_name("complex_missing");
+        let cols = r["columns"].as_array().expect("both columns are listed");
+        let z = cols.iter().find(|c| s(c, "type") == "complex").expect("the complex column");
+        let raw = cols.iter().find(|c| s(c, "type") == "raw").expect("the raw column");
+
+        assert!(z.get("n_unique").is_none(), "the distinct count is already left off");
+        assert!(
+            z.get("n_missing").is_none(),
+            "the complex column reports {} missing of ten, three of which are NA",
+            z["n_missing"]
+        );
+        assert!(!s(z, "col_fp").is_empty(), "and it is still known by its digest");
+        assert_eq!(raw["n_missing"], 0, "a raw vector cannot hold NA, so this one is measured");
+        assert!(
+            r.get("n_missing_total").is_none() || r["n_missing_total"] == 0,
+            "the total is over the columns that were counted"
+        );
+
+        // A vector of the same type has nowhere else to put the count, so the
+        // record carries none rather than a zero over cells nobody read.
+        let v = by_name("vec_complex");
+        assert_eq!(s(&v, "type"), "complex");
+        assert!(
+            v.get("n_missing_total").is_none(),
+            "the complex vector reports {} missing over values it never looked at",
+            v["n_missing_total"]
+        );
+    }
+
     #[test]
     fn a_grid_is_summarised_whole() {
         // A matrix, an array and a raster have no columns to hang a summary
@@ -6255,7 +6319,7 @@ mod tests {
     #[test]
     fn every_fixture_is_readable() {
         let recs = records();
-        assert_eq!(recs.len(), 125, "one record per saved object");
+        assert_eq!(recs.len(), 126, "one record per saved object");
         // Not everything saved under data/ is data. These carry behaviour rather
         // than observations, so there is nothing to fingerprint; what they must
         // still do is read cleanly, because a file that fails mid-object takes
@@ -6576,7 +6640,7 @@ mod tests {
         let p = Profile {
             detail: ColumnDetail::None,
             columns: Vec::new(),
-            n_missing_total: 0,
+            n_missing_total: Some(0),
             schema_fp: String::new(),
             shape_fp: String::new(),
             content_fp: String::new(),
@@ -6935,6 +6999,10 @@ mod tests {
             // Two column types carry no distinct count, and a consumer building
             // a column specification off this file has to know which.
             ("the columns that carry no distinct count", "no `n_unique`".to_string()),
+            // And the one that carries no missing count either, for the same
+            // reason: its cells were never looked at, so none of them was ever
+            // found missing.
+            ("the column that carries no missing count", "no `n_missing`".to_string()),
             // A record for an object the cap skipped is identified by a hash
             // of its bytes and by nothing taken over its rows, and a consumer
             // matching on row sketches has to know that one is missing rather

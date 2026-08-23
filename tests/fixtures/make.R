@@ -593,3 +593,11 @@ sv(data.frame(a = 1:9000000L, b = 1:9000000L, c = 1:9000000L), "unread_columns")
 # parses to this shape with millions of columns, and writing four zeroes against
 # each of them would describe nothing at great length.
 sv(as.data.frame(matrix(numeric(0), nrow = 0, ncol = 600)), "wide_empty")
+# A complex column with missing values in it, and a raw column beside it. The
+# reader hashes both of these whole rather than cell by cell, so it never looks
+# at a value of either. Only one of them can be missing: R has no missing raw
+# value, so a raw column's zero is a fact about the type, while three of these
+# ten complex values are NA and the count came back zero all the same.
+z <- complex(real = 1:10, imaginary = 10:1)
+z[c(2, 5, 9)] <- NA
+sv(data.frame(z = z, r = as.raw(1:10)), "complex_missing")
