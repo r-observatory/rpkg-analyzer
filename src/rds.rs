@@ -1315,6 +1315,14 @@ fn margin_summaries(node: &Node, nrow: usize, ncol: usize, rec: &mut Value) {
     if nrow < 2 || ncol < 2 {
         return;
     }
+    // A grid whose cells were never read has no margins to take. The accessor
+    // below answers "missing" at every position of such a vector, so the walk
+    // runs to the end of the grid and emits nothing: on the largest object of
+    // this kind in the published corpus, 149,260,391 asks for a value that is
+    // not there.
+    if values_dropped(node) {
+        return;
+    }
     // Reading a value out of the flat vector, with R's two spellings of
     // missing folded into one.
     let at: Box<dyn Fn(usize) -> Option<f64>> = match &node.val {
@@ -6623,6 +6631,36 @@ mod tests {
         }
         assert_eq!(s(&r, "confidence"), "degraded");
         assert!(!s(&r, "notes").is_empty(), "and it says why");
+    }
+
+    /// The margins of a grid whose cells were never read.
+    ///
+    /// `margin_summaries` walked every cell before finding out there were
+    /// none. The accessor it builds over a dropped vector answers "missing" to
+    /// every position, so the largest such object in the published corpus, a
+    /// 26,687 by 5,593 matrix, cost 149,260,391 closure calls to produce no
+    /// field at all. No field is written either way, so the only observable
+    /// difference is that the walk is not made.
+    #[test]
+    fn a_grid_the_cap_skipped_is_not_averaged_across() {
+        let (nr, nc) = (26_687usize, 5_593usize);
+        let node = Node {
+            val: Val::Reals { len: nr * nc, vals: Vec::new() },
+            attr: attrs(&[("dim", ints(&[nr as i32, nc as i32]))]),
+        };
+        let started = std::time::Instant::now();
+        let r = describe_here("big_matrix", &node);
+        let took = started.elapsed();
+
+        for k in ["row_mean_mean", "row_mean_sd", "col_mean_mean", "col_mean_sd"] {
+            assert!(r.get(k).is_none(), "the grid reports {k} over cells it never read");
+        }
+        assert!(
+            took < std::time::Duration::from_millis(200),
+            "describing a grid of {} unread cells took {took:?}, which is the per-cell \
+             walk still being made",
+            nr * nc
+        );
     }
 
     /// One type is not on its own a reason to give up per-column detail. A
