@@ -2108,6 +2108,26 @@ fn round_stat(v: f64) -> f64 {
     (v * scale).round() / scale
 }
 
+/// Whether a vector's length was read and its values were not.
+///
+/// Past `CELL_CAP` the reader keeps the length and skips over the values, and
+/// the node it leaves behind is still an `Ints` or a `Reals`. Nothing else
+/// makes those two disagree, so a `vals` shorter than `len` means exactly one
+/// thing and means it wherever it is asked.
+///
+/// It has to be asked. Reading `vals` on such a node yields an empty slice
+/// rather than a refusal, so a count over it comes back zero and looks like a
+/// measurement: no missing values in a column that has them, one distinct value
+/// in nine million, and a fingerprint taken over nothing, which is the same
+/// fingerprint for every object the cap ever touched.
+fn values_dropped(node: &Node) -> bool {
+    match &node.val {
+        Val::Ints { len, vals, .. } => vals.len() < *len,
+        Val::Reals { len, vals } => vals.len() < *len,
+        _ => false,
+    }
+}
+
 fn profile_columns(cols: &[&Node], names: &[String]) -> Option<Profile> {
     // Two different things used to be one. A column whose values were never
     // materialized (over the cap, or a type this reader skips) genuinely cannot
@@ -2124,9 +2144,14 @@ fn profile_columns(cols: &[&Node], names: &[String]) -> Option<Profile> {
     // even though it cannot be summarised. A generated sequence too long to
     // hold cannot: nothing was hashed, and a fingerprint over its length alone
     // would make two different sequences of the same length one dataset.
+    // A fourth case, and the quietest of them: a vector past the cell cap keeps
+    // its type and loses its values, so it arrives here as an ordinary `Reals`
+    // over an empty slice. Every count then came out zero and every one of them
+    // was written down.
     let any_unread = cols.iter().any(|c| {
-        !matches!(c.val, Val::Ints { .. } | Val::Reals { .. } | Val::Str(_) | Val::Vec(_))
-            && !matches!(c.val, Val::Blob { of, .. } if of == "raw" || of == "complex")
+        values_dropped(c)
+            || (!matches!(c.val, Val::Ints { .. } | Val::Reals { .. } | Val::Str(_) | Val::Vec(_))
+                && !matches!(c.val, Val::Blob { of, .. } if of == "raw" || of == "complex"))
     });
     if any_unread {
         return None;
@@ -3421,6 +3446,14 @@ fn describe(
                         rec["shape_fp"] = json!(p.shape_fp);
                         rec["content_fp"] = json!(p.content_fp);
                         rec["row_sketch"] = json!(p.row_sketch);
+                    } else if values_dropped(node) {
+                        // A grid has no column list to carry the same news, so
+                        // the record says it here. Its extent is exact and not
+                        // one of its cells was read, and without this the two
+                        // are told apart by the absence of fields a consumer
+                        // has no reason to expect on every matrix.
+                        rec["confidence"] = json!("degraded");
+                        rec["notes"] = json!("value scan skipped (size cap)");
                     }
                 }
             }
@@ -3554,6 +3587,11 @@ fn describe(
                 }
             }
             rec["content_fp"] = json!(p.content_fp);
+        } else if values_dropped(node) {
+            // Same as the grid: a length and a type were read and nothing else
+            // was.
+            rec["confidence"] = json!("degraded");
+            rec["notes"] = json!("value scan skipped (size cap)");
         }
     }
     rec
@@ -6475,6 +6513,100 @@ mod tests {
             }
         }
         assert!(r.get("content_fp").is_none(), "no value was read, so nothing is fingerprinted");
+    }
+
+    /// An attribute pairlist, so a node of a given shape can be built here
+    /// without a fixture file of the size that shape implies.
+    fn attrs(items: &[(&str, Node)]) -> Option<Box<Node>> {
+        let mut cur = Node { val: Val::Nil, attr: None };
+        for (k, v) in items.iter().rev() {
+            cur = Node {
+                val: Val::List {
+                    tag: Box::new(Node { val: Val::Sym((*k).to_string()), attr: None }),
+                    car: Box::new(v.clone()),
+                    cdr: Box::new(cur),
+                },
+                attr: None,
+            };
+        }
+        Some(Box::new(cur))
+    }
+    fn strs(v: &[&str]) -> Node {
+        Node { val: Val::Str(v.iter().map(|s| Some((*s).to_string())).collect()), attr: None }
+    }
+    fn ints(v: &[i32]) -> Node {
+        Node { val: Val::Ints { len: v.len(), vals: v.to_vec(), logical: false }, attr: None }
+    }
+    /// A column of `len` doubles the reader declined to hold, which is what the
+    /// value pass leaves behind past the cell cap: the length is known and not
+    /// one cell of it is.
+    fn dropped_reals(len: usize) -> Node {
+        Node { val: Val::Reals { len, vals: Vec::new() }, attr: None }
+    }
+    fn describe_here(name: &str, node: &Node) -> Value {
+        describe(name, "data/x.rda", node, "rda", 3, "none", false, 0)
+    }
+
+    /// Past the cell cap the reader keeps a vector's length and drops its
+    /// values. A column left that way is still a `Reals`, so every count taken
+    /// over it was taken over an empty slice and came out zero: no missing
+    /// values in a column that has them, no distinct values in nine million,
+    /// and a fingerprint over nothing, which is the same fingerprint for every
+    /// object this happens to. A record cannot report a measurement it did not
+    /// take.
+    #[test]
+    fn a_frame_whose_cells_the_cap_dropped_measures_nothing() {
+        let n = CELL_CAP + 1;
+        let node = Node {
+            val: Val::Vec(vec![dropped_reals(n), dropped_reals(n)]),
+            attr: attrs(&[
+                ("names", strs(&["a", "b"])),
+                ("class", strs(&["data.frame"])),
+                ("row.names", ints(&[NA_INT, -(n as i32)])),
+            ]),
+        };
+        let r = describe_here("tall_real", &node);
+
+        assert_eq!(r["ncol"], 2);
+        assert_eq!(r["nrow"], n as i64, "the length is the one thing that was read");
+        assert_eq!(s(&r, "column_detail"), "structural");
+        assert_eq!(s(&r, "confidence"), "degraded");
+        assert!(!s(&r, "notes").is_empty(), "and it says why");
+        let cols = r["columns"].as_array().expect("every column is still listed");
+        assert_eq!(cols.len(), 2);
+        for c in cols {
+            for k in ["n_missing", "n_unique", "col_fp"] {
+                assert!(c.get(k).is_none(), "{} claims {k} with no cell read", c["name"]);
+            }
+        }
+        assert!(r.get("n_missing_total").is_none(), "nothing was counted as missing");
+        assert!(
+            r.get("content_fp").is_none(),
+            "and nothing was read to identify it by, so two unlike objects cannot share one"
+        );
+    }
+
+    /// The same cap, and the same silence required of it, on the grid that has
+    /// no columns to hang the counts on. A matrix past the cap summarised an
+    /// empty slice as its cells: a distinct count of zero, no missing values in
+    /// a grid that has them, and `exact` over the lot.
+    #[test]
+    fn a_grid_whose_cells_the_cap_dropped_measures_nothing() {
+        let side = 3000i32;
+        let node = Node {
+            val: Val::Reals { len: (side as usize) * (side as usize), vals: Vec::new() },
+            attr: attrs(&[("dim", ints(&[side, side]))]),
+        };
+        let r = describe_here("big_matrix", &node);
+
+        assert_eq!(r["nrow"], 3000);
+        assert_eq!(r["ncol"], 3000);
+        assert_eq!(r["length"], 9_000_000i64);
+        for k in ["n_unique", "n_missing_total", "summary_over", "mean", "content_fp"] {
+            assert!(r.get(k).is_none(), "the grid reports {k} with no cell read");
+        }
+        assert_eq!(s(&r, "confidence"), "degraded");
+        assert!(!s(&r, "notes").is_empty(), "and it says why");
     }
 
     /// One type is not on its own a reason to give up per-column detail. A
