@@ -60,6 +60,12 @@ const NA_INT: i32 = i32::MIN;
 
 // Above this many cells in one vector, skip the value pass and keep structure
 // only, so a pathologically large object cannot blow up time or memory.
+//
+// One vector is the whole of the test on the way in: a 600 by 14,000 frame
+// holds 8.4 million cells and not one of its columns is above the cap, so all
+// of it is read. The same number bounds `grid_cells`, which is a second copy of
+// an object already held, and that one is against the cell count. Two tests,
+// two quantities, one bound.
 const CELL_CAP: usize = 8_000_000;
 
 /// The width past which describing every column one at a time stops being a
@@ -107,11 +113,21 @@ enum ColumnDetail {
     None,
     /// Every column, carrying what can be known without reading a value: its
     /// name, its declared type, whether it is a factor and how many levels it
-    /// declares. This is not a depth width chooses. It is what a frame past the
-    /// cell cap gets, where no value was read at all, and it is a different
-    /// list from `Reduced`: no count of anything is in it, because no cell was
-    /// looked at. The two used to share the `reduced` label, which told a
-    /// consumer to expect four statistics from a list that had none of them.
+    /// declares. It is a different list from `Reduced`: no count of anything is
+    /// in it, because no cell was looked at. The two used to share the
+    /// `reduced` label, which told a consumer to expect four statistics from a
+    /// list that had none of them.
+    ///
+    /// This is not a depth width chooses, and it is not the object's cell count
+    /// either. It is what one column being unreadable does to the frame around
+    /// it, and a column is unreadable two ways: it is longer than `CELL_CAP`
+    /// values, so the value pass kept its length and skipped over it, or it
+    /// holds something with no representation here, a compact sequence too long
+    /// to expand or an S4 object. Complex and raw are not that second case,
+    /// because the whole vector was hashed on the way past. So a three column
+    /// frame lands here when it is nine million rows tall, and a 600 by 14,000
+    /// frame does not land here at all: 8.4 million cells, and every column in
+    /// it is 600 long.
     Structural,
 }
 
@@ -6695,7 +6711,15 @@ mod tests {
             ("the leftover-attribute cap", format!("{ATTRS_OTHER_CAP} entries")),
             ("the row sketch size", format!("bottom-{SKETCH_K}")),
             ("the per-column detail cap", format!("{COLUMN_DETAIL_CAP} columns")),
-            ("the cell cap", format!("{CELL_CAP} cells")),
+            ("the cell cap", format!("{CELL_CAP} values")),
+            // The cap is against the length of one vector. Stating it as the
+            // object's cell count instead is the difference between a 600 by
+            // 14,000 frame being fully measured, which it is, and its being
+            // read for structure alone.
+            ("what the cell cap is against", "not the cell count of the object".to_string()),
+            // Two column types carry no distinct count, and a consumer building
+            // a column specification off this file has to know which.
+            ("the columns that carry no distinct count", "no `n_unique`".to_string()),
             (
                 "the column depth vocabulary",
                 "`column_detail` is `full`, `reduced`, `none` or `structural`".to_string(),
