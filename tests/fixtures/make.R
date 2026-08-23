@@ -587,3 +587,9 @@ sv(wide_sf, "wide_sf")
 # gets. Nine million rows cost a few hundred bytes here because R stores 1:n as
 # a compact sequence and writes the state rather than the numbers.
 sv(data.frame(a = 1:9000000L, b = 1:9000000L, c = 1:9000000L), "unread_columns")
+# Wide, one type, and no rows. There are no values to summarise and none to
+# count per column either, so the record says how many cells there are, which is
+# none, and the width and the row count say the rest. A malformed wide file
+# parses to this shape with millions of columns, and writing four zeroes against
+# each of them would describe nothing at great length.
+sv(as.data.frame(matrix(numeric(0), nrow = 0, ncol = 600)), "wide_empty")

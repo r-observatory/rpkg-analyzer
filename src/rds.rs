@@ -101,7 +101,9 @@ enum ColumnDetail {
     /// No column list, and in its place the summary a matrix of the same values
     /// would carry. A wide frame whose columns are all one type is a matrix
     /// wearing a data.frame coat, and profiling it column by column writes
-    /// "numeric" nineteen thousand times over.
+    /// "numeric" nineteen thousand times over. Chosen only when that summary
+    /// can actually be taken, because the whole of the exchange is a list given
+    /// up for an aggregate: see `column_detail`.
     None,
     /// Every column, carrying what can be known without reading a value: its
     /// name, its declared type, whether it is a factor and how many levels it
@@ -1435,13 +1437,50 @@ fn one_base_type(cols: &[&Node]) -> Option<&'static str> {
     Some(first)
 }
 
-/// How deep a set of columns is worth describing, on width first and then on
-/// what the columns are.
+/// The grid a set of columns lays out into, as the row count and the cell
+/// count, when they lay out into a grid at all and it is small enough to hold
+/// flat a second time.
+///
+/// This is the one place the question is asked. Deciding a depth and producing
+/// what that depth promises used to test different things: the depth was picked
+/// on width and one type, and the aggregate was refused separately on the cell
+/// cap, so a frame past the cap gave up its column list and got nothing for it.
+fn grid_cells(cols: &[&Node]) -> Option<(usize, usize)> {
+    let nrow = col_len(cols.first()?);
+    // A column holding a matrix of its own is longer than the frame is tall, so
+    // the columns do not lay end to end into a grid.
+    if cols.iter().any(|c| col_len(c) != nrow) {
+        return None;
+    }
+    let cells = nrow.checked_mul(cols.len())?;
+    // A grid of no cells is still a grid, and saying it holds nothing is a
+    // complete description of it. What is refused here is a grid too big to
+    // hold a second time, which is the one case where there are values and no
+    // way to describe them whole.
+    if cells > CELL_CAP {
+        return None;
+    }
+    Some((nrow, cells))
+}
+
+/// How deep a set of columns is worth describing, on width first, then on what
+/// the columns are, and last on what can actually be delivered.
+///
+/// Giving up the column list is only worth doing in exchange for the aggregate
+/// that replaces it, so the exchange has to be available before it is made. A
+/// frame that is one type and past the cell cap keeps every column instead:
+/// four statistics on each of them says far less than the aggregate would, and
+/// it says immeasurably more than the empty record that promising an aggregate
+/// and then refusing it produced.
+///
+/// A grid of no cells is not that case. It holds no values, so there is nothing
+/// to summarise and nothing per column to write either, and `nrow` with
+/// `n_cells` describes it completely.
 fn column_detail(cols: &[&Node]) -> ColumnDetail {
     if cols.len() <= COLUMN_DETAIL_CAP {
         return ColumnDetail::Full;
     }
-    if one_base_type(cols).is_some() {
+    if one_base_type(cols).is_some() && grid_cells(cols).is_some() {
         ColumnDetail::None
     } else {
         ColumnDetail::Reduced
@@ -1460,10 +1499,14 @@ fn column_detail(cols: &[&Node]) -> ColumnDetail {
 ///
 /// Nothing is copied until the shape is known to be rectangular, and the copy
 /// is refused past the cell cap that already bounds what this reader will hold
-/// twice.
-fn flatten_columns(cols: &[&Node], nrow: usize) -> Option<Node> {
-    let cells = nrow.checked_mul(cols.len())?;
-    if cells == 0 || cells > CELL_CAP {
+/// twice. Both of those are `grid_cells`, which is also what the depth is
+/// decided on, so the decision and the copy cannot disagree about whether this
+/// object has an aggregate in it.
+fn flatten_columns(cols: &[&Node]) -> Option<Node> {
+    let (_, cells) = grid_cells(cols)?;
+    // There is nothing to lay out, and a summary of no values is a row of
+    // statistics over nothing. The caller says so with n_cells instead.
+    if cells == 0 {
         return None;
     }
     let val = match &cols.first()?.val {
@@ -1507,19 +1550,23 @@ fn flatten_columns(cols: &[&Node], nrow: usize) -> Option<Node> {
 ///
 /// The missing total is not set here. It comes off the per-column pass, which
 /// runs whatever the depth, and counts the same cells this would.
-fn whole_object_summary(rec: &mut Value, cols: &[&Node]) {
-    let Some(first) = cols.first() else { return };
-    let nrow = col_len(first);
-    // A column holding a matrix of its own is longer than the frame is tall, so
-    // the columns do not lay end to end into a grid and there is no grid to
-    // summarise the margins of.
-    if cols.iter().any(|c| col_len(c) != nrow) {
-        return;
+///
+/// Returns whether the summary was actually written, because a caller that has
+/// already given up the column list has nothing left to say if it was not.
+fn whole_object_summary(rec: &mut Value, cols: &[&Node]) -> bool {
+    let Some((nrow, cells)) = grid_cells(cols) else { return false };
+    rec["n_cells"] = json!(cells);
+    // An empty grid holds no values and needs no summary of them: `nrow` and
+    // `n_cells` are the whole of what there is to say, and they say it. The
+    // alternative is a name and four zeroes for each of two and a half million
+    // columns, which is what a malformed wide file parses to.
+    if cells == 0 {
+        return true;
     }
-    rec["n_cells"] = json!(nrow.saturating_mul(cols.len()));
-    let Some(flat) = flatten_columns(cols, nrow) else { return };
+    let Some(flat) = flatten_columns(cols) else { return false };
     lift_value_summary(rec, &flat, "cells");
     margin_summaries(&flat, nrow, cols.len(), rec);
+    true
 }
 
 /// Hang a profile on a record at the depth it was taken at.
@@ -1534,7 +1581,17 @@ fn attach_profile(rec: &mut Value, p: Profile, cols: &[&Node]) {
     rec["content_fp"] = json!(p.content_fp);
     rec["row_sketch"] = json!(p.row_sketch);
     match p.detail {
-        ColumnDetail::None => whole_object_summary(rec, cols),
+        ColumnDetail::None => {
+            // `column_detail` picks this depth only where the summary can be
+            // taken, so reaching the other arm means the two have come apart
+            // again. A record that has given up its column list and has no
+            // aggregate to put there describes nothing, and the one thing it
+            // must not do is read as a complete description of an object.
+            if !whole_object_summary(rec, cols) {
+                rec["confidence"] = json!("degraded");
+                rec["notes"] = json!("whole-object summary unavailable");
+            }
+        }
         _ => rec["columns"] = Value::Array(p.columns),
     }
 }
@@ -6040,7 +6097,7 @@ mod tests {
     #[test]
     fn every_fixture_is_readable() {
         let recs = records();
-        assert_eq!(recs.len(), 124, "one record per saved object");
+        assert_eq!(recs.len(), 125, "one record per saved object");
         // Not everything saved under data/ is data. These carry behaviour rather
         // than observations, so there is nothing to fingerprint; what they must
         // still do is read cleanly, because a file that fails mid-object takes
@@ -6303,6 +6360,98 @@ mod tests {
         );
     }
 
+    /// The depth that gives up the column list promises an aggregate in its
+    /// place, and past the cell cap that aggregate cannot be taken: the columns
+    /// are not laid end to end into the one vector it is a summary over.
+    /// Deciding the depth on width and one type alone therefore wrote a record
+    /// with no column list, nothing in place of it, and a confidence of `exact`
+    /// over the silence, which is worse than the truncation the depths replace.
+    #[test]
+    fn a_frame_too_big_to_lay_flat_keeps_its_columns() {
+        let ncol = COLUMN_DETAIL_CAP + 1;
+        let nrow = CELL_CAP / ncol + 1;
+        assert!(nrow * ncol > CELL_CAP, "the frame has to be past the cell cap to test anything");
+        let cols: Vec<Node> = (0..ncol)
+            .map(|_| Node {
+                val: Val::Ints {
+                    len: nrow,
+                    vals: (0..nrow).map(|i| (i % 97) as i32).collect(),
+                    logical: false,
+                },
+                attr: None,
+            })
+            .collect();
+        let refs: Vec<&Node> = cols.iter().collect();
+        let names: Vec<String> = (0..ncol).map(|j| format!("v{j}")).collect();
+
+        // One type across the whole width, which is the condition that used to
+        // decide this on its own.
+        assert_eq!(one_base_type(&refs), Some("integer"));
+        assert!(flatten_columns(&refs).is_none(), "and yet the aggregate cannot be produced");
+        assert_ne!(column_detail(&refs), ColumnDetail::None, "so no depth may promise one");
+
+        let p = profile_columns(&refs, &names).expect("a wide frame still profiles");
+        let mut rec = json!({ "ncol": ncol, "confidence": "exact" });
+        attach_profile(&mut rec, p, &refs);
+
+        let listed = rec["columns"].as_array().map(|c| c.len()).unwrap_or(0);
+        assert!(
+            listed > 0 || rec.get("summary_over").is_some(),
+            "a record with neither a column list nor an aggregate describes nothing at all"
+        );
+        assert_eq!(listed, ncol, "every column is kept instead, none of them dropped");
+        assert_eq!(s(&rec, "column_detail"), "reduced");
+        assert_eq!(s(&rec, "confidence"), "exact", "nothing here was measured wrongly");
+    }
+
+    /// The same defence at the point the record is written. However the depth
+    /// was arrived at, a record that has given up its column list and then
+    /// cannot produce the aggregate has to say so, rather than go quiet and
+    /// call itself exact.
+    #[test]
+    fn a_promised_aggregate_that_cannot_be_taken_is_said_on_the_record() {
+        // Columns of different lengths are not a grid, so there is nothing to
+        // lay flat and no margins to summarise.
+        let a = Node { val: Val::Reals { len: 3, vals: vec![1.0, 2.0, 3.0] }, attr: None };
+        let b = Node { val: Val::Reals { len: 2, vals: vec![4.0, 5.0] }, attr: None };
+        let refs: Vec<&Node> = vec![&a, &b];
+        let p = Profile {
+            detail: ColumnDetail::None,
+            columns: Vec::new(),
+            n_missing_total: 0,
+            schema_fp: String::new(),
+            shape_fp: String::new(),
+            content_fp: String::new(),
+            row_sketch: Vec::new(),
+            capped: false,
+        };
+        let mut rec = json!({ "confidence": "exact" });
+        attach_profile(&mut rec, p, &refs);
+
+        assert!(rec.get("columns").is_none(), "the list was given up");
+        assert!(rec.get("summary_over").is_none(), "and the aggregate could not be taken");
+        assert_ne!(s(&rec, "confidence"), "exact", "so the record cannot claim to be exact");
+        assert!(!s(&rec, "notes").is_empty(), "and it has to say what is missing");
+    }
+
+    /// A wide frame with no rows is the one object that gives up its column
+    /// list and needs no aggregate to replace it: there are no values, which
+    /// `nrow` and `n_cells` say between them, and a per-column list would be a
+    /// name and four zeroes for each of however many columns there are. A
+    /// malformed wide file parses to exactly this shape with two and a half
+    /// million of them.
+    #[test]
+    fn a_wide_frame_with_no_rows_says_it_holds_nothing() {
+        let r = by_name("wide_empty");
+        assert_eq!(s(&r, "column_detail"), "none");
+        assert_eq!(r["ncol"], 600);
+        assert_eq!(r["nrow"], 0);
+        assert_eq!(r["n_cells"], 0, "and the count of cells says there are none");
+        assert!(r.get("columns").is_none(), "no list of six hundred vacant columns");
+        assert!(r.get("summary_over").is_none(), "no summary of values that are not there");
+        assert_eq!(s(&r, "confidence"), "exact", "nothing about it is uncertain");
+    }
+
     /// A frame whose columns were never read lists every column and describes
     /// none of them, which is a different list from the one a wide frame of
     /// mixed types carries. Both wearing one label is how a consumer builds a
@@ -6363,6 +6512,18 @@ mod tests {
                         r["ncol"].as_u64().unwrap_or(0) > COLUMN_DETAIL_CAP as u64,
                         "{name} gave up its column list below the cap"
                     );
+                    // The whole of what the depth is for: the list is given up
+                    // in exchange for an aggregate, so a record carrying
+                    // neither says nothing about its values while reading as
+                    // though it had been measured. An object with no cells is
+                    // the one exception, and it is not silence: it has no
+                    // values, and n_cells of zero states that.
+                    let cells = r["n_cells"].as_u64();
+                    assert!(cells.is_some(), "{name} gave up its column list and states no size");
+                    assert!(
+                        cells == Some(0) || r.get("summary_over").is_some(),
+                        "{name} gave up its column list and put nothing in its place"
+                    );
                 }
                 None => {}
             }
@@ -6402,6 +6563,7 @@ mod tests {
             ("the leftover-attribute cap", format!("{ATTRS_OTHER_CAP} entries")),
             ("the row sketch size", format!("bottom-{SKETCH_K}")),
             ("the per-column detail cap", format!("{COLUMN_DETAIL_CAP} columns")),
+            ("the cell cap", format!("{CELL_CAP} cells")),
             (
                 "the column depth vocabulary",
                 "`column_detail` is `full`, `reduced`, `none` or `structural`".to_string(),
