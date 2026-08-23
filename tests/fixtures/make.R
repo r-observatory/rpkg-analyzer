@@ -202,3 +202,351 @@ saveRDS(data.frame(a = 1:4, b = c("w","x","y","z")), file.path(e, "ext_object.rd
 writeLines(c("a\tb", "1\tx", "2\ty"), file.path(e, "ext_tabbed.tsv"))
 writeLines("not something we open", file.path(e, "ext_ignored.xlsx"))
 writeLines(c("k,v", "1,10"), file.path(e, "nested", "ext_nested.csv"))
+
+# --- the save format R used before 1.4.0 -------------------------------------
+# save() cannot write this any more, so the bytes are written out directly. They
+# are hand-built rather than copied from a package, and R loads them, which is
+# what makes this a fixture and not a guess: a data.frame of 3 rows and 2
+# columns with a factor, a numeric vector holding every special value the format
+# can carry, and an integer vector with missing values, which the archive has
+# more than a thousand of.
+#
+# Three things here are deliberate. The closure among the nodes is never
+# referenced, but still has to be consumed exactly, because a file in the
+# archive keeps functions beside its data and misreading one leaves every
+# definition after it at the wrong offset. It is defined out of the order the
+# table lists it in, which is what separates reading the table from counting
+# positions. And three objects share the file, as they do in the archive.
+writeLines(c(
+    "1976",
+    "7 25 32",
+    "0 10 \"names\"",
+    "1 20 \"row.names\"",
+    "2 30 \"class\"",
+    "3 40 \"levels\"",
+    "4 50 \"df\"",
+    "5 60 \"specials\"",
+    "6 70 \"int_na\"",
+    "7 100",
+    "8 110",
+    "9 120",
+    "10 130",
+    "11 140",
+    "12 150",
+    "13 160",
+    "14 170",
+    "15 180",
+    "16 190",
+    "17 200",
+    "18 210",
+    "19 220",
+    "20 230",
+    "21 240",
+    "22 250",
+    "23 260",
+    "24 270",
+    "25 280",
+    "26 290",
+    "27 300",
+    "28 310",
+    "29 320",
+    "30 330",
+    "31 340",
+    "27 3 0 0 -1 -1 -1 -1",
+    "7 2 0 0 -1 110 310 50",
+    "8 19 1 0 120 2",
+    "180 190",
+    "9 2 0 0 -1 150 130 10",
+    "10 2 0 0 -1 160 140 20",
+    "11 2 0 0 -1 170 -1 30",
+    "12 16 0 0 -1 2",
+    "270 280",
+    "13 13 0 0 -1 3",
+    "1 2 3",
+    "14 16 0 0 -1 1",
+    "260",
+    "15 14 0 0 -1 3",
+    " 1.5",
+    " 2.5",
+    " 3.5",
+    "16 13 1 0 220 3",
+    "1 2 1",
+    "17 16 0 0 -1 2",
+    "240 250",
+    "18 16 0 0 -1 1",
+    "290",
+    "19 2 0 0 -1 200 230 40",
+    "20 2 0 0 -1 210 -1 30",
+    "21 9 0 0 -1 1 \"a\"",
+    "22 9 0 0 -1 1 \"b\"",
+    "23 9 0 0 -1 10 \"data.frame\"",
+    "24 9 0 0 -1 1 \"x\"",
+    "25 9 0 0 -1 1 \"y\"",
+    "26 9 0 0 -1 6 \"factor\"",
+    "28 2 0 0 -1 320 330 60",
+    "29 14 0 0 -1 5",
+    " NA",
+    " NaN",
+    " Inf",
+    " -Inf",
+    " 1.5",
+    "30 2 0 0 -1 340 -1 70",
+    "31 13 0 0 -1 4",
+    " NA",
+    " 7",
+    " NA",
+    " 9",
+    "100"
+  ), file.path(d, "v1_ascii_frame.rda"))
+
+# A builtin saved beside real data. Nothing about the builtin is worth
+# recording, but it has to be read exactly, or the frame after it is lost with
+# it the way objects after a compiled function used to be.
+builtin_fn <- sum
+after_builtin <- data.frame(a = 1:4, b = c(2.5, 3.5, 4.5, 5.5))
+save(builtin_fn, after_builtin, file = file.path(d, "mixed_builtin.rda"), version = 3)
+
+# A string carrying an attribute. R reads one and throws it away, noting that
+# older files can have them, so the bytes are written out directly: save()
+# will not produce one. R loads this as c("hello", "world"); leaving the
+# attribute unread takes the second string with it.
+writeBin(as.raw(c(0x52,0x44,0x58,0x32,0x0a,0x58,0x0a,0x00,0x00,0x00,0x02,0x00,0x04,0x04,0x00,0x00,0x02,0x03,0x00,0x00,0x00,0x04,0x02,0x00,0x00,0x00,0x01,0x00,0x00,0x00,0x09,0x00,0x00,0x00,0x01,0x73,0x00,0x00,0x00,0x10,0x00,0x00,0x00,0x02,0x00,0x00,0x02,0x09,0x00,0x00,0x00,0x05,0x68,0x65,0x6c,0x6c,0x6f,0x00,0x00,0x04,0x02,0x00,0x00,0x00,0x01,0x00,0x00,0x00,0x09,0x00,0x00,0x00,0x05,0x62,0x6f,0x67,0x75,0x73,0x00,0x00,0x00,0x10,0x00,0x00,0x00,0x01,0x00,0x00,0x00,0x09,0x00,0x00,0x00,0x01,0x78,0x00,0x00,0x00,0xfe,0x00,0x00,0x00,0x09,0x00,0x00,0x00,0x05,0x77,0x6f,0x72,0x6c,0x64,0x00,0x00,0x00,0xfe)), file.path(d, "string_with_attribute.rda"))
+
+# The same text stored two ways. R records a string's encoding beside it, and
+# latin1 is not UTF-8: reading one as the other replaces every accented
+# character with a marker, so the text is wrong and the fingerprint taken over
+# it no longer matches the same text stored as UTF-8.
+enc_latin <- c("caf\xe9", "na\xefve")
+Encoding(enc_latin) <- "latin1"
+latin_txt <- data.frame(txt = enc_latin, n = 1:2, stringsAsFactors = FALSE)
+utf8_txt  <- data.frame(txt = enc2utf8(enc_latin), n = 1:2, stringsAsFactors = FALSE)
+save(latin_txt, file = file.path(d, "latin_txt.rda"), version = 3)
+save(utf8_txt,  file = file.path(d, "utf8_txt.rda"),  version = 3)
+
+# One dataset name carried by two files. data() loads whichever comes first in
+# its own order, which is the saved image, and never opens the csv, so only the
+# image is a dataset a reader can reach.
+one_per_name <- data.frame(from_rda = 1:3, second = c(4, 5, 6))
+save(one_per_name, file = file.path(d, "one_per_name.rda"), version = 2)
+writeLines(c("from_csv;x;y;z", "1;2;3;4"), file.path(d, "one_per_name.csv"))
+
+# --- help pages --------------------------------------------------------------
+# A catalogue that lists names and says nothing about any of them is a poor
+# catalogue, and the package has already written the sentence. The alias names
+# what the page documents, which is how a title reaches the dataset it belongs
+# to, and the title carries markup that has to come off.
+man <- file.path(dirname(d), "man")
+dir.create(man, recursive = TRUE, showWarnings = FALSE)
+writeLines(c(
+  "\\name{altrep_frame}",
+  "\\docType{data}",
+  "\\alias{altrep_frame}",
+  "\\alias{plain_frame}",
+  "\\title{Readings from the \\code{example} instrument}",
+  "\\description{Two columns of nothing in particular.}",
+  "\\keyword{datasets}"
+), file.path(man, "altrep_frame.Rd"))
+
+# A file written on a Mac before OS X separates its lines with a carriage
+# return and nothing else. Most readers do not treat that as a line break, so
+# the whole file arrives as one line and a table is reported as having no rows.
+# It is still in the archive, in packages last touched in 2010.
+cat("a;b", "1;2", "3;4", "5;6", sep = "\r", file = file.path(d, "cr_endings.csv"))
+
+# A comma-separated file where data() reads semicolons. It really does load as
+# one column named after the whole header line, so that is what is reported;
+# what the file plainly is gets recorded beside it.
+writeLines(c("alpha,beta,gamma", "1,2,3", "4,5,6"), file.path(d, "comma_in_csv.csv"))
+
+# --- what a bare vector holds ------------------------------------------------
+# A length on its own does not distinguish a column of numbers from a column of
+# names, and raw and complex vectors were reported as objects of length zero
+# because their bytes are read for size rather than kept.
+sv(c(1.5, 2.5, NA, 4.5, 100.25), "vec_numeric")
+sv(c("alpha", "beta", "alpha", NA), "vec_character")
+sv(as.raw(c(1, 2, 255)), "vec_raw")
+sv(c(1+2i, 3-4i), "vec_complex")
+sv(factor(c("a", "b", "a", "c")), "vec_factor")
+sv(as.raw(c(1, 2, 255)), "vec_raw_same")   # byte-identical to vec_raw
+sv(as.raw(c(1, 2, 254)), "vec_raw_diff")   # one byte apart from vec_raw
+
+# --- what summary() would say ------------------------------------------------
+# A range says where the values stop, not where they sit. These are the numbers
+# summary() gives for each kind of column, checked against it.
+sv(data.frame(
+  num = c(1.5, 2.5, NA, 4.5, 100.25),
+  int = c(1L, 5L, 3L, NA, 9L),
+  lgl = c(TRUE, FALSE, NA, TRUE, TRUE),
+  chr = c("a", "bb", "", NA, "ccc"),
+  fac = factor(c("a", "b", "a", "c", "b")),
+  dat = as.Date(c("2020-01-01", "2021-06-15", "2019-03-02", NA, "2020-07-04")),
+  stringsAsFactors = FALSE
+), "summary_kinds")
+
+# A geometry with a height, so the dimension is not the usual XY, and an xts
+# whose index class is kept under a name of its own.
+if (requireNamespace("sf", quietly = TRUE)) {
+  sv(sf::st_sf(id = 1:2,
+               geometry = sf::st_sfc(sf::st_point(c(1, 2, 3)),
+                                     sf::st_point(c(4, 5, 6)), crs = 4326)), "sf_three_d")
+}
+if (requireNamespace("xts", quietly = TRUE)) {
+  sv(xts::xts(matrix(c(1.5, 2.5, 3.5, 4.5), ncol = 2),
+              as.POSIXct(c("2020-01-01 00:00", "2020-01-02 06:00"), tz = "UTC")), "xts_series")
+}
+
+# A logical sparse matrix counts rather than averages, and a column holding an
+# infinity has a maximum JSON cannot write, which reads the same as not having
+# one unless the infinities are counted.
+if (requireNamespace("Matrix", quietly = TRUE)) {
+  sv(as(Matrix::sparseMatrix(i = c(1, 3, 5), j = c(2, 4, 6), x = c(1, 2, 3),
+                             dims = c(8, 8)) > 0, "lMatrix"), "spm_lgc")
+}
+sv(data.frame(v = c(as.numeric(1:99), Inf), w = as.numeric(1:100)), "with_infinity")
+
+# A raster with everything a reader needs to judge the figures above: the cell
+# size, whether the cells are here or behind a file handle, the sentinel that
+# stands in for nothing, and the range of each named layer.
+if (requireNamespace("raster", quietly = TRUE)) {
+  rr <- raster::raster(nrows = 10, ncols = 20, xmn = 0, xmx = 10, ymn = 0, ymx = 5,
+                       crs = "EPSG:4326")
+  rr[] <- seq_len(200)
+  bb <- raster::brick(rr, rr * 2)
+  names(bb) <- c("elev", "depth")
+  raster::NAvalue(bb) <- -9999
+  sv(bb, "raster_named_brick")
+}
+# A dense grid that is almost all zeros. It has the shape of sparse data
+# without the class that announces it.
+sv(local({ m <- matrix(0, nrow = 10, ncol = 10); m[1:5] <- 1:5; m }), "mostly_zero")
+
+# A tibble, a data.table and a plain frame all inherit from data.frame, and the
+# difference lives in the inheritance chain where anything matching on the class
+# gets it wrong: an exact match counts no tibbles, a substring match counts
+# everything. That mistake has already undercounted the archive once.
+flav_plain <- data.frame(a = 1:3, b = c("x", "y", "z"), stringsAsFactors = FALSE)
+sv(flav_plain, "flav_plain")
+if (requireNamespace("tibble", quietly = TRUE)) {
+  sv(tibble::as_tibble(flav_plain), "flav_tibble")
+  sv(structure(flav_plain, class = c("grouped_df", "tbl_df", "tbl", "data.frame")),
+     "flav_grouped")
+}
+if (requireNamespace("data.table", quietly = TRUE)) {
+  sv(data.table::as.data.table(flav_plain), "flav_data_table")
+}
+
+# --- what a dataset says about itself beyond its shape -----------------------
+# A list was a black box, and inside a frame it was worse: a nested tibble
+# reports its group count as its row count, so a table of two thousand
+# observations was catalogued as twenty rows.
+sv(list(train = data.frame(x = 1:10, y = 1:10), test = data.frame(x = 1:5, y = 1:5)),
+   "list_of_frames")
+sv(list(a = 1:5, b = letters[1:5], c = as.numeric(1:5)), "list_parallel")
+sv(list(l1 = list(l2 = list(l3 = list(l4 = 1:3)))), "list_deep")
+if (requireNamespace("tidyr", quietly = TRUE) && requireNamespace("tibble", quietly = TRUE)) {
+  nested <- tidyr::nest(tibble::tibble(g = rep(c("a", "b", "c"), times = c(1, 4, 10)),
+                                       v = 1:15, w = as.numeric(1:15)), data = c(v, w))
+  sv(nested, "nested_tibble")
+}
+# Things written down beside the values: the order a factor declares, the zone
+# a moment is in, and what a number is a number of.
+sv(factor(c("lo", "hi", "mid"), levels = c("lo", "mid", "hi"), ordered = TRUE), "ord_factor")
+sv(as.POSIXct(c("2020-01-01", "2020-06-01"), tz = "America/Chicago"), "tz_stamps")
+if (requireNamespace("units", quietly = TRUE)) {
+  sv(units::set_units(c(1.5, 2.5, 3.5), "m/s"), "unit_speeds")
+}
+# A table of counts is unreadable without its margin labels.
+sv(table(treat = c("A", "A", "B"), outcome = c("hit", "miss", "hit")), "labelled_table")
+if (requireNamespace("data.table", quietly = TRUE)) {
+  kdt <- data.table::data.table(a = 1:6, b = 6:1, v = as.numeric(1:6))
+  data.table::setkey(kdt, a); data.table::setindex(kdt, b)
+  sv(kdt, "keyed_dt")
+}
+if (requireNamespace("dplyr", quietly = TRUE)) {
+  sv(dplyr::group_by(tibble::tibble(g = c("x", "x", "y"), v = 1:3), g), "grouped_tbl")
+}
+
+# Spread, order and where the gaps fall. A series that starts late is a
+# different thing from one that is patchy throughout, and both had the same
+# description: a count of missing values.
+sv(data.frame(
+  spread  = c(2, 4, 4, 4, 5, 5, 7, 9),
+  rising  = 1:8,
+  falling = 8:1,
+  wholes  = as.numeric(1:8),
+  late    = c(NA, NA, NA, 1, 2, 3, 4, 5),
+  patchy  = c(1, NA, 3, NA, 5, NA, 7, NA)
+), "stats_kinds")
+
+# How far apart the observations are, and whether they are evenly so. A daily
+# series with a fortnight missing and one observed daily throughout have the
+# same start, end and count.
+if (requireNamespace("zoo", quietly = TRUE)) {
+  sv(zoo::zoo(1:10, as.Date("2020-01-01") + 0:9), "z_regular")
+  sv(zoo::zoo(1:6, as.Date("2020-01-01") + c(0, 1, 2, 16, 17, 18)), "z_gappy")
+}
+# A symmetric matrix keeps one triangle, so its stored count is roughly half
+# its non-zeros: every off-diagonal entry stands for two.
+if (requireNamespace("Matrix", quietly = TRUE)) {
+  sv(Matrix::sparseMatrix(i = c(1, 2, 3, 3), j = c(1, 1, 1, 3), x = c(5, 1, 2, 7),
+                          dims = c(4, 4), symmetric = TRUE), "sym_sparse")
+}
+
+# The shape of a distribution, which a range and a middle do not give: a long
+# right tail with one value far out, and a column of codes where the commonest
+# value is most of the column.
+sv(data.frame(
+  # 8 sits outside the usual fences but inside a wider one, so the width of
+  # the fence is testable rather than merely the presence of an extreme.
+  skewed = as.numeric(c(rep(1, 40), rep(2, 30), rep(3, 28), 8, 50)),
+  codes  = as.numeric(c(rep(1, 60), rep(2, 30), rep(3, 10)))
+), "shape_kinds")
+
+# Tables do not always sit directly in the slots. Cross-validation folds keep
+# theirs a level down, and counting only direct slots reported a dataset of
+# forty-three rows as holding none.
+sv(list(fold1 = list(train = data.frame(x = 1:10), test = data.frame(x = 1:5)),
+        fold2 = list(train = data.frame(x = 1:20), test = data.frame(x = 1:8))),
+   "nested_folds")
+# Slots holding nothing: a NULL and an empty vector count towards the length
+# and are not there.
+sv(list(a = NULL, b = NA, c = 1:3, d = character(0)), "holey_list")
+# A list with no names at all, and one whose slots are S4 objects that state
+# their size in a slot rather than by their length.
+sv(list(1:3, letters[1:2], as.numeric(1:4)), "unnamed_list")
+if (requireNamespace("Matrix", quietly = TRUE)) {
+  sv(list(m1 = Matrix::Diagonal(3), m2 = Matrix::Diagonal(4)), "list_of_s4")
+}
+
+# Where the variation lies. rows_vary has a level per row and near-identical
+# columns; cols_vary is its transpose, so the two summaries have to swap. A
+# summary over every cell as one vector is identical for both, which is the
+# point: it cannot tell them apart.
+rv <- matrix(rep(c(1, 50, 100), each = 4), nrow = 3, byrow = TRUE) +
+      matrix(rep(c(0.1, -0.1, 0.2, -0.2), 3), nrow = 3, byrow = TRUE)
+sv(rv, "rows_vary")
+sv(t(rv), "cols_vary")
+# A margin mean has to skip the missing values rather than be poisoned by one.
+sv(matrix(c(1, NA, 3, 4, 5, 6, NA, 8, 9, 10, 11, 12), nrow = 3), "margin_na")
+# One row is not a margin worth summarising.
+sv(matrix(1:4, nrow = 1), "margin_thin")
+# Folds of deliberately different sizes, so a per-element count cannot be
+# recovered from the total and the element count.
+sv(list(fold1 = list(data.frame(x = 1:50)),
+        fold2 = list(data.frame(x = 1:150)),
+        fold3 = list(data.frame(x = 1:7))), "uneven_folds")
+
+# A summary must not contradict its own bounds. Rounding to six decimal places
+# turned every statistic here into zero while the minimum and maximum, which
+# are not rounded, stayed where they were.
+sv(data.frame(pico = c(1e-12, 2e-12, 3e-12), nano = c(4e-9, 5e-9, 6e-9)), "tiny_values")
+
+# NA and NaN are both is.na() and are not the same finding: one is a value
+# nobody recorded, the other is one a calculation could not produce. R tells
+# them apart by the payload it puts in NA_real_, and so must anything reading
+# the bytes. Infinities counted by sign rather than flagged at each end.
+sv(data.frame(
+  mixed    = c(NA, NA, NaN, 0/0, 0/0, 1, 2, 3, 4, Inf, Inf, -Inf),
+  just_na  = c(1, NA, 3, NA, 5, NA, 7, 8, 9, 10, 11, 12),
+  just_nan = c(1, NaN, 3, NaN, 5, 6, 7, 8, 9, 10, 11, 12),
+  runs     = c(NA, NA, NA, 4, 5, 6, 7, 8, 9, NA, NA, NA)), "na_and_nan")
