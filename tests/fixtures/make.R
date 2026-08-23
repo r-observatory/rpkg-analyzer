@@ -581,3 +581,9 @@ attr(wide_sf$geom, "class") <- c("sfc_POINT", "sfc")
 attr(wide_sf$geom, "crs") <- structure(list(input = "EPSG:4326", wkt = "GEOGCRS[\"WGS 84\"]"), class = "crs")
 attr(wide_sf$geom, "bbox") <- structure(c(xmin = 1, ymin = 2, xmax = 11, ymax = 12), class = "bbox")
 sv(wide_sf, "wide_sf")
+# Longer than the reader will hold. Every column is past the cell cap, so no
+# value is read at all and the record can list the columns without describing
+# any of them, which is a different shape of list from the one a wide frame
+# gets. Nine million rows cost a few hundred bytes here because R stores 1:n as
+# a compact sequence and writes the state rather than the numbers.
+sv(data.frame(a = 1:9000000L, b = 1:9000000L, c = 1:9000000L), "unread_columns")

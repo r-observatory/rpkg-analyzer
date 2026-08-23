@@ -103,6 +103,14 @@ enum ColumnDetail {
     /// wearing a data.frame coat, and profiling it column by column writes
     /// "numeric" nineteen thousand times over.
     None,
+    /// Every column, carrying what can be known without reading a value: its
+    /// name, its declared type, whether it is a factor and how many levels it
+    /// declares. This is not a depth width chooses. It is what a frame past the
+    /// cell cap gets, where no value was read at all, and it is a different
+    /// list from `Reduced`: no count of anything is in it, because no cell was
+    /// looked at. The two used to share the `reduced` label, which told a
+    /// consumer to expect four statistics from a list that had none of them.
+    Structural,
 }
 
 impl ColumnDetail {
@@ -111,6 +119,7 @@ impl ColumnDetail {
             ColumnDetail::Full => "full",
             ColumnDetail::Reduced => "reduced",
             ColumnDetail::None => "none",
+            ColumnDetail::Structural => "structural",
         }
     }
 }
@@ -2540,7 +2549,12 @@ fn profile_columns(cols: &[&Node], names: &[String]) -> Option<Profile> {
             // The fields that say which column this is and how much of it there
             // is, picked off the full object rather than rebuilt, so the two
             // depths cannot drift into spelling a field differently.
-            ColumnDetail::Reduced => {
+            //
+            // Structural depth is not reached from here: it names a list built
+            // where no value was read, and this loop is the value pass. It
+            // shares the arm so that a future depth cannot silently drop a
+            // column list by falling through to the empty one.
+            ColumnDetail::Reduced | ColumnDetail::Structural => {
                 let mut short = json!({});
                 for k in ["name", "type", "n_missing", "n_unique"] {
                     if let Some(v) = o.get(k) {
@@ -3260,10 +3274,13 @@ fn describe(
                     })
                     .collect();
                 rec["columns"] = json!(cols);
-                // Every column is listed and none of them is described, which
-                // is what reduced depth means. Why the statistics are absent is
-                // a separate matter, and notes below says it.
-                rec["column_detail"] = json!(ColumnDetail::Reduced.name());
+                // Every column is listed and none of them is described. That is
+                // its own depth and not the reduced one: reduced keeps four
+                // statistics per column, and there are none to keep here
+                // because no cell was read. Labelling both `reduced` told a
+                // consumer to expect a count of missing values from a list that
+                // has never held one.
+                rec["column_detail"] = json!(ColumnDetail::Structural.name());
                 rec["confidence"] = json!("degraded");
                 rec["notes"] = json!("value scan skipped (size cap)");
             }
@@ -5447,10 +5464,11 @@ mod tests {
                 continue;
             }
             // A wide frame of mixed types keeps every column and gives up the
-            // statistics rather than the other way round. That is a declared
-            // omission, written on the record as column_detail, which is the
+            // statistics rather than the other way round, and a frame past the
+            // cell cap never read a value to describe. Both are declared
+            // omissions, written on the record as column_detail, which is the
             // one thing this test exists to catch the absence of.
-            if s(&r, "column_detail") == "reduced" {
+            if matches!(s(&r, "column_detail").as_str(), "reduced" | "structural") {
                 continue;
             }
             let has_own = r.get("mean").is_some()
@@ -6022,7 +6040,7 @@ mod tests {
     #[test]
     fn every_fixture_is_readable() {
         let recs = records();
-        assert_eq!(recs.len(), 123, "one record per saved object");
+        assert_eq!(recs.len(), 124, "one record per saved object");
         // Not everything saved under data/ is data. These carry behaviour rather
         // than observations, so there is nothing to fingerprint; what they must
         // still do is read cleanly, because a file that fails mid-object takes
@@ -6035,11 +6053,19 @@ mod tests {
         ];
         // Deliberately broken: R refuses it, so we must too.
         let unloadable = ["ws_ragged"];
+        // Deliberately too long to hold. The structure reads, no value does, and
+        // the record says exactly that, so there is nothing to fingerprint.
+        let unread = ["unread_columns"];
         for r in &recs {
             let name = s(r, "name");
             let notes = s(r, "notes");
             if unloadable.contains(&name.as_str()) {
                 assert_eq!(s(r, "confidence"), "degraded", "{name} should not load");
+                continue;
+            }
+            if unread.contains(&name.as_str()) {
+                assert_eq!(s(r, "confidence"), "degraded", "{name} read no value");
+                assert_eq!(notes, "value scan skipped (size cap)");
                 continue;
             }
             assert!(
@@ -6277,6 +6303,31 @@ mod tests {
         );
     }
 
+    /// A frame whose columns were never read lists every column and describes
+    /// none of them, which is a different list from the one a wide frame of
+    /// mixed types carries. Both wearing one label is how a consumer builds a
+    /// column specification around fields that are never there.
+    #[test]
+    fn a_frame_read_without_its_values_says_so_at_its_own_depth() {
+        let r = by_name("unread_columns");
+        assert_eq!(s(&r, "column_detail"), "structural");
+        assert_eq!(s(&r, "confidence"), "degraded");
+        assert_eq!(s(&r, "notes"), "value scan skipped (size cap)");
+        assert_eq!(r["nrow"], 9_000_000i64, "the width is not what put it here");
+        assert_eq!(r["ncol"], 3);
+        let cols = r["columns"].as_array().expect("every column is still listed");
+        assert_eq!(cols.len(), 3);
+        for c in cols {
+            for k in ["name", "type", "is_factor"] {
+                assert!(c.get(k).is_some(), "{} has no {k}", c["name"]);
+            }
+            for k in ["n_missing", "n_unique"] {
+                assert!(c.get(k).is_none(), "{} claims {k} with no value read", c["name"]);
+            }
+        }
+        assert!(r.get("content_fp").is_none(), "no value was read, so nothing is fingerprinted");
+    }
+
     /// One type is not on its own a reason to give up per-column detail. A
     /// narrow all-numeric frame is exactly the case where the per-column means
     /// and ranges are the description.
@@ -6303,7 +6354,7 @@ mod tests {
             let tier = s(&r, "column_detail");
             match r.get("columns") {
                 Some(_) => assert!(
-                    tier == "full" || tier == "reduced",
+                    tier == "full" || tier == "reduced" || tier == "structural",
                     "{name} carries a column list and calls its depth {tier:?}"
                 ),
                 None if !tier.is_empty() => {
@@ -6353,7 +6404,7 @@ mod tests {
             ("the per-column detail cap", format!("{COLUMN_DETAIL_CAP} columns")),
             (
                 "the column depth vocabulary",
-                "`column_detail` is `full`, `reduced` or `none`".to_string(),
+                "`column_detail` is `full`, `reduced`, `none` or `structural`".to_string(),
             ),
         ] {
             assert!(
