@@ -165,9 +165,17 @@ enum Val {
     Ints { len: usize, vals: Vec<i32>, logical: bool },
     Reals { len: usize, vals: Vec<f64> },
     /// Values whose bytes are not kept: complex and raw, which are read for
-    /// their length rather than their contents, and a generated sequence too
-    /// long to hold. `of` is what they are, which is otherwise lost.
-    Blob { len: usize, of: &'static str, digest: u64 },
+    /// their length rather than their contents, a vector past the cell cap,
+    /// and a generated sequence too long to hold. `of` is what they are, which
+    /// is otherwise lost.
+    ///
+    /// `digest` is the hash the reader took of the bytes on the way past, and
+    /// it is what stands in for the values that are gone: without it two
+    /// unlike objects are indistinguishable and the store holds one of them.
+    /// A generated sequence has none, because there were no bytes to hash and
+    /// a hash of the length alone would make two different sequences of the
+    /// same length one dataset.
+    Blob { len: usize, of: &'static str, digest: Option<u64> },
     Vec(Vec<Node>),
     List { tag: Box<Node>, car: Box<Node>, cdr: Box<Node> },
     S4,
@@ -387,16 +395,21 @@ impl<'a> Reader<'a> {
             }
             LGLSXP | INTSXP => {
                 let n = self.vlen()?;
-                let vals = if n <= CELL_CAP {
-                    let mut s = Vec::with_capacity(n);
-                    for _ in 0..n {
-                        s.push(self.i32()?);
-                    }
-                    s
-                } else {
+                // Past the cap the values are hashed and gone, the way complex
+                // and raw already are. Skipping them without hashing left the
+                // object with nothing to be known by, and a record with no
+                // fingerprint is dropped rather than stored.
+                if n > CELL_CAP {
+                    let digest = self.digest_span(4 * n)?;
                     self.skip(4 * n)?;
-                    Vec::new()
-                };
+                    let attr = self.maybe_attr(ha)?;
+                    let of = if t == LGLSXP { "logical" } else { "integer" };
+                    return Ok(Node { val: Val::Blob { len: n, of, digest: Some(digest) }, attr });
+                }
+                let mut vals = Vec::with_capacity(n);
+                for _ in 0..n {
+                    vals.push(self.i32()?);
+                }
                 let attr = self.maybe_attr(ha)?;
                 Ok(Node {
                     val: Val::Ints { len: n, vals, logical: t == LGLSXP },
@@ -405,16 +418,19 @@ impl<'a> Reader<'a> {
             }
             REALSXP => {
                 let n = self.vlen()?;
-                let vals = if n <= CELL_CAP {
-                    let mut s = Vec::with_capacity(n);
-                    for _ in 0..n {
-                        s.push(self.f64()?);
-                    }
-                    s
-                } else {
+                if n > CELL_CAP {
+                    let digest = self.digest_span(8 * n)?;
                     self.skip(8 * n)?;
-                    Vec::new()
-                };
+                    let attr = self.maybe_attr(ha)?;
+                    return Ok(Node {
+                        val: Val::Blob { len: n, of: "numeric", digest: Some(digest) },
+                        attr,
+                    });
+                }
+                let mut vals = Vec::with_capacity(n);
+                for _ in 0..n {
+                    vals.push(self.f64()?);
+                }
                 let attr = self.maybe_attr(ha)?;
                 Ok(Node { val: Val::Reals { len: n, vals }, attr })
             }
@@ -423,14 +439,14 @@ impl<'a> Reader<'a> {
                 let digest = self.digest_span(16 * n)?;
                 self.skip(16 * n)?;
                 let attr = self.maybe_attr(ha)?;
-                Ok(Node { val: Val::Blob { len: n, of: "complex", digest }, attr })
+                Ok(Node { val: Val::Blob { len: n, of: "complex", digest: Some(digest) }, attr })
             }
             RAWSXP => {
                 let n = self.vlen()?;
                 let digest = self.digest_span(n)?;
                 self.skip(n)?;
                 let attr = self.maybe_attr(ha)?;
-                Ok(Node { val: Val::Blob { len: n, of: "raw", digest }, attr })
+                Ok(Node { val: Val::Blob { len: n, of: "raw", digest: Some(digest) }, attr })
             }
             VECSXP | EXPRSXP => {
                 let n = self.vlen()?;
@@ -980,7 +996,14 @@ fn expand_seq(state: &Node, want_int: bool) -> Option<Val> {
     let n = if p[0].is_finite() && p[0] >= 0.0 { p[0] as usize } else { return None };
     let (start, step) = (p[1], p[2]);
     if n > CELL_CAP {
-        return Some(Val::Blob { len: n, of: if want_int { "integer" } else { "numeric" }, digest: 0 });
+        // No digest: nothing was read to hash. The values are generated from
+        // three numbers, and a hash of the length alone would make two
+        // different sequences of the same length one dataset.
+        return Some(Val::Blob {
+            len: n,
+            of: if want_int { "integer" } else { "numeric" },
+            digest: None,
+        });
     }
     if want_int {
         let vals = (0..n)
@@ -1087,7 +1110,10 @@ fn push_cell(buf: &mut Vec<u8>, col: &Node, i: usize, levels: Option<&[Option<St
         Val::Blob { len, digest, .. } => {
             buf.push(1);
             buf.extend_from_slice(&(*len as u64).to_be_bytes());
-            buf.extend_from_slice(&digest.to_be_bytes());
+            // A blob with no digest is never profiled: the value pass refuses
+            // it before this is reached, because a cell of it would stand for
+            // bytes nobody read.
+            buf.extend_from_slice(&digest.unwrap_or(0).to_be_bytes());
             let _ = i;
             // Present, not missing. The bytes of a complex or raw value are
             // not kept, which is a limit on what can be said about it and not
@@ -1226,7 +1252,9 @@ fn digest_node(n: &Node, depth: u32) -> u64 {
             }
             acc
         }
-        Val::Blob { len, digest, .. } => fnv(&[(*len as u64).to_be_bytes(), digest.to_be_bytes()].concat()),
+        Val::Blob { len, digest, .. } => {
+            fnv(&[(*len as u64).to_be_bytes(), digest.unwrap_or(0).to_be_bytes()].concat())
+        }
         Val::Vec(items) => {
             let mut acc = fnv(b"vec");
             for it in items {
@@ -1591,6 +1619,54 @@ fn whole_object_summary(rec: &mut Value, cols: &[&Node]) -> bool {
     lift_value_summary(rec, &flat, "cells");
     margin_summaries(&flat, nrow, cols.len(), rec);
     true
+}
+
+/// What an object whose values were never read can still be known by.
+///
+/// Nothing in it can be counted, but its bytes went past the reader and were
+/// hashed on the way, so it can be told from something else. Without this such
+/// a record carried no fingerprint at all and a consumer keyed on `content_fp`
+/// dropped it: an object too big to describe became an object that was never
+/// there. In the published corpus that is 34 objects, one of them a 149 million
+/// cell matrix.
+///
+/// The three keys are built the way the value pass builds them, off the same
+/// cell bytes, so the two recipes cannot drift apart. `row_sketch` has no
+/// counterpart here, because no row was assembled to hash.
+///
+/// All or nothing. One value the reader could not hash, a generated sequence
+/// for instance, leaves the whole object without an identity rather than with
+/// one taken over the part of it that happened to have bytes.
+fn skipped_fingerprints(cols: &[&Node], names: &[String]) -> Option<(String, String, String)> {
+    if cols.is_empty() {
+        return None;
+    }
+    let mut col_fp_bytes: Vec<u8> = Vec::new();
+    let mut schema_src = String::new();
+    let mut shape_src = String::new();
+    for (j, col) in cols.iter().enumerate() {
+        if !matches!(col.val, Val::Blob { digest: Some(_), .. }) {
+            return None;
+        }
+        let (ty, is_factor, _) = base_type(col);
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(ty.as_bytes());
+        let mut buf = Vec::new();
+        push_cell(&mut buf, col, 0, None);
+        hasher.update(&buf);
+        col_fp_bytes.extend_from_slice(hex128(&hasher.finalize()).as_bytes());
+        col_fp_bytes.push(b'|');
+
+        let name = names.get(j).cloned().unwrap_or_default();
+        let btype = if is_factor { "factor" } else { ty };
+        schema_src.push_str(&format!("{name}:{btype}|"));
+        shape_src.push_str(&format!("{btype}|"));
+    }
+    Some((
+        hex128(&blake3::hash(&col_fp_bytes)),
+        hex128(&blake3::hash(schema_src.as_bytes())),
+        hex128(&blake3::hash(shape_src.as_bytes())),
+    ))
 }
 
 /// Hang a profile on a record at the depth it was taken at.
@@ -2008,8 +2084,11 @@ fn describe_list(items: &[Node], names: &[String], out: &mut Value) {
     let mut elem_names: Vec<String> = Vec::new();
     if all.len() == all_names.len() {
         for (nd, nm) in all.iter().zip(&all_names) {
-            let readable = matches!(nd.val, Val::Ints { .. } | Val::Reals { .. } | Val::Str(_) | Val::Vec(_))
-                || matches!(nd.val, Val::Blob { of, .. } if of == "raw" || of == "complex");
+            let readable = !values_dropped(nd)
+                && matches!(
+                    nd.val,
+                    Val::Ints { .. } | Val::Reals { .. } | Val::Str(_) | Val::Vec(_) | Val::Blob { .. }
+                );
             if readable {
                 refs.push(nd);
                 elem_names.push(nm.clone());
@@ -2132,24 +2211,21 @@ fn round_stat(v: f64) -> f64 {
     (v * scale).round() / scale
 }
 
-/// Whether a vector's length was read and its values were not.
+/// Whether a value's length was read and its values were not.
 ///
-/// Past `CELL_CAP` the reader keeps the length and skips over the values, and
-/// the node it leaves behind is still an `Ints` or a `Reals`. Nothing else
-/// makes those two disagree, so a `vals` shorter than `len` means exactly one
-/// thing and means it wherever it is asked.
+/// The reader leaves a `Blob` wherever that happened: past `CELL_CAP`, where
+/// the bytes went by and were hashed on the way, and for a generated sequence
+/// too long to expand, where there were no bytes at all. Complex and raw are
+/// not this. Their elements are never kept either, but that is the reader's
+/// settled treatment of those two types rather than something it gave up on,
+/// and a column of one is profiled from the digest.
 ///
-/// It has to be asked. Reading `vals` on such a node yields an empty slice
-/// rather than a refusal, so a count over it comes back zero and looks like a
-/// measurement: no missing values in a column that has them, one distinct value
-/// in nine million, and a fingerprint taken over nothing, which is the same
-/// fingerprint for every object the cap ever touched.
+/// It has to be asked. Such a value has a length and no cells, so every count
+/// taken over it comes back zero and reads as a measurement: no missing values
+/// in a column that has them, one distinct value in nine million, and a
+/// fingerprint over nothing.
 fn values_dropped(node: &Node) -> bool {
-    match &node.val {
-        Val::Ints { len, vals, .. } => vals.len() < *len,
-        Val::Reals { len, vals } => vals.len() < *len,
-        _ => false,
-    }
+    matches!(&node.val, Val::Blob { of, .. } if !matches!(*of, "complex" | "raw"))
 }
 
 fn profile_columns(cols: &[&Node], names: &[String]) -> Option<Profile> {
@@ -2165,17 +2241,13 @@ fn profile_columns(cols: &[&Node], names: &[String]) -> Option<Profile> {
     // column has no values to read at all. Only the second can defeat a profile.
     // A complex or raw value is the third case: its elements were not kept,
     // but the whole of it was hashed on the way past, so it can be identified
-    // even though it cannot be summarised. A generated sequence too long to
-    // hold cannot: nothing was hashed, and a fingerprint over its length alone
-    // would make two different sequences of the same length one dataset.
-    // A fourth case, and the quietest of them: a vector past the cell cap keeps
-    // its type and loses its values, so it arrives here as an ordinary `Reals`
-    // over an empty slice. Every count then came out zero and every one of them
-    // was written down.
+    // even though it cannot be summarised.
     let any_unread = cols.iter().any(|c| {
         values_dropped(c)
-            || (!matches!(c.val, Val::Ints { .. } | Val::Reals { .. } | Val::Str(_) | Val::Vec(_))
-                && !matches!(c.val, Val::Blob { of, .. } if of == "raw" || of == "complex"))
+            || !matches!(
+                c.val,
+                Val::Ints { .. } | Val::Reals { .. } | Val::Str(_) | Val::Vec(_) | Val::Blob { .. }
+            )
     });
     if any_unread {
         return None;
@@ -3389,6 +3461,15 @@ fn describe(
                 rec["column_detail"] = json!(ColumnDetail::Structural.name());
                 rec["confidence"] = json!("degraded");
                 rec["notes"] = json!("value scan skipped (size cap)");
+                // Described by nothing is not the same as being nothing. What
+                // the reader hashed on its way past the columns is enough to
+                // tell this frame from another, and a record with no
+                // fingerprint is dropped rather than stored.
+                if let Some((content, schema, shape)) = skipped_fingerprints(&els, &names) {
+                    rec["content_fp"] = json!(content);
+                    rec["schema_fp"] = json!(schema);
+                    rec["shape_fp"] = json!(shape);
+                }
             }
         }
         describe_attrs(&pairs, &mut rec, &[]);
@@ -3478,6 +3559,13 @@ fn describe(
                         // has no reason to expect on every matrix.
                         rec["confidence"] = json!("degraded");
                         rec["notes"] = json!("value scan skipped (size cap)");
+                        if let Some((content, schema, shape)) =
+                            skipped_fingerprints(&refs, &names)
+                        {
+                            rec["content_fp"] = json!(content);
+                            rec["schema_fp"] = json!(schema);
+                            rec["shape_fp"] = json!(shape);
+                        }
                     }
                 }
             }
@@ -3613,9 +3701,17 @@ fn describe(
             rec["content_fp"] = json!(p.content_fp);
         } else if values_dropped(node) {
             // Same as the grid: a length and a type were read and nothing else
-            // was.
+            // was, and the hash the reader took on the way past is what the
+            // vector is known by. A vector carries no schema of its own, so it
+            // gets the one key it gets when its values are there.
             rec["confidence"] = json!("degraded");
             rec["notes"] = json!("value scan skipped (size cap)");
+            let flat = [node];
+            if let Some((content, _, _)) =
+                skipped_fingerprints(&flat, std::slice::from_ref(&name.to_string()))
+            {
+                rec["content_fp"] = json!(content);
+            }
         }
     }
     rec
@@ -6562,10 +6658,18 @@ mod tests {
         Node { val: Val::Ints { len: v.len(), vals: v.to_vec(), logical: false }, attr: None }
     }
     /// A column of `len` doubles the reader declined to hold, which is what the
-    /// value pass leaves behind past the cell cap: the length is known and not
-    /// one cell of it is.
+    /// value pass leaves behind past the cell cap: the length is known, not one
+    /// cell of it is, and the digest is what it took of the bytes on the way
+    /// past.
     fn dropped_reals(len: usize) -> Node {
-        Node { val: Val::Reals { len, vals: Vec::new() }, attr: None }
+        let digest = fnv(&(len as u64).to_be_bytes());
+        Node { val: Val::Blob { len, of: "numeric", digest: Some(digest) }, attr: None }
+    }
+    /// The same thing with a shape on it: a grid the reader went past.
+    fn dropped_grid(nr: usize, nc: usize) -> Node {
+        let mut g = dropped_reals(nr * nc);
+        g.attr = attrs(&[("dim", ints(&[nr as i32, nc as i32]))]);
+        g
     }
     fn describe_here(name: &str, node: &Node) -> Value {
         describe(name, "data/x.rda", node, "rda", 3, "none", false, 0)
@@ -6605,9 +6709,86 @@ mod tests {
         }
         assert!(r.get("n_missing_total").is_none(), "nothing was counted as missing");
         assert!(
-            r.get("content_fp").is_none(),
-            "and nothing was read to identify it by, so two unlike objects cannot share one"
+            r.get("row_sketch").is_none(),
+            "and no row was assembled, so there is nothing to sketch"
         );
+        // Counting nothing is not the same as being nothing. The bytes went
+        // past the reader and were hashed on the way, so the object keeps an
+        // identity even though no statistic can be taken off it.
+        for k in ["content_fp", "schema_fp", "shape_fp"] {
+            assert!(
+                !s(&r, k).is_empty(),
+                "the frame carries no {k}, so a consumer keyed on one drops it outright"
+            );
+        }
+    }
+
+    /// The identity of a value the reader went past.
+    ///
+    /// Nothing built by hand can settle this one. The question is what the
+    /// reader does with bytes it does not keep, so the bytes have to go
+    /// through it, which means a real serialized vector past the cell cap.
+    /// Two of them one value apart were the same dataset before: every object
+    /// the cap ever touched hashed to one of four values, and a 149 million
+    /// cell matrix and a 131 million cell matrix were recorded as the same
+    /// data.
+    #[test]
+    fn a_value_the_cap_skipped_is_still_told_apart_from_another() {
+        let dir = std::env::temp_dir().join("rpkg-analyzer-skipped-identity");
+        std::fs::create_dir_all(&dir).expect("a directory to write into");
+        let n = CELL_CAP + 1;
+        let read_back = |stem: &str, name: &str| -> Value {
+            let path = dir.join(format!("{stem}.rds"));
+            let objs = read_file(&path).expect("the vector reads back");
+            let (_, node, ..) = &objs[0];
+            describe(name, "data/x.rds", node, "rds", 2, "none", false, 0)
+        };
+        write_ints_rds(&dir.join("a.rds"), n, 0);
+        write_ints_rds(&dir.join("c.rds"), n, n - 1);
+
+        let a = read_back("a", "a");
+        let renamed = read_back("a", "under_another_name");
+        let c = read_back("c", "c");
+        for f in [&a, &c] {
+            assert_eq!(f["length"], n as i64, "the length is what the cap keeps");
+            assert_eq!(s(f, "confidence"), "degraded", "and no cell of it was read");
+        }
+        assert!(
+            !s(&a, "content_fp").is_empty(),
+            "a value the cap skipped has no identity, so it leaves the catalogue"
+        );
+        assert_eq!(
+            s(&a, "content_fp"),
+            s(&renamed, "content_fp"),
+            "the same bytes under another name are the same data"
+        );
+        assert_ne!(
+            s(&a, "content_fp"),
+            s(&c, "content_fp"),
+            "and one value apart is not"
+        );
+        for stem in ["a", "c"] {
+            let _ = std::fs::remove_file(dir.join(format!("{stem}.rds")));
+        }
+    }
+
+    /// An integer vector serialized the way `save(compress = FALSE)` writes
+    /// one: uncompressed XDR, no attributes, `hot` set to 1 and the rest 0.
+    fn write_ints_rds(path: &std::path::Path, n: usize, hot: usize) {
+        let mut b: Vec<u8> = Vec::with_capacity(18 + 4 * n);
+        b.extend_from_slice(b"X\n");
+        // Serialization version, the R that wrote it, the oldest that can read
+        // it. Only the first is looked at.
+        for v in [2i32, 0x0004_0400, 0x0002_0300] {
+            b.extend_from_slice(&v.to_be_bytes());
+        }
+        b.extend_from_slice(&(INTSXP as i32).to_be_bytes());
+        b.extend_from_slice(&(n as i32).to_be_bytes());
+        for i in 0..n {
+            let v: i32 = if i == hot { 1 } else { 0 };
+            b.extend_from_slice(&v.to_be_bytes());
+        }
+        std::fs::write(path, &b).expect("write the serialized vector");
     }
 
     /// The same cap, and the same silence required of it, on the grid that has
@@ -6616,21 +6797,20 @@ mod tests {
     /// a grid that has them, and `exact` over the lot.
     #[test]
     fn a_grid_whose_cells_the_cap_dropped_measures_nothing() {
-        let side = 3000i32;
-        let node = Node {
-            val: Val::Reals { len: (side as usize) * (side as usize), vals: Vec::new() },
-            attr: attrs(&[("dim", ints(&[side, side]))]),
-        };
+        let node = dropped_grid(3000, 3000);
         let r = describe_here("big_matrix", &node);
 
         assert_eq!(r["nrow"], 3000);
         assert_eq!(r["ncol"], 3000);
         assert_eq!(r["length"], 9_000_000i64);
-        for k in ["n_unique", "n_missing_total", "summary_over", "mean", "content_fp"] {
+        for k in ["n_unique", "n_missing_total", "summary_over", "mean", "row_sketch"] {
             assert!(r.get(k).is_none(), "the grid reports {k} with no cell read");
         }
         assert_eq!(s(&r, "confidence"), "degraded");
         assert!(!s(&r, "notes").is_empty(), "and it says why");
+        for k in ["content_fp", "schema_fp", "shape_fp"] {
+            assert!(!s(&r, k).is_empty(), "the grid carries no {k} to be known by");
+        }
     }
 
     /// The margins of a grid whose cells were never read.
@@ -6644,10 +6824,7 @@ mod tests {
     #[test]
     fn a_grid_the_cap_skipped_is_not_averaged_across() {
         let (nr, nc) = (26_687usize, 5_593usize);
-        let node = Node {
-            val: Val::Reals { len: nr * nc, vals: Vec::new() },
-            attr: attrs(&[("dim", ints(&[nr as i32, nc as i32]))]),
-        };
+        let node = dropped_grid(nr, nc);
         let started = std::time::Instant::now();
         let r = describe_here("big_matrix", &node);
         let took = started.elapsed();
@@ -6758,6 +6935,11 @@ mod tests {
             // Two column types carry no distinct count, and a consumer building
             // a column specification off this file has to know which.
             ("the columns that carry no distinct count", "no `n_unique`".to_string()),
+            // A record for an object the cap skipped is identified by a hash
+            // of its bytes and by nothing taken over its rows, and a consumer
+            // matching on row sketches has to know that one is missing rather
+            // than empty.
+            ("the key a skipped object does not carry", "no `row_sketch`".to_string()),
             (
                 "the column depth vocabulary",
                 "`column_detail` is `full`, `reduced`, `none` or `structural`".to_string(),
