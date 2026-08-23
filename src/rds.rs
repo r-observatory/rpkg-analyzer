@@ -533,6 +533,10 @@ fn attr_text(pairs: &[(String, &Node)], key: &str, cap: usize) -> Option<String>
     Some(t.chars().take(cap).collect())
 }
 
+/// How many leftover attributes one object reports. The list is a description
+/// rather than a payload, so a pathological object cannot turn it into one.
+const ATTRS_OTHER_CAP: usize = 24;
+
 /// Human-written description and any attribute names this reader does not
 /// otherwise consume.
 ///
@@ -574,8 +578,7 @@ fn describe_attrs(pairs: &[(String, &Node)], out: &mut Value, extra: &[&str]) {
     other.sort_by(|a, b| a.0.cmp(&b.0));
     other.dedup_by(|a, b| a.0 == b.0);
     if !other.is_empty() {
-        // Bounded: a pathological object cannot turn this into a payload.
-        other.truncate(24);
+        other.truncate(ATTRS_OTHER_CAP);
         out["attrs_other"] = json!(other
             .iter()
             .map(|(k, v)| {
@@ -5947,5 +5950,28 @@ mod tests {
             p.content_fp, p2.content_fp,
             "a column beyond the cap still contributes to the content fingerprint"
         );
+    }
+
+    /// A record never says that the reader stopped early: an extdata walk that
+    /// hit its cap looks exactly like a package with 200 files, and a truncated
+    /// attribute list looks exactly like an object with 24 attributes. That
+    /// makes every downstream census of these a floor rather than a total, and
+    /// the README is the only place a consumer can learn it. So the numbers
+    /// there are these numbers, and moving a cap without saying so fails here.
+    #[test]
+    fn the_readme_states_the_bounds_the_records_do_not() {
+        let readme = std::fs::read_to_string("README.md").expect("read README.md");
+        for (what, phrase) in [
+            ("the extdata file cap", format!("{EXTDATA_FILE_CAP} files")),
+            ("the extdata walk depth", format!("depth {EXTDATA_DEPTH}")),
+            ("the leftover-attribute cap", format!("{ATTRS_OTHER_CAP} entries")),
+            ("the row sketch size", format!("bottom-{SKETCH_K}")),
+            ("the per-column detail cap", format!("{COLUMN_DETAIL_CAP} columns")),
+        ] {
+            assert!(
+                readme.contains(&phrase),
+                "the README does not state {what}: no \"{phrase}\" in it"
+            );
+        }
     }
 }

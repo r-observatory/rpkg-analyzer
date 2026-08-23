@@ -3733,9 +3733,9 @@ mod tests {
             .collect()
     }
 
-    /// Every record carries `analyzer_version`, and the pipelines decide from it
-    /// whether the rows they already hold were written by a build that reads
-    /// datasets the way this one does. The last release of the narrower reader
+    /// The summary record carries `analyzer_version`, and the pipelines decide
+    /// from it whether the rows they already hold were written by a build that
+    /// reads datasets the way this one does. The last release of the narrower reader
     /// was 0.3.2, so a tree that still calls itself 0.3.2 is indistinguishable
     /// from that release and no rescan downstream can ever fire. Any build
     /// carrying the wider reader has to announce a version past it.
