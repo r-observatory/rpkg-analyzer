@@ -572,3 +572,12 @@ sv(wide_heterogeneous, "wide_heterogeneous")
 # One type and few columns. The per-column means are the description here, so
 # uniformity on its own must cost nothing.
 sv(as.data.frame(matrix((1:40) + 0.5, nrow = 5, ncol = 8)), "narrow_homogeneous")
+# An sf frame past the cap. The geometry column is the one column the record's
+# own extent and projection are lifted off, so a depth that dropped it would
+# take the object's identity with it rather than a statistic.
+wide_sf <- wide_homogeneous
+wide_sf$geom <- list(c(1, 2), c(3, 4), c(5, 6), c(7, 8), c(9, 10), c(11, 12))
+attr(wide_sf$geom, "class") <- c("sfc_POINT", "sfc")
+attr(wide_sf$geom, "crs") <- structure(list(input = "EPSG:4326", wkt = "GEOGCRS[\"WGS 84\"]"), class = "crs")
+attr(wide_sf$geom, "bbox") <- structure(c(xmin = 1, ymin = 2, xmax = 11, ymax = 12), class = "bbox")
+sv(wide_sf, "wide_sf")

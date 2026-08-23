@@ -2547,6 +2547,22 @@ fn profile_columns(cols: &[&Node], names: &[String]) -> Option<Profile> {
                         short[k] = v.clone();
                     }
                 }
+                // A geometry column is identified by being one, and the whole
+                // record's spatial description is lifted off it afterwards.
+                // Dropping these would take an sf frame's projection and extent
+                // with them, which is the object's identity rather than a
+                // statistic about a column. One column in a frame carries them,
+                // so the cost does not grow with the width.
+                if o.get("is_geometry").and_then(|v| v.as_bool()).unwrap_or(false) {
+                    for k in [
+                        "is_geometry", "geom_type", "geom_dimension", "n_geometries",
+                        "n_empty", "bbox", "crs_input", "crs_epsg", "crs_wkt",
+                    ] {
+                        if let Some(v) = o.get(k) {
+                            short[k] = v.clone();
+                        }
+                    }
+                }
                 col_json.push(short);
             }
             ColumnDetail::None => {}
@@ -6006,7 +6022,7 @@ mod tests {
     #[test]
     fn every_fixture_is_readable() {
         let recs = records();
-        assert_eq!(recs.len(), 122, "one record per saved object");
+        assert_eq!(recs.len(), 123, "one record per saved object");
         // Not everything saved under data/ is data. These carry behaviour rather
         // than observations, so there is nothing to fingerprint; what they must
         // still do is read cleanly, because a file that fails mid-object takes
@@ -6235,6 +6251,30 @@ mod tests {
             );
         }
         assert!(r.get("row_mean_sd").is_none(), "and no aggregate is invented for it");
+    }
+
+    /// Reduced depth gives up statistics, not identity. An sf frame's extent and
+    /// projection are read off its geometry column and lifted onto the record,
+    /// so a depth that dropped that column's fields would leave a spatial object
+    /// with no geography on it at all.
+    #[test]
+    fn a_wide_spatial_frame_still_knows_where_it_is() {
+        let r = by_name("wide_sf");
+        assert_eq!(s(&r, "column_detail"), "reduced");
+        assert_eq!(r["is_spatial"], true);
+        assert_eq!(s(&r, "geom_type"), "POINT");
+        assert_eq!(r["n_geometries"], 6);
+        assert_eq!(r["crs_epsg"], 4326);
+        assert_eq!(r["bbox"], serde_json::json!([1.0, 2.0, 11.0, 12.0]));
+        let cols = r["columns"].as_array().unwrap();
+        assert_eq!(cols.len(), 601, "the geometry column plus the six hundred others");
+        let geo = cols.iter().find(|c| c["name"] == "geom").expect("the geometry column is listed");
+        assert_eq!(geo["is_geometry"], true);
+        // And it is the only one that grew: the rest stay at identifying fields.
+        assert!(
+            cols.iter().filter(|c| c.get("bbox").is_some()).count() == 1,
+            "only the geometry column carries an extent"
+        );
     }
 
     /// One type is not on its own a reason to give up per-column detail. A
