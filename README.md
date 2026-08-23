@@ -28,7 +28,7 @@ One `summary` record per run, followed by intermediate records:
 | `function` | R or compiled function | `lang` (`r`/`c`/`cpp`/`rust`/`fortran`), `name`, `file`, `line`, `loc`; R nodes also `exported`, `n_params`, `cyclocomp` |
 | `call_edge` | one call-graph edge | `graph` (`r`/`native`/`c`/`rust`/`fortran`), `from`, `to` |
 | `dcf` | package version | every DESCRIPTION field verbatim (the catch-all) |
-| `dataset` | object shipped under `data/`, `R/sysdata.rda`, or `inst/extdata` | `name`, `file`, `origin_dir`, `format`, `compression`, `class`, `kind`, `nrow`, `ncol`, `columns[]`, `schema_fp`, `shape_fp`, `content_fp`, `row_sketch`, `confidence`; see [Dataset records](#dataset-records) |
+| `dataset` | object shipped under `data/`, `R/sysdata.rda`, or `inst/extdata` | `name`, `file`, `origin_dir`, `format`, `compression`, `class`, `kind`, `nrow`, `ncol`, `column_detail`, `columns[]`, `schema_fp`, `shape_fp`, `content_fp`, `row_sketch`, `confidence`; see [Dataset records](#dataset-records) |
 
 The summary record also carries `analyzer_version`, the build that wrote it. A consumer storing these results needs it to tell rows it has already collected from rows a newer build would describe differently, which is what makes a rescan decidable rather than a guess.
 
@@ -86,6 +86,14 @@ Class and shape: `class` (the class vector as written, slash-joined), `kind` (`d
 
 `columns[]` is one object per column: `name`, `type`, `n_missing`, `n_unique` and `col_fp` always, and then whatever the type supports. Numeric columns add `col_min`, `col_max`, `mean`, `median`, `q1`, `q3`, `sd`, `skewness`, `kurtosis`, `n_zero`, `p_zero`, `is_integer_valued`, `sort_order` (`ascending`, `descending`, `unsorted`), `n_outliers` with `n_outliers_low` and `n_outliers_high` counted against the fences a boxplot would draw, and `mode_value` with `mode_share` when the column has few enough distinct values for a commonest value to mean anything and that value is actually common. Character columns add `min_nchar`, `max_nchar` and `n_blank`. Factors add `levels`, `n_levels`, `is_ordered` and `level_counts`. Doubles add `n_infinite`, `n_infinite_pos`, `n_infinite_neg`, `min_infinite`, `max_infinite` and `n_nan`: `n_missing` counts R's NA and a NaN alike, because `is.na()` does, and `n_nan` is the part of it that arithmetic produced rather than anybody left out. Missingness has a position as well as a count: `n_missing_leading`, `n_missing_trailing` and `max_missing_run` separate a column that starts late from one that is unreliable throughout.
 
+How much of that a record carries depends on how wide the object is and on what its columns are, and `column_detail` is `full`, `reduced` or `none` to say which. Width alone is not the test, because a frame is only repeating itself when its columns are also alike.
+
+- `full`: every column and every statistic above. Anything up to 512 columns, whatever its columns hold. Ten numeric columns need their own means and ranges however alike their types are, so uniformity counts for nothing here.
+- `reduced`: every column, carrying `name`, `type`, `n_missing` and `n_unique` and nothing else. A frame past 512 columns whose columns are not all one type. Each column there is a different variable, so the list keeps all of them and the statistics are what goes.
+- `none`: no `columns[]` at all, and in its place the whole-object treatment a matrix gets, described below: `n_cells`, `n_missing_total`, the summary over every cell with `summary_over` of `cells`, and the `row_mean_*` and `col_mean_*` margin summaries. A frame past 512 columns whose columns are all one of `numeric`, `integer`, `logical` or `character` is a matrix wearing a data.frame coat, and a per-column profile of one is the word `numeric` nineteen thousand times over. A factor is not counted as one type for this: its levels are per-column vocabulary that no whole-object summary can carry.
+
+`ncol` is the true width at all three depths, and `content_fp`, `schema_fp`, `shape_fp` and `row_sketch` are taken over every column at all three, so nothing about the depth changes which objects are the same data. Records with no column structure at all, a matrix or a vector or a list, carry no `column_detail`: there is no list for it to describe.
+
 An object with values but no columns (a vector, a matrix, an array, a sparse matrix) gets the same summary lifted to the top level, with `summary_over` naming what it was taken over: `cells` for a dense grid, `stored values` for a sparse one, where a mean over the cells and a mean over the stored values are different numbers. `n_missing_total` is the object-wide count.
 
 Matrices say how they are held rather than only how big they are: `matrix_shape` (`general`, `symmetric`, `triangular`, `diagonal`, `positive-definite`), `matrix_storage` (`dense`, `packed`, `column-compressed`, `row-compressed`, `triplet`, `diagonal`), `matrix_value_type` (`double`, `logical`, `integer`, `complex`, or `pattern` for a matrix that stores only where its entries are), `matrix_uplo` (which triangle a symmetric or triangular matrix keeps), `matrix_diag`, and for a sparse one `n_stored` and `density`. A grid of two dimensions or more also carries a six number summary of each margin's means, `row_mean_min` through `row_mean_max` with `row_mean_sd`, and the same for `col_mean_*`: a grid whose row means spread widely while its column means barely move is saying where its structure is, which one summary over every cell cannot say.
@@ -129,7 +137,7 @@ Two limits are silent: nothing on a record or in the inventory says the reader s
 
 The remaining bounds announce themselves, one way or another:
 
-- The per-column detail list stops at 512 columns, while `ncol` still reports the true width and the fingerprints still cover every column, so what is lost is the description of the tail rather than the fact of it.
+- Per-column detail stops being written column by column past 512 columns, and `column_detail` on the record says at which of the three depths it was written. No column is dropped at any of them, `ncol` reports the true width, and the fingerprints cover every column throughout.
 - `level_counts` stops at 50 levels and sets `level_counts_truncated`; margin labels stop at 50 and set `labels_truncated`.
 - An object past the cell cap keeps its structure and skips the value pass, which is `degraded` with `notes` of `value scan skipped (size cap)`, and it carries no fingerprints.
 - Help-page titles are read from at most 4000 Rd files per package, each up to 1 MiB.

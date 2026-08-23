@@ -550,3 +550,25 @@ sv(data.frame(
   just_na  = c(1, NA, 3, NA, 5, NA, 7, 8, 9, 10, 11, 12),
   just_nan = c(1, NaN, 3, NaN, 5, 6, 7, 8, 9, 10, 11, 12),
   runs     = c(NA, NA, NA, 4, 5, 6, 7, 8, 9, NA, NA, NA)), "na_and_nan")
+
+# Width plus one type is a matrix wearing a data.frame coat. Six hundred
+# columns of numbers described one at a time is the same sentence six hundred
+# times, and what a reader wants from an object like this is where the
+# variation lies rather than six hundred near-identical means.
+set.seed(7)
+wide_homogeneous <- as.data.frame(matrix(round(rnorm(600 * 6, 10, 3), 3), nrow = 6, ncol = 600))
+wide_homogeneous[[3]][2] <- NA
+sv(wide_homogeneous, "wide_homogeneous")
+# The same numbers stored as the matrix they are. The whole-object treatment a
+# uniform frame gets has to be the treatment a matrix gets and not a second one
+# that drifts away from it, which is what comparing these two says.
+sv(as.matrix(wide_homogeneous), "wide_as_matrix")
+# The same width with the types mixed, where every column is its own variable
+# and dropping any of them loses one nobody can recover.
+wide_heterogeneous <- wide_homogeneous
+for (j in seq(1, 600, by = 3)) wide_heterogeneous[[j]] <- paste0("s", seq_len(6) + j)
+for (j in seq(2, 600, by = 3)) wide_heterogeneous[[j]] <- rep(c(TRUE, FALSE), 3)
+sv(wide_heterogeneous, "wide_heterogeneous")
+# One type and few columns. The per-column means are the description here, so
+# uniformity on its own must cost nothing.
+sv(as.data.frame(matrix((1:40) + 0.5, nrow = 5, ncol = 8)), "narrow_homogeneous")
