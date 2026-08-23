@@ -60,6 +60,8 @@ Three places, and `origin_dir` says which one a record came from.
 
 `data/` is the loadable catalogue, so only the extensions `data()` itself dispatches on are opened, in `data()`'s own precedence order. A package that ships one name twice (`mtcars.rda` beside `mtcars.csv`) gets one record, for the file `data()` would actually load, because the other copy is not reachable by that name. An `.rds` here is not opened at all: `data()` cannot load one, and in an installed tree `data/Rdata.rds` is the lazy-load index rather than a dataset, which once put a fingerprinted dataset called `Rdata` in the catalogue for every package.
 
+A `.tsv` or a `.dat` under `data/` gets no record at all, for the same reason: `data()` does not dispatch on those extensions, so a row for one would put a dataset in the catalogue that nobody can reach. Of the text formats it does dispatch on, `.csv` is read with a semicolon and `.tab` and `.txt` with whitespace, which is what `data()` itself does and not what the extension usually means elsewhere.
+
 `R/sysdata.rda` holds objects the package uses internally. These get records with `internal` true and `origin_dir` `sysdata`: they are real data the package carries, but nothing outside the package can load them by name.
 
 `inst/extdata` (or `extdata`, in an installed tree) is covered too, under the rules in [inst/extdata](#instextdata) below.
