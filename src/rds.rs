@@ -68,6 +68,21 @@ const NA_INT: i32 = i32::MIN;
 // two quantities, one bound.
 const CELL_CAP: usize = 8_000_000;
 
+/// How many serialized objects one file may hold before the read is given up.
+///
+/// An item is one object on the wire: a vector, an attribute, and every
+/// element of a character vector or a list one apiece. So this is not a second
+/// spelling of the cell cap. It bounds the count of objects rather than the
+/// length of any one of them, and for the two types that are written element
+/// by element it is the tighter of the two by a factor of nearly two: a
+/// character column of eight million values is eight million items and never
+/// reaches the cell cap at all.
+///
+/// Overrunning it gives up the whole file rather than the object that
+/// overran, because the read is a single pass through one byte stream and
+/// there is no way back to the start of the next object.
+const ITEM_BUDGET: u32 = 5_000_000;
+
 /// The width past which describing every column one at a time stops being a
 /// description.
 ///
@@ -4068,7 +4083,7 @@ fn read_file(path: &Path) -> Result<Vec<(String, Node, String, i32, String)>, St
         return Err(format!("non-XDR encoding '{}'", sel as char));
     }
     p += 2; // 'X' '\n'
-    let mut r = Reader { b: &bytes, p, ver: 0, refs: Vec::new(), budget: 5_000_000 };
+    let mut r = Reader { b: &bytes, p, ver: 0, refs: Vec::new(), budget: ITEM_BUDGET };
     let ver = r.i32()?;
     r.ver = ver;
     let _writer = r.i32()?;
@@ -7006,6 +7021,42 @@ mod tests {
         }
     }
 
+    /// The vocabulary a column's `type` is drawn from is closed, and the
+    /// README is where a consumer building a column specification learns it.
+    /// A value appearing that the file does not name is a specification with a
+    /// case missing; a value the file names that nothing produces is a case
+    /// nobody needs. Both directions are checked here.
+    #[test]
+    fn the_readme_names_every_type_a_column_can_be() {
+        // Every arm of base_type, written out once. `unknown` is the arm for a
+        // value this reader holds no representation of, which no fixture
+        // produces and the file still has to name.
+        let vocabulary = [
+            "logical", "integer", "numeric", "character", "factor", "Date", "POSIXct",
+            "list", "raw", "complex", "unknown",
+        ];
+        let readme = std::fs::read_to_string("README.md").expect("read README.md");
+        for t in vocabulary {
+            assert!(
+                readme.contains(&format!("`{t}`")),
+                "the README does not name `{t}`, which a column's type can be"
+            );
+        }
+        for r in records() {
+            let mut seen: Vec<String> = vec![s(&r, "type")];
+            for c in r["columns"].as_array().into_iter().flatten() {
+                seen.push(s(c, "type"));
+            }
+            for t in seen.iter().filter(|t| !t.is_empty()) {
+                assert!(
+                    vocabulary.contains(&t.as_str()),
+                    "{} holds a column of type {t}, which is not in the vocabulary",
+                    s(&r, "name")
+                );
+            }
+        }
+    }
+
     /// A record never says that the reader stopped early: an extdata walk that
     /// hit its cap looks exactly like a package with 200 files, and a truncated
     /// attribute list looks exactly like an object with 24 attributes. That
@@ -7043,6 +7094,16 @@ mod tests {
                 "the column depth vocabulary",
                 "`column_detail` is `full`, `reduced`, `none` or `structural`".to_string(),
             ),
+            // The bound that fires first for a character or a list column, and
+            // the only one that gives up a whole file rather than an object.
+            ("the item budget", format!("{ITEM_BUDGET} items")),
+            // Past this a column keeps its mean and loses its quartiles, and
+            // everything worked out off the sorted copy goes with them.
+            ("the quantile cap", format!("{QUANTILE_CAP} values")),
+            ("the mode cardinality cap", format!("{MODE_CARDINALITY_CAP} distinct values")),
+            // The length rule is on three types and the file says which, since
+            // a character column of that size never reaches it.
+            ("which types the length rule is on", "`logical`, `integer` and `numeric`".to_string()),
         ] {
             assert!(
                 readme.contains(&phrase),
