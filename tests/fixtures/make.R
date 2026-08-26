@@ -550,3 +550,54 @@ sv(data.frame(
   just_na  = c(1, NA, 3, NA, 5, NA, 7, 8, 9, 10, 11, 12),
   just_nan = c(1, NaN, 3, NaN, 5, 6, 7, 8, 9, 10, 11, 12),
   runs     = c(NA, NA, NA, 4, 5, 6, 7, 8, 9, NA, NA, NA)), "na_and_nan")
+
+# Width plus one type is a matrix wearing a data.frame coat. Six hundred
+# columns of numbers described one at a time is the same sentence six hundred
+# times, and what a reader wants from an object like this is where the
+# variation lies rather than six hundred near-identical means.
+set.seed(7)
+wide_homogeneous <- as.data.frame(matrix(round(rnorm(600 * 6, 10, 3), 3), nrow = 6, ncol = 600))
+wide_homogeneous[[3]][2] <- NA
+sv(wide_homogeneous, "wide_homogeneous")
+# The same numbers stored as the matrix they are. The whole-object treatment a
+# uniform frame gets has to be the treatment a matrix gets and not a second one
+# that drifts away from it, which is what comparing these two says.
+sv(as.matrix(wide_homogeneous), "wide_as_matrix")
+# The same width with the types mixed, where every column is its own variable
+# and dropping any of them loses one nobody can recover.
+wide_heterogeneous <- wide_homogeneous
+for (j in seq(1, 600, by = 3)) wide_heterogeneous[[j]] <- paste0("s", seq_len(6) + j)
+for (j in seq(2, 600, by = 3)) wide_heterogeneous[[j]] <- rep(c(TRUE, FALSE), 3)
+sv(wide_heterogeneous, "wide_heterogeneous")
+# One type and few columns. The per-column means are the description here, so
+# uniformity on its own must cost nothing.
+sv(as.data.frame(matrix((1:40) + 0.5, nrow = 5, ncol = 8)), "narrow_homogeneous")
+# An sf frame past the cap. The geometry column is the one column the record's
+# own extent and projection are lifted off, so a depth that dropped it would
+# take the object's identity with it rather than a statistic.
+wide_sf <- wide_homogeneous
+wide_sf$geom <- list(c(1, 2), c(3, 4), c(5, 6), c(7, 8), c(9, 10), c(11, 12))
+attr(wide_sf$geom, "class") <- c("sfc_POINT", "sfc")
+attr(wide_sf$geom, "crs") <- structure(list(input = "EPSG:4326", wkt = "GEOGCRS[\"WGS 84\"]"), class = "crs")
+attr(wide_sf$geom, "bbox") <- structure(c(xmin = 1, ymin = 2, xmax = 11, ymax = 12), class = "bbox")
+sv(wide_sf, "wide_sf")
+# Longer than the reader will hold. Every column is past the cell cap, so no
+# value is read at all and the record can list the columns without describing
+# any of them, which is a different shape of list from the one a wide frame
+# gets. Nine million rows cost a few hundred bytes here because R stores 1:n as
+# a compact sequence and writes the state rather than the numbers.
+sv(data.frame(a = 1:9000000L, b = 1:9000000L, c = 1:9000000L), "unread_columns")
+# Wide, one type, and no rows. There are no values to summarise and none to
+# count per column either, so the record says how many cells there are, which is
+# none, and the width and the row count say the rest. A malformed wide file
+# parses to this shape with millions of columns, and writing four zeroes against
+# each of them would describe nothing at great length.
+sv(as.data.frame(matrix(numeric(0), nrow = 0, ncol = 600)), "wide_empty")
+# A complex column with missing values in it, and a raw column beside it. The
+# reader hashes both of these whole rather than cell by cell, so it never looks
+# at a value of either. Only one of them can be missing: R has no missing raw
+# value, so a raw column's zero is a fact about the type, while three of these
+# ten complex values are NA and the count came back zero all the same.
+z <- complex(real = 1:10, imaginary = 10:1)
+z[c(2, 5, 9)] <- NA
+sv(data.frame(z = z, r = as.raw(1:10)), "complex_missing")

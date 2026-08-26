@@ -60,17 +60,103 @@ const NA_INT: i32 = i32::MIN;
 
 // Above this many cells in one vector, skip the value pass and keep structure
 // only, so a pathologically large object cannot blow up time or memory.
+//
+// One vector is the whole of the test on the way in: a 600 by 14,000 frame
+// holds 8.4 million cells and not one of its columns is above the cap, so all
+// of it is read. The same number bounds `grid_cells`, which is a second copy of
+// an object already held, and that one is against the cell count. Two tests,
+// two quantities, one bound.
 const CELL_CAP: usize = 8_000_000;
 
-/// How many columns get a per-column record in the emitted schema.
+/// How many serialized objects one file may hold before the read is given up.
+///
+/// An item is one object on the wire: a vector, an attribute, and every
+/// element of a character vector or a list one apiece. So this is not a second
+/// spelling of the cell cap. It bounds the count of objects rather than the
+/// length of any one of them, and for the two types that are written element
+/// by element it is the tighter of the two by a factor of nearly two: a
+/// character column of eight million values is eight million items and never
+/// reaches the cell cap at all.
+///
+/// Overrunning it gives up the whole file rather than the object that
+/// overran, because the read is a single pass through one byte stream and
+/// there is no way back to the start of the next object.
+const ITEM_BUDGET: u32 = 5_000_000;
+
+/// The width past which describing every column one at a time stops being a
+/// description.
 ///
 /// The schema is one JSON object per column, so its size tracks the width of the
 /// object and nothing else. A document-term matrix runs to six figures of
 /// columns, which is megabytes of description for something no reader scrolls
 /// through and no page renders: the consumer draws a few hundred rows at most.
-/// The true width is reported as ncol regardless, so capping the detail loses the
-/// tail rather than the fact.
+///
+/// Below this width nothing changes and every column keeps every statistic.
+/// Above it the depth is decided by what the columns are rather than by where
+/// they fall in the list, and `column_detail` on the record says which of the
+/// three depths was used. The true width is `ncol` and the fingerprints cover
+/// every column at all three, so what changes is how much is written about a
+/// column and never whether the column was there.
 const COLUMN_DETAIL_CAP: usize = 512;
+
+/// How much of a frame's column structure a record carries.
+///
+/// Stopping the list at the cap said nothing about having stopped, so a reader
+/// took 512 profiles of a 19,763 column object for the whole of it. Worse, the
+/// objects that most needed an aggregate got neither an aggregate nor a
+/// complete list. Each depth here is written on the record, so what a consumer
+/// has is stated rather than inferred from which fields happen to be absent.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ColumnDetail {
+    /// Every column and every statistic, which is what any frame narrow enough
+    /// to read through gets. Ten numeric columns need their own means and
+    /// ranges however alike their types are, so uniformity counts for nothing
+    /// here.
+    Full,
+    /// Every column, carrying only what identifies one: its name, its type, how
+    /// much of it is missing and how many distinct values it holds. A wide frame
+    /// of mixed types is a wide frame of different variables, and losing any of
+    /// them loses a variable outright, so the list keeps all of them and gives
+    /// up the statistics instead.
+    Reduced,
+    /// No column list, and in its place the summary a matrix of the same values
+    /// would carry. A wide frame whose columns are all one type is a matrix
+    /// wearing a data.frame coat, and profiling it column by column writes
+    /// "numeric" nineteen thousand times over. Chosen only when that summary
+    /// can actually be taken, because the whole of the exchange is a list given
+    /// up for an aggregate: see `column_detail`.
+    None,
+    /// Every column, carrying what can be known without reading a value: its
+    /// name, its declared type, whether it is a factor and how many levels it
+    /// declares. It is a different list from `Reduced`: no count of anything is
+    /// in it, because no cell was looked at. The two used to share the
+    /// `reduced` label, which told a consumer to expect four statistics from a
+    /// list that had none of them.
+    ///
+    /// This is not a depth width chooses, and it is not the object's cell count
+    /// either. It is what one column being unreadable does to the frame around
+    /// it, and a column is unreadable two ways: it is longer than `CELL_CAP`
+    /// values, so the value pass kept its length and skipped over it, or it
+    /// holds something with no representation here, a compact sequence too long
+    /// to expand or an S4 object. Complex and raw are not that second case,
+    /// because the whole vector was hashed on the way past. So a three column
+    /// frame lands here when it is nine million rows tall, and a 600 by 14,000
+    /// frame does not land here at all: 8.4 million cells, and every column in
+    /// it is 600 long.
+    Structural,
+}
+
+impl ColumnDetail {
+    fn name(self) -> &'static str {
+        match self {
+            ColumnDetail::Full => "full",
+            ColumnDetail::Reduced => "reduced",
+            ColumnDetail::None => "none",
+            ColumnDetail::Structural => "structural",
+        }
+    }
+}
+
 // Bottom-k row sketch size (KMV), for Jaccard/containment between datasets.
 const SKETCH_K: usize = 32;
 
@@ -94,9 +180,17 @@ enum Val {
     Ints { len: usize, vals: Vec<i32>, logical: bool },
     Reals { len: usize, vals: Vec<f64> },
     /// Values whose bytes are not kept: complex and raw, which are read for
-    /// their length rather than their contents, and a generated sequence too
-    /// long to hold. `of` is what they are, which is otherwise lost.
-    Blob { len: usize, of: &'static str, digest: u64 },
+    /// their length rather than their contents, a vector past the cell cap,
+    /// and a generated sequence too long to hold. `of` is what they are, which
+    /// is otherwise lost.
+    ///
+    /// `digest` is the hash the reader took of the bytes on the way past, and
+    /// it is what stands in for the values that are gone: without it two
+    /// unlike objects are indistinguishable and the store holds one of them.
+    /// A generated sequence has none, because there were no bytes to hash and
+    /// a hash of the length alone would make two different sequences of the
+    /// same length one dataset.
+    Blob { len: usize, of: &'static str, digest: Option<u64> },
     Vec(Vec<Node>),
     List { tag: Box<Node>, car: Box<Node>, cdr: Box<Node> },
     S4,
@@ -316,16 +410,21 @@ impl<'a> Reader<'a> {
             }
             LGLSXP | INTSXP => {
                 let n = self.vlen()?;
-                let vals = if n <= CELL_CAP {
-                    let mut s = Vec::with_capacity(n);
-                    for _ in 0..n {
-                        s.push(self.i32()?);
-                    }
-                    s
-                } else {
+                // Past the cap the values are hashed and gone, the way complex
+                // and raw already are. Skipping them without hashing left the
+                // object with nothing to be known by, and a record with no
+                // fingerprint is dropped rather than stored.
+                if n > CELL_CAP {
+                    let digest = self.digest_span(4 * n)?;
                     self.skip(4 * n)?;
-                    Vec::new()
-                };
+                    let attr = self.maybe_attr(ha)?;
+                    let of = if t == LGLSXP { "logical" } else { "integer" };
+                    return Ok(Node { val: Val::Blob { len: n, of, digest: Some(digest) }, attr });
+                }
+                let mut vals = Vec::with_capacity(n);
+                for _ in 0..n {
+                    vals.push(self.i32()?);
+                }
                 let attr = self.maybe_attr(ha)?;
                 Ok(Node {
                     val: Val::Ints { len: n, vals, logical: t == LGLSXP },
@@ -334,16 +433,19 @@ impl<'a> Reader<'a> {
             }
             REALSXP => {
                 let n = self.vlen()?;
-                let vals = if n <= CELL_CAP {
-                    let mut s = Vec::with_capacity(n);
-                    for _ in 0..n {
-                        s.push(self.f64()?);
-                    }
-                    s
-                } else {
+                if n > CELL_CAP {
+                    let digest = self.digest_span(8 * n)?;
                     self.skip(8 * n)?;
-                    Vec::new()
-                };
+                    let attr = self.maybe_attr(ha)?;
+                    return Ok(Node {
+                        val: Val::Blob { len: n, of: "numeric", digest: Some(digest) },
+                        attr,
+                    });
+                }
+                let mut vals = Vec::with_capacity(n);
+                for _ in 0..n {
+                    vals.push(self.f64()?);
+                }
                 let attr = self.maybe_attr(ha)?;
                 Ok(Node { val: Val::Reals { len: n, vals }, attr })
             }
@@ -352,14 +454,14 @@ impl<'a> Reader<'a> {
                 let digest = self.digest_span(16 * n)?;
                 self.skip(16 * n)?;
                 let attr = self.maybe_attr(ha)?;
-                Ok(Node { val: Val::Blob { len: n, of: "complex", digest }, attr })
+                Ok(Node { val: Val::Blob { len: n, of: "complex", digest: Some(digest) }, attr })
             }
             RAWSXP => {
                 let n = self.vlen()?;
                 let digest = self.digest_span(n)?;
                 self.skip(n)?;
                 let attr = self.maybe_attr(ha)?;
-                Ok(Node { val: Val::Blob { len: n, of: "raw", digest }, attr })
+                Ok(Node { val: Val::Blob { len: n, of: "raw", digest: Some(digest) }, attr })
             }
             VECSXP | EXPRSXP => {
                 let n = self.vlen()?;
@@ -533,6 +635,10 @@ fn attr_text(pairs: &[(String, &Node)], key: &str, cap: usize) -> Option<String>
     Some(t.chars().take(cap).collect())
 }
 
+/// How many leftover attributes one object reports. The list is a description
+/// rather than a payload, so a pathological object cannot turn it into one.
+const ATTRS_OTHER_CAP: usize = 24;
+
 /// Human-written description and any attribute names this reader does not
 /// otherwise consume.
 ///
@@ -574,8 +680,7 @@ fn describe_attrs(pairs: &[(String, &Node)], out: &mut Value, extra: &[&str]) {
     other.sort_by(|a, b| a.0.cmp(&b.0));
     other.dedup_by(|a, b| a.0 == b.0);
     if !other.is_empty() {
-        // Bounded: a pathological object cannot turn this into a payload.
-        other.truncate(24);
+        other.truncate(ATTRS_OTHER_CAP);
         out["attrs_other"] = json!(other
             .iter()
             .map(|(k, v)| {
@@ -906,7 +1011,14 @@ fn expand_seq(state: &Node, want_int: bool) -> Option<Val> {
     let n = if p[0].is_finite() && p[0] >= 0.0 { p[0] as usize } else { return None };
     let (start, step) = (p[1], p[2]);
     if n > CELL_CAP {
-        return Some(Val::Blob { len: n, of: if want_int { "integer" } else { "numeric" }, digest: 0 });
+        // No digest: nothing was read to hash. The values are generated from
+        // three numbers, and a hash of the length alone would make two
+        // different sequences of the same length one dataset.
+        return Some(Val::Blob {
+            len: n,
+            of: if want_int { "integer" } else { "numeric" },
+            digest: None,
+        });
     }
     if want_int {
         let vals = (0..n)
@@ -1013,7 +1125,10 @@ fn push_cell(buf: &mut Vec<u8>, col: &Node, i: usize, levels: Option<&[Option<St
         Val::Blob { len, digest, .. } => {
             buf.push(1);
             buf.extend_from_slice(&(*len as u64).to_be_bytes());
-            buf.extend_from_slice(&digest.to_be_bytes());
+            // A blob with no digest is never profiled: the value pass refuses
+            // it before this is reached, because a cell of it would stand for
+            // bytes nobody read.
+            buf.extend_from_slice(&digest.unwrap_or(0).to_be_bytes());
             let _ = i;
             // Present, not missing. The bytes of a complex or raw value are
             // not kept, which is a limit on what can be said about it and not
@@ -1152,7 +1267,9 @@ fn digest_node(n: &Node, depth: u32) -> u64 {
             }
             acc
         }
-        Val::Blob { len, digest, .. } => fnv(&[(*len as u64).to_be_bytes(), digest.to_be_bytes()].concat()),
+        Val::Blob { len, digest, .. } => {
+            fnv(&[(*len as u64).to_be_bytes(), digest.unwrap_or(0).to_be_bytes()].concat())
+        }
         Val::Vec(items) => {
             let mut acc = fnv(b"vec");
             for it in items {
@@ -1181,8 +1298,11 @@ fn hex128(h: &blake3::Hash) -> String {
 }
 
 struct Profile {
+    detail: ColumnDetail,
     columns: Vec<Value>,
-    n_missing_total: u64,
+    /// None where no column produced a count, which is a frame or a vector of
+    /// nothing but complex values.
+    n_missing_total: Option<u64>,
     schema_fp: String,
     shape_fp: String,
     content_fp: String,
@@ -1238,6 +1358,14 @@ fn quantile(sorted: &[f64], p: f64) -> f64 {
 /// margin with nothing in it contributes no mean rather than a NaN.
 fn margin_summaries(node: &Node, nrow: usize, ncol: usize, rec: &mut Value) {
     if nrow < 2 || ncol < 2 {
+        return;
+    }
+    // A grid whose cells were never read has no margins to take. The accessor
+    // below answers "missing" at every position of such a vector, so the walk
+    // runs to the end of the grid and emits nothing: on the largest object of
+    // this kind in the published corpus, 149,260,391 asks for a value that is
+    // not there.
+    if values_dropped(node) {
         return;
     }
     // Reading a value out of the flat vector, with R's two spellings of
@@ -1321,6 +1449,23 @@ fn emit_margin(rec: &mut Value, side: &str, mut m: Vec<f64>) {
 /// `over` says what was summarised, because it is not always every cell. A
 /// sparse matrix holds only its non-zeros, and a mean taken over those is a
 /// different number from a mean over the grid they sit in.
+/// What an object with values and no columns holds.
+///
+/// A length alone does not distinguish a column of numbers from a column of
+/// names. Read off the value rather than off the profile, so an object whose
+/// bytes are not kept, a raw or a complex vector or a grid the cell cap
+/// skipped, still says what its cells are.
+fn lift_element_type(rec: &mut Value, values: &Node) {
+    let (ty, is_factor, nlev) = base_type(values);
+    rec["type"] = json!(ty);
+    if is_factor {
+        rec["is_factor"] = json!(true);
+        if nlev >= 0 {
+            rec["n_levels"] = json!(nlev);
+        }
+    }
+}
+
 fn lift_value_summary(rec: &mut Value, values: &Node, over: &'static str) {
     let name = "values".to_string();
     let Some(p) = profile_columns(&[values], std::slice::from_ref(&name)) else { return };
@@ -1344,11 +1489,246 @@ fn lift_value_summary(rec: &mut Value, values: &Node, over: &'static str) {
     if let Some(v) = c.get("n_unique") {
         rec["n_unique"] = v.clone();
     }
-    if rec.get("n_missing_total").is_none() {
-        rec["n_missing_total"] = json!(p.n_missing_total);
+    if let (None, Some(total)) = (rec.get("n_missing_total"), p.n_missing_total) {
+        rec["n_missing_total"] = json!(total);
     }
     if any {
         rec["summary_over"] = json!(over);
+    }
+}
+
+/// The one base type every column shares, when there is one and the values can
+/// be read as the single vector they amount to.
+///
+/// Homogeneity is the test rather than the class, because the class does not
+/// know. WallomicsData ships a 30 by 19,763 data.frame of expression values,
+/// which is a matrix that happened to be saved as a frame, and the per-column
+/// profile of it is the word "numeric" nineteen thousand times. A frame of
+/// mixed types is the opposite case however wide it gets: every column is a
+/// different variable and no aggregate stands in for them.
+///
+/// Only the four atomic types are counted, and a factor is not one of them. A
+/// factor's levels are per-column vocabulary that no whole-object summary can
+/// carry, and concatenating the codes of columns with different level sets
+/// makes a vector whose values mean nothing. The same goes for dates, list
+/// columns and anything read for its size rather than its contents.
+fn one_base_type(cols: &[&Node]) -> Option<&'static str> {
+    let (first, is_factor, _) = base_type(cols.first()?);
+    if is_factor || !matches!(first, "numeric" | "integer" | "logical" | "character") {
+        return None;
+    }
+    if cols.iter().skip(1).any(|c| base_type(c).0 != first) {
+        return None;
+    }
+    Some(first)
+}
+
+/// The grid a set of columns lays out into, as the row count and the cell
+/// count, when they lay out into a grid at all and it is small enough to hold
+/// flat a second time.
+///
+/// This is the one place the question is asked. Deciding a depth and producing
+/// what that depth promises used to test different things: the depth was picked
+/// on width and one type, and the aggregate was refused separately on the cell
+/// cap, so a frame past the cap gave up its column list and got nothing for it.
+fn grid_cells(cols: &[&Node]) -> Option<(usize, usize)> {
+    let nrow = col_len(cols.first()?);
+    // A column holding a matrix of its own is longer than the frame is tall, so
+    // the columns do not lay end to end into a grid.
+    if cols.iter().any(|c| col_len(c) != nrow) {
+        return None;
+    }
+    let cells = nrow.checked_mul(cols.len())?;
+    // A grid of no cells is still a grid, and saying it holds nothing is a
+    // complete description of it. What is refused here is a grid too big to
+    // hold a second time, which is the one case where there are values and no
+    // way to describe them whole.
+    if cells > CELL_CAP {
+        return None;
+    }
+    Some((nrow, cells))
+}
+
+/// How deep a set of columns is worth describing, on width first, then on what
+/// the columns are, and last on what can actually be delivered.
+///
+/// Giving up the column list is only worth doing in exchange for the aggregate
+/// that replaces it, so the exchange has to be available before it is made. A
+/// frame that is one type and past the cell cap keeps every column instead:
+/// four statistics on each of them says far less than the aggregate would, and
+/// it says immeasurably more than the empty record that promising an aggregate
+/// and then refusing it produced.
+///
+/// A grid of no cells is not that case. It holds no values, so there is nothing
+/// to summarise and nothing per column to write either, and `nrow` with
+/// `n_cells` describes it completely.
+fn column_detail(cols: &[&Node]) -> ColumnDetail {
+    if cols.len() <= COLUMN_DETAIL_CAP {
+        return ColumnDetail::Full;
+    }
+    if one_base_type(cols).is_some() && grid_cells(cols).is_some() {
+        ColumnDetail::None
+    } else {
+        ColumnDetail::Reduced
+    }
+}
+
+/// A frame's columns laid end to end, as the one vector they would be if the
+/// object had been saved as the matrix it is.
+///
+/// margin_summaries and lift_value_summary both read a flat column-major
+/// vector, which is exactly what a matrix node already is: a data.frame node is
+/// a list of column vectors instead, so neither could be pointed at one.
+/// Building the vector gives a uniform frame the matrix treatment through the
+/// matrix code rather than through a second implementation that drifts away
+/// from it, which is a thing the tests can then hold to by comparing the two.
+///
+/// Nothing is copied until the shape is known to be rectangular, and the copy
+/// is refused past the cell cap that already bounds what this reader will hold
+/// twice. Both of those are `grid_cells`, which is also what the depth is
+/// decided on, so the decision and the copy cannot disagree about whether this
+/// object has an aggregate in it.
+fn flatten_columns(cols: &[&Node]) -> Option<Node> {
+    let (_, cells) = grid_cells(cols)?;
+    // There is nothing to lay out, and a summary of no values is a row of
+    // statistics over nothing. The caller says so with n_cells instead.
+    if cells == 0 {
+        return None;
+    }
+    let val = match &cols.first()?.val {
+        Val::Reals { .. } => {
+            let mut flat = Vec::with_capacity(cells);
+            for c in cols {
+                let Val::Reals { vals, .. } = &c.val else { return None };
+                flat.extend_from_slice(vals);
+            }
+            Val::Reals { len: flat.len(), vals: flat }
+        }
+        Val::Ints { logical, .. } => {
+            let logical = *logical;
+            let mut flat = Vec::with_capacity(cells);
+            for c in cols {
+                let Val::Ints { vals, logical: l, .. } = &c.val else { return None };
+                // A logical column and an integer one are both Ints and are not
+                // the same values, so a mix of them is not one vector.
+                if *l != logical {
+                    return None;
+                }
+                flat.extend_from_slice(vals);
+            }
+            Val::Ints { len: flat.len(), vals: flat, logical }
+        }
+        Val::Str(_) => {
+            let mut flat = Vec::with_capacity(cells);
+            for c in cols {
+                let Val::Str(vals) = &c.val else { return None };
+                flat.extend_from_slice(vals);
+            }
+            Val::Str(flat)
+        }
+        _ => return None,
+    };
+    Some(Node { val, attr: None })
+}
+
+/// What a wide uniform frame carries in place of a column list: the size of the
+/// grid, the summary over all of its cells, and where the variation in it lies.
+///
+/// The missing total is not set here. It comes off the per-column pass, which
+/// runs whatever the depth, and counts the same cells this would.
+///
+/// Returns whether the summary was actually written, because a caller that has
+/// already given up the column list has nothing left to say if it was not.
+fn whole_object_summary(rec: &mut Value, cols: &[&Node]) -> bool {
+    let Some((nrow, cells)) = grid_cells(cols) else { return false };
+    rec["n_cells"] = json!(cells);
+    // An empty grid holds no values and needs no summary of them: `nrow` and
+    // `n_cells` are the whole of what there is to say, and they say it. The
+    // alternative is a name and four zeroes for each of two and a half million
+    // columns, which is what a malformed wide file parses to.
+    if cells == 0 {
+        return true;
+    }
+    let Some(flat) = flatten_columns(cols) else { return false };
+    lift_value_summary(rec, &flat, "cells");
+    margin_summaries(&flat, nrow, cols.len(), rec);
+    true
+}
+
+/// What an object whose values were never read can still be known by.
+///
+/// Nothing in it can be counted, but its bytes went past the reader and were
+/// hashed on the way, so it can be told from something else. Without this such
+/// a record carried no fingerprint at all and a consumer keyed on `content_fp`
+/// dropped it: an object too big to describe became an object that was never
+/// there. In the published corpus that is 34 objects, one of them a 149 million
+/// cell matrix.
+///
+/// The three keys are built the way the value pass builds them, off the same
+/// cell bytes, so the two recipes cannot drift apart. `row_sketch` has no
+/// counterpart here, because no row was assembled to hash.
+///
+/// All or nothing. One value the reader could not hash, a generated sequence
+/// for instance, leaves the whole object without an identity rather than with
+/// one taken over the part of it that happened to have bytes.
+fn skipped_fingerprints(cols: &[&Node], names: &[String]) -> Option<(String, String, String)> {
+    if cols.is_empty() {
+        return None;
+    }
+    let mut col_fp_bytes: Vec<u8> = Vec::new();
+    let mut schema_src = String::new();
+    let mut shape_src = String::new();
+    for (j, col) in cols.iter().enumerate() {
+        if !matches!(col.val, Val::Blob { digest: Some(_), .. }) {
+            return None;
+        }
+        let (ty, is_factor, _) = base_type(col);
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(ty.as_bytes());
+        let mut buf = Vec::new();
+        push_cell(&mut buf, col, 0, None);
+        hasher.update(&buf);
+        col_fp_bytes.extend_from_slice(hex128(&hasher.finalize()).as_bytes());
+        col_fp_bytes.push(b'|');
+
+        let name = names.get(j).cloned().unwrap_or_default();
+        let btype = if is_factor { "factor" } else { ty };
+        schema_src.push_str(&format!("{name}:{btype}|"));
+        shape_src.push_str(&format!("{btype}|"));
+    }
+    Some((
+        hex128(&blake3::hash(&col_fp_bytes)),
+        hex128(&blake3::hash(schema_src.as_bytes())),
+        hex128(&blake3::hash(shape_src.as_bytes())),
+    ))
+}
+
+/// Hang a profile on a record at the depth it was taken at.
+///
+/// The depth is written even when it is `full`, so that reading it is never a
+/// matter of noticing which fields are missing.
+fn attach_profile(rec: &mut Value, p: Profile, cols: &[&Node]) {
+    rec["column_detail"] = json!(p.detail.name());
+    if let Some(total) = p.n_missing_total {
+        rec["n_missing_total"] = json!(total);
+    }
+    rec["schema_fp"] = json!(p.schema_fp);
+    rec["shape_fp"] = json!(p.shape_fp);
+    rec["content_fp"] = json!(p.content_fp);
+    rec["row_sketch"] = json!(p.row_sketch);
+    match p.detail {
+        ColumnDetail::None => {
+            // `column_detail` picks this depth only where the summary can be
+            // taken, so reaching the other arm means the two have come apart
+            // again. A record that has given up its column list and has no
+            // aggregate to put there describes nothing, and the one thing it
+            // must not do is read as a complete description of an object.
+            if !whole_object_summary(rec, cols) {
+                rec["confidence"] = json!("degraded");
+                rec["notes"] = json!("whole-object summary unavailable");
+            }
+        }
+        _ => rec["columns"] = Value::Array(p.columns),
     }
 }
 
@@ -1740,8 +2120,11 @@ fn describe_list(items: &[Node], names: &[String], out: &mut Value) {
     let mut elem_names: Vec<String> = Vec::new();
     if all.len() == all_names.len() {
         for (nd, nm) in all.iter().zip(&all_names) {
-            let readable = matches!(nd.val, Val::Ints { .. } | Val::Reals { .. } | Val::Str(_) | Val::Vec(_))
-                || matches!(nd.val, Val::Blob { of, .. } if of == "raw" || of == "complex");
+            let readable = !values_dropped(nd)
+                && matches!(
+                    nd.val,
+                    Val::Ints { .. } | Val::Reals { .. } | Val::Str(_) | Val::Vec(_) | Val::Blob { .. }
+                );
             if readable {
                 refs.push(nd);
                 elem_names.push(nm.clone());
@@ -1864,6 +2247,23 @@ fn round_stat(v: f64) -> f64 {
     (v * scale).round() / scale
 }
 
+/// Whether a value's length was read and its values were not.
+///
+/// The reader leaves a `Blob` wherever that happened: past `CELL_CAP`, where
+/// the bytes went by and were hashed on the way, and for a generated sequence
+/// too long to expand, where there were no bytes at all. Complex and raw are
+/// not this. Their elements are never kept either, but that is the reader's
+/// settled treatment of those two types rather than something it gave up on,
+/// and a column of one is profiled from the digest.
+///
+/// It has to be asked. Such a value has a length and no cells, so every count
+/// taken over it comes back zero and reads as a measurement: no missing values
+/// in a column that has them, one distinct value in nine million, and a
+/// fingerprint over nothing.
+fn values_dropped(node: &Node) -> bool {
+    matches!(&node.val, Val::Blob { of, .. } if !matches!(*of, "complex" | "raw"))
+}
+
 fn profile_columns(cols: &[&Node], names: &[String]) -> Option<Profile> {
     // Two different things used to be one. A column whose values were never
     // materialized (over the cap, or a type this reader skips) genuinely cannot
@@ -1877,22 +2277,32 @@ fn profile_columns(cols: &[&Node], names: &[String]) -> Option<Profile> {
     // column has no values to read at all. Only the second can defeat a profile.
     // A complex or raw value is the third case: its elements were not kept,
     // but the whole of it was hashed on the way past, so it can be identified
-    // even though it cannot be summarised. A generated sequence too long to
-    // hold cannot: nothing was hashed, and a fingerprint over its length alone
-    // would make two different sequences of the same length one dataset.
+    // even though it cannot be summarised.
     let any_unread = cols.iter().any(|c| {
-        !matches!(c.val, Val::Ints { .. } | Val::Reals { .. } | Val::Str(_) | Val::Vec(_))
-            && !matches!(c.val, Val::Blob { of, .. } if of == "raw" || of == "complex")
+        values_dropped(c)
+            || !matches!(
+                c.val,
+                Val::Ints { .. } | Val::Reals { .. } | Val::Str(_) | Val::Vec(_) | Val::Blob { .. }
+            )
     });
     if any_unread {
         return None;
     }
     let _ = n;
 
-    let mut col_json = Vec::with_capacity(cols.len());
+    // Decided once, before a cell is read, because it governs what the loop
+    // below bothers to work out as well as what it writes.
+    let detail = column_detail(cols);
+    let mut col_json = match detail {
+        ColumnDetail::None => Vec::new(),
+        _ => Vec::with_capacity(cols.len()),
+    };
     let mut col_fp_bytes: Vec<u8> = Vec::new();
     let mut cell_hashes: Vec<Vec<u64>> = Vec::with_capacity(cols.len());
     let mut n_missing_total = 0u64;
+    // Whether any column produced one. A frame of nothing but complex columns
+    // has no total to report, only a sum over counts nobody took.
+    let mut n_missing_counted = false;
     let mut schema_src = String::new();
     let mut shape_src = String::new();
 
@@ -1936,7 +2346,11 @@ fn profile_columns(cols: &[&Node], names: &[String]) -> Option<Profile> {
         // look identical until the middle is described.
         let mut sum = 0.0f64;
         let mut vals_for_quantiles: Vec<f64> = Vec::new();
-        let quantiles_wanted = is_num && n <= QUANTILE_CAP;
+        // Holding a second copy of the column to sort it is the one part of this
+        // that grows with the data, and every statistic it pays for is one the
+        // other two depths do not write. So it is not only unwritten there, it
+        // is not worked out.
+        let quantiles_wanted = is_num && n <= QUANTILE_CAP && detail == ColumnDetail::Full;
         if quantiles_wanted {
             vals_for_quantiles.reserve(n);
         }
@@ -2099,7 +2513,17 @@ fn profile_columns(cols: &[&Node], names: &[String]) -> Option<Profile> {
             }
         }
         let fp = hex128(&hasher.finalize());
-        n_missing_total += n_missing;
+        // A complex vector is hashed whole rather than cell by cell, so no
+        // value of one was ever looked at and none of them was ever found
+        // missing: the count came back 0 on a column where three of ten are
+        // NA. Raw is the other side of that. Its cells were not looked at
+        // either, and R has no missing raw value to look for, so 0 is a fact
+        // about the type rather than a count nobody took.
+        let counts_missing = ty != "complex";
+        if counts_missing {
+            n_missing_total += n_missing;
+            n_missing_counted = true;
+        }
 
         let name = names.get(j).cloned().unwrap_or_default();
         let btype = if is_factor { "factor" } else { ty };
@@ -2109,10 +2533,10 @@ fn profile_columns(cols: &[&Node], names: &[String]) -> Option<Profile> {
         // is_factor is not written when false: it says the same thing as the
         // type, and a field repeated on every column of every dataset to say
         // "no" is a tenth of what the column list costs.
-        let mut o = json!({
-            "name": name, "type": ty,
-            "n_missing": n_missing, "col_fp": fp
-        });
+        let mut o = json!({ "name": name, "type": ty, "col_fp": fp });
+        if counts_missing {
+            o["n_missing"] = json!(n_missing);
+        }
         // Left out rather than reported as one, which is what the shared
         // digest would make it.
         if !is_opaque {
@@ -2343,14 +2767,46 @@ fn profile_columns(cols: &[&Node], names: &[String]) -> Option<Profile> {
         }
         spatial_fields(col, &mut o);
         describe_attrs(&attr_pairs(col), &mut o, &[]);
-        // Emit detail for the leading columns only. The cap is on what is
-        // WRITTEN, never on what is hashed: col_fp_bytes below still covers every
-        // column, so content_fp is unchanged and the content-addressed store does
-        // not see a new identity for data that has not moved. ncol is recorded
-        // separately from the true column count, so a reader can still see how
-        // many there are and tell that this list is the first of them.
-        if col_json.len() < COLUMN_DETAIL_CAP {
-            col_json.push(o);
+        // The depth is on what is WRITTEN, never on what is hashed: col_fp_bytes
+        // below still covers every column at all three, so content_fp is
+        // unchanged and the content-addressed store does not see a new identity
+        // for data that has not moved.
+        match detail {
+            ColumnDetail::Full => col_json.push(o),
+            // The fields that say which column this is and how much of it there
+            // is, picked off the full object rather than rebuilt, so the two
+            // depths cannot drift into spelling a field differently.
+            //
+            // Structural depth is not reached from here: it names a list built
+            // where no value was read, and this loop is the value pass. It
+            // shares the arm so that a future depth cannot silently drop a
+            // column list by falling through to the empty one.
+            ColumnDetail::Reduced | ColumnDetail::Structural => {
+                let mut short = json!({});
+                for k in ["name", "type", "n_missing", "n_unique"] {
+                    if let Some(v) = o.get(k) {
+                        short[k] = v.clone();
+                    }
+                }
+                // A geometry column is identified by being one, and the whole
+                // record's spatial description is lifted off it afterwards.
+                // Dropping these would take an sf frame's projection and extent
+                // with them, which is the object's identity rather than a
+                // statistic about a column. One column in a frame carries them,
+                // so the cost does not grow with the width.
+                if o.get("is_geometry").and_then(|v| v.as_bool()).unwrap_or(false) {
+                    for k in [
+                        "is_geometry", "geom_type", "geom_dimension", "n_geometries",
+                        "n_empty", "bbox", "crs_input", "crs_epsg", "crs_wkt",
+                    ] {
+                        if let Some(v) = o.get(k) {
+                            short[k] = v.clone();
+                        }
+                    }
+                }
+                col_json.push(short);
+            }
+            ColumnDetail::None => {}
         }
         col_fp_bytes.extend_from_slice(fp.as_bytes());
         col_fp_bytes.push(b'|');
@@ -2377,8 +2833,9 @@ fn profile_columns(cols: &[&Node], names: &[String]) -> Option<Profile> {
     let row_sketch = row_hashes.iter().map(|h| format!("{h:016x}")).collect();
 
     Some(Profile {
+        detail,
         columns: col_json,
-        n_missing_total,
+        n_missing_total: n_missing_counted.then_some(n_missing_total),
         schema_fp,
         shape_fp,
         content_fp,
@@ -2586,12 +3043,7 @@ fn describe(
                     let names = attr(&dp, "names").map(str_vec).unwrap_or_default();
                     let refs: Vec<&Node> = cols.iter().collect();
                     if let Some(pr) = profile_columns(&refs, &names) {
-                        rec["n_missing_total"] = json!(pr.n_missing_total);
-                        rec["schema_fp"] = json!(pr.schema_fp);
-                        rec["shape_fp"] = json!(pr.shape_fp);
-                        rec["content_fp"] = json!(pr.content_fp);
-                        rec["row_sketch"] = json!(pr.row_sketch);
-                        rec["columns"] = json!(pr.columns);
+                        attach_profile(&mut rec, pr, &refs);
                     }
                 }
             }
@@ -2730,7 +3182,9 @@ fn describe(
                         let names: Vec<String> =
                             cols.iter().enumerate().map(|(k, _)| format!("s{k}")).collect();
                         if let Some(pr) = profile_columns(&cols, &names) {
-                            rec["n_missing_total"] = json!(pr.n_missing_total);
+                            if let Some(total) = pr.n_missing_total {
+                                rec["n_missing_total"] = json!(total);
+                            }
                             rec["schema_fp"] = json!(pr.schema_fp);
                             rec["shape_fp"] = json!(pr.shape_fp);
                             rec["content_fp"] = json!(pr.content_fp);
@@ -2871,7 +3325,9 @@ fn describe(
                             let cols = vec![v];
                             let names = vec!["values".to_string()];
                             if let Some(pr) = profile_columns(&cols, &names) {
-                                rec["n_missing_total"] = json!(pr.n_missing_total);
+                                if let Some(total) = pr.n_missing_total {
+                                    rec["n_missing_total"] = json!(total);
+                                }
                                 rec["schema_fp"] = json!(pr.schema_fp);
                                 rec["shape_fp"] = json!(pr.shape_fp);
                                 rec["content_fp"] = json!(pr.content_fp);
@@ -3027,13 +3483,9 @@ fn describe(
         }
         match profile_columns(&els, &names) {
             Some(p) => {
-                rec["columns"] = json!(p.columns);
-                rec["n_missing_total"] = json!(p.n_missing_total);
-                rec["schema_fp"] = json!(p.schema_fp);
-                rec["shape_fp"] = json!(p.shape_fp);
-                rec["content_fp"] = json!(p.content_fp);
-                rec["row_sketch"] = json!(p.row_sketch);
-                if p.capped {
+                let capped = p.capped;
+                attach_profile(&mut rec, p, &els);
+                if capped {
                     rec["confidence"] = json!("degraded");
                 }
                 lift_spatial(&mut rec);
@@ -3053,8 +3505,24 @@ fn describe(
                     })
                     .collect();
                 rec["columns"] = json!(cols);
+                // Every column is listed and none of them is described. That is
+                // its own depth and not the reduced one: reduced keeps four
+                // statistics per column, and there are none to keep here
+                // because no cell was read. Labelling both `reduced` told a
+                // consumer to expect a count of missing values from a list that
+                // has never held one.
+                rec["column_detail"] = json!(ColumnDetail::Structural.name());
                 rec["confidence"] = json!("degraded");
                 rec["notes"] = json!("value scan skipped (size cap)");
+                // Described by nothing is not the same as being nothing. What
+                // the reader hashed on its way past the columns is enough to
+                // tell this frame from another, and a record with no
+                // fingerprint is dropped rather than stored.
+                if let Some((content, schema, shape)) = skipped_fingerprints(&els, &names) {
+                    rec["content_fp"] = json!(content);
+                    rec["schema_fp"] = json!(schema);
+                    rec["shape_fp"] = json!(shape);
+                }
             }
         }
         describe_attrs(&pairs, &mut rec, &[]);
@@ -3093,6 +3561,12 @@ fn describe(
             margin_fields(&pairs, &mut rec);
             series_fields(&pairs, &mut rec);
             describe_attrs(&pairs, &mut rec, &[]);
+            // What the grid holds. Read off the value the way a bare vector
+            // reads it, rather than picked out of the summary below, which is
+            // where it used to come from: a grid whose cells the cap skipped
+            // has no summary and so stopped saying what its cells are, while
+            // the vector in the same position went on saying it.
+            lift_element_type(&mut rec, node);
             // A grid has no columns to hang a summary on, so it is described
             // whole. Without this a matrix said how big it was and nothing
             // about what was in it.
@@ -3131,11 +3605,28 @@ fn describe(
                 };
                 {
                     if let Some(p) = profile_columns(&refs, &names) {
-                        rec["n_missing_total"] = json!(p.n_missing_total);
+                        if let Some(total) = p.n_missing_total {
+                            rec["n_missing_total"] = json!(total);
+                        }
                         rec["schema_fp"] = json!(p.schema_fp);
                         rec["shape_fp"] = json!(p.shape_fp);
                         rec["content_fp"] = json!(p.content_fp);
                         rec["row_sketch"] = json!(p.row_sketch);
+                    } else if values_dropped(node) {
+                        // A grid has no column list to carry the same news, so
+                        // the record says it here. Its extent is exact and not
+                        // one of its cells was read, and without this the two
+                        // are told apart by the absence of fields a consumer
+                        // has no reason to expect on every matrix.
+                        rec["confidence"] = json!("degraded");
+                        rec["notes"] = json!("value scan skipped (size cap)");
+                        if let Some((content, schema, shape)) =
+                            skipped_fingerprints(&refs, &names)
+                        {
+                            rec["content_fp"] = json!(content);
+                            rec["schema_fp"] = json!(schema);
+                            rec["shape_fp"] = json!(shape);
+                        }
                     }
                 }
             }
@@ -3234,20 +3725,11 @@ fn describe(
     }
     describe_attrs(&pairs, &mut rec, &[]);
     if kind == "vector" || kind == "list" {
-        // What a vector holds, which the record said nothing about: a length
-        // alone does not distinguish a column of numbers from a column of
-        // names. Taken from the value rather than from the profile, so a raw
-        // or complex vector, whose bytes are not kept, still says what it is.
-        let (ty, is_factor, nlev) = base_type(node);
-        rec["type"] = json!(ty);
-        if is_factor {
-            rec["is_factor"] = json!(true);
-            if nlev >= 0 {
-                rec["n_levels"] = json!(nlev);
-            }
-        }
+        lift_element_type(&mut rec, node);
         if let Some(p) = profile_columns(&[node], std::slice::from_ref(&name.to_string())) {
-            rec["n_missing_total"] = json!(p.n_missing_total);
+            if let Some(total) = p.n_missing_total {
+                rec["n_missing_total"] = json!(total);
+            }
             rec["n_unique"] = json!(p.columns.first().and_then(|c| c.get("n_unique")).cloned().unwrap_or(json!(null)));
             // The summary the profile already worked out, which was being
             // kept only for the columns of a table: a time series or a zoo is
@@ -3269,6 +3751,19 @@ fn describe(
                 }
             }
             rec["content_fp"] = json!(p.content_fp);
+        } else if values_dropped(node) {
+            // Same as the grid: a length and a type were read and nothing else
+            // was, and the hash the reader took on the way past is what the
+            // vector is known by. A vector carries no schema of its own, so it
+            // gets the one key it gets when its values are there.
+            rec["confidence"] = json!("degraded");
+            rec["notes"] = json!("value scan skipped (size cap)");
+            let flat = [node];
+            if let Some((content, _, _)) =
+                skipped_fingerprints(&flat, std::slice::from_ref(&name.to_string()))
+            {
+                rec["content_fp"] = json!(content);
+            }
         }
     }
     rec
@@ -3588,7 +4083,7 @@ fn read_file(path: &Path) -> Result<Vec<(String, Node, String, i32, String)>, St
         return Err(format!("non-XDR encoding '{}'", sel as char));
     }
     p += 2; // 'X' '\n'
-    let mut r = Reader { b: &bytes, p, ver: 0, refs: Vec::new(), budget: 5_000_000 };
+    let mut r = Reader { b: &bytes, p, ver: 0, refs: Vec::new(), budget: ITEM_BUDGET };
     let ver = r.i32()?;
     r.ver = ver;
     let _writer = r.i32()?;
@@ -4096,12 +4591,7 @@ pub fn scan_package(root: &Path) -> Vec<Value> {
                         rec["delimiter_would_give_ncol"] = json!(n as i64);
                     }
                     if let Some(p) = profile_columns(&refs, &names) {
-                        rec["columns"] = json!(p.columns);
-                        rec["n_missing_total"] = json!(p.n_missing_total);
-                        rec["schema_fp"] = json!(p.schema_fp);
-                        rec["shape_fp"] = json!(p.shape_fp);
-                        rec["content_fp"] = json!(p.content_fp);
-                        rec["row_sketch"] = json!(p.row_sketch);
+                        attach_profile(&mut rec, p, &refs);
                     }
                     out.push(rec);
                 }
@@ -4731,6 +5221,45 @@ mod tests {
         assert_eq!(f["n_levels"], 3);
     }
 
+    /// A complex column with missing values in it.
+    ///
+    /// The reader hashes a complex vector whole rather than cell by cell, so
+    /// it never looks at a value of one and never finds one missing. The count
+    /// came back 0 on a column where three of ten are NA, which is the same
+    /// thing as a distinct count of 1 over one digest: a number nobody took,
+    /// written down as a measurement. R has no missing raw value, so a raw
+    /// column's 0 is a fact about the type and stays.
+    #[test]
+    fn a_complex_column_counts_nothing_it_never_looked_at() {
+        let r = by_name("complex_missing");
+        let cols = r["columns"].as_array().expect("both columns are listed");
+        let z = cols.iter().find(|c| s(c, "type") == "complex").expect("the complex column");
+        let raw = cols.iter().find(|c| s(c, "type") == "raw").expect("the raw column");
+
+        assert!(z.get("n_unique").is_none(), "the distinct count is already left off");
+        assert!(
+            z.get("n_missing").is_none(),
+            "the complex column reports {} missing of ten, three of which are NA",
+            z["n_missing"]
+        );
+        assert!(!s(z, "col_fp").is_empty(), "and it is still known by its digest");
+        assert_eq!(raw["n_missing"], 0, "a raw vector cannot hold NA, so this one is measured");
+        assert!(
+            r.get("n_missing_total").is_none() || r["n_missing_total"] == 0,
+            "the total is over the columns that were counted"
+        );
+
+        // A vector of the same type has nowhere else to put the count, so the
+        // record carries none rather than a zero over cells nobody read.
+        let v = by_name("vec_complex");
+        assert_eq!(s(&v, "type"), "complex");
+        assert!(
+            v.get("n_missing_total").is_none(),
+            "the complex vector reports {} missing over values it never looked at",
+            v["n_missing_total"]
+        );
+    }
+
     #[test]
     fn a_grid_is_summarised_whole() {
         // A matrix, an array and a raster have no columns to hang a summary
@@ -5238,6 +5767,14 @@ mod tests {
             // Read for their size rather than their contents: there is a
             // length and a fingerprint, and nothing to average.
             if matches!(s(&r, "type").as_str(), "raw" | "complex") {
+                continue;
+            }
+            // A wide frame of mixed types keeps every column and gives up the
+            // statistics rather than the other way round, and a frame past the
+            // cell cap never read a value to describe. Both are declared
+            // omissions, written on the record as column_detail, which is the
+            // one thing this test exists to catch the absence of.
+            if matches!(s(&r, "column_detail").as_str(), "reduced" | "structural") {
                 continue;
             }
             let has_own = r.get("mean").is_some()
@@ -5809,7 +6346,7 @@ mod tests {
     #[test]
     fn every_fixture_is_readable() {
         let recs = records();
-        assert_eq!(recs.len(), 118, "one record per saved object");
+        assert_eq!(recs.len(), 126, "one record per saved object");
         // Not everything saved under data/ is data. These carry behaviour rather
         // than observations, so there is nothing to fingerprint; what they must
         // still do is read cleanly, because a file that fails mid-object takes
@@ -5822,11 +6359,19 @@ mod tests {
         ];
         // Deliberately broken: R refuses it, so we must too.
         let unloadable = ["ws_ragged"];
+        // Deliberately too long to hold. The structure reads, no value does, and
+        // the record says exactly that, so there is nothing to fingerprint.
+        let unread = ["unread_columns"];
         for r in &recs {
             let name = s(r, "name");
             let notes = s(r, "notes");
             if unloadable.contains(&name.as_str()) {
                 assert_eq!(s(r, "confidence"), "degraded", "{name} should not load");
+                continue;
+            }
+            if unread.contains(&name.as_str()) {
+                assert_eq!(s(r, "confidence"), "degraded", "{name} read no value");
+                assert_eq!(notes, "value scan skipped (size cap)");
                 continue;
             }
             assert!(
@@ -5916,10 +6461,11 @@ mod tests {
         assert!(parse_table("a,b\n1,2\n", ',').is_some(), "a header plus a row is a table");
     }
 
-    /// Per-column detail is capped, and the cap must not move a fingerprint: the
-    /// hash covers every column even when the emitted list stops.
+    /// A wide table of one type is described whole, and the depth it was
+    /// described at must not move a fingerprint: the hash covers every column
+    /// however little of the column list is written.
     #[test]
-    fn wide_frames_cap_emitted_detail_without_moving_the_fingerprint() {
+    fn a_wide_uniform_table_writes_no_column_list_and_still_hashes_every_column() {
         let width = COLUMN_DETAIL_CAP + 40;
         let mut header = Vec::with_capacity(width);
         let mut row = Vec::with_capacity(width);
@@ -5927,19 +6473,20 @@ mod tests {
             header.push(format!("c{i}"));
             row.push(i.to_string());
         }
-        let text = format!("{}\n{}\n", header.join(","), row.join(","));
+        let text = format!("{}\n{}\n{}\n", header.join(","), row.join(","), row.join(","));
         let (cols, names, _) = parse_table(&text, ',').expect("a wide table still parses");
         let refs: Vec<&Node> = cols.iter().collect();
         let p = profile_columns(&refs, &names).expect("a wide frame profiles");
 
-        assert_eq!(p.columns.len(), COLUMN_DETAIL_CAP, "the emitted list stops at the cap");
+        assert_eq!(p.detail, ColumnDetail::None, "one type across the whole width");
+        assert!(p.columns.is_empty(), "no column list, rather than a truncated one");
         assert_eq!(names.len(), width, "while the real width is untouched");
 
-        // Changing a column PAST the cap must still change content_fp, which is
-        // what proves the hash was not truncated along with the list.
+        // Changing a column past the cap must still change content_fp, which is
+        // what proves the hash was not shortened along with the list.
         let mut row2 = row.clone();
         row2[width - 1] = "999999".to_string();
-        let text2 = format!("{}\n{}\n", header.join(","), row2.join(","));
+        let text2 = format!("{}\n{}\n{}\n", header.join(","), row2.join(","), row2.join(","));
         let (cols2, names2, _) = parse_table(&text2, ',').unwrap();
         let refs2: Vec<&Node> = cols2.iter().collect();
         let p2 = profile_columns(&refs2, &names2).unwrap();
@@ -5947,5 +6494,621 @@ mod tests {
             p.content_fp, p2.content_fp,
             "a column beyond the cap still contributes to the content fingerprint"
         );
+    }
+
+    /// A wide table of mixed types keeps every column. Each one is a different
+    /// variable, so a list that stopped at the cap dropped variables, and the
+    /// record said nothing about having dropped them.
+    #[test]
+    fn a_wide_mixed_table_keeps_every_column() {
+        let width = COLUMN_DETAIL_CAP + 40;
+        let mut header = Vec::with_capacity(width);
+        let mut row = Vec::with_capacity(width);
+        for i in 0..width {
+            header.push(format!("c{i}"));
+            row.push(if i % 2 == 0 { i.to_string() } else { format!("t{i}") });
+        }
+        let text = format!("{}\n{}\n{}\n", header.join(","), row.join(","), row.join(","));
+        let (cols, names, _) = parse_table(&text, ',').expect("a wide table still parses");
+        let refs: Vec<&Node> = cols.iter().collect();
+        let p = profile_columns(&refs, &names).expect("a wide frame profiles");
+
+        assert_eq!(p.detail, ColumnDetail::Reduced);
+        assert_eq!(p.columns.len(), width, "every column, none of them dropped");
+        assert_eq!(p.columns[width - 1]["name"], format!("c{}", width - 1));
+    }
+
+    /// A wide frame whose columns are all one type gets the treatment a matrix
+    /// gets, because that is what it is. Six hundred numeric columns profiled
+    /// one at a time is the same sentence six hundred times, and the object
+    /// that most needs an aggregate was getting neither an aggregate nor a
+    /// complete list.
+    #[test]
+    fn a_wide_frame_of_one_type_is_summarised_whole() {
+        let r = by_name("wide_homogeneous");
+        assert_eq!(s(&r, "column_detail"), "none");
+        assert!(r.get("columns").is_none(), "no column list, rather than a truncated one");
+        assert_eq!(r["ncol"], 600, "and the true width is still on the record");
+        assert_eq!(r["n_cells"], 3600, "the grid the values sit in");
+        assert_eq!(s(&r, "summary_over"), "cells");
+        assert!(r.get("mean").is_some(), "the values are described whole");
+        assert_eq!(r["n_missing_total"], 1, "the one missing cell is still counted");
+        assert!(r.get("row_mean_sd").is_some(), "and each margin is summarised");
+        assert!(r.get("col_mean_sd").is_some());
+        assert!(r.get("content_fp").is_some(), "the fingerprints still cover every column");
+    }
+
+    /// The whole-object treatment has to BE the matrix treatment rather than a
+    /// second one that drifts from it, so the same numbers stored both ways
+    /// have to describe themselves identically.
+    #[test]
+    fn a_uniform_frame_and_the_same_numbers_as_a_matrix_agree() {
+        let f = by_name("wide_homogeneous");
+        let m = by_name("wide_as_matrix");
+        for k in [
+            "mean", "median", "q1", "q3", "sd", "col_min", "col_max", "skewness", "kurtosis",
+            "row_mean_min", "row_mean_median", "row_mean_mean", "row_mean_max", "row_mean_sd",
+            "col_mean_min", "col_mean_median", "col_mean_mean", "col_mean_max", "col_mean_sd",
+            "n_missing_total", "n_unique", "summary_over", "content_fp",
+        ] {
+            assert_eq!(f[k], m[k], "{k} differs between the frame and the matrix of the same numbers");
+        }
+        assert_eq!(f["n_cells"], m["length"], "the same number of cells either way");
+    }
+
+    /// A wide frame of mixed types keeps every column. Each one is a variable of
+    /// its own, so a list that stopped at the cap lost variables outright, and
+    /// the statistics are what goes instead.
+    #[test]
+    fn a_wide_frame_of_mixed_types_keeps_every_column_at_less_depth() {
+        let r = by_name("wide_heterogeneous");
+        assert_eq!(s(&r, "column_detail"), "reduced");
+        let cols = r["columns"].as_array().unwrap();
+        assert_eq!(cols.len(), 600, "every column is there");
+        let kinds: HashSet<&str> =
+            cols.iter().filter_map(|c| c["type"].as_str()).collect();
+        assert!(kinds.len() > 1, "the fixture is heterogeneous: {kinds:?}");
+        for c in cols {
+            for k in ["name", "type", "n_missing", "n_unique"] {
+                assert!(c.get(k).is_some(), "{} has no {k}", c["name"]);
+            }
+        }
+        for k in [
+            "mean", "median", "q1", "q3", "sd", "skewness", "kurtosis", "n_outliers",
+            "mode_value", "sort_order", "max_missing_run", "col_fp", "col_min", "col_max",
+        ] {
+            assert!(
+                cols.iter().all(|c| c.get(k).is_none()),
+                "{k} is not carried at reduced depth"
+            );
+        }
+        assert!(r.get("row_mean_sd").is_none(), "and no aggregate is invented for it");
+    }
+
+    /// Reduced depth gives up statistics, not identity. An sf frame's extent and
+    /// projection are read off its geometry column and lifted onto the record,
+    /// so a depth that dropped that column's fields would leave a spatial object
+    /// with no geography on it at all.
+    #[test]
+    fn a_wide_spatial_frame_still_knows_where_it_is() {
+        let r = by_name("wide_sf");
+        assert_eq!(s(&r, "column_detail"), "reduced");
+        assert_eq!(r["is_spatial"], true);
+        assert_eq!(s(&r, "geom_type"), "POINT");
+        assert_eq!(r["n_geometries"], 6);
+        assert_eq!(r["crs_epsg"], 4326);
+        assert_eq!(r["bbox"], serde_json::json!([1.0, 2.0, 11.0, 12.0]));
+        let cols = r["columns"].as_array().unwrap();
+        assert_eq!(cols.len(), 601, "the geometry column plus the six hundred others");
+        let geo = cols.iter().find(|c| c["name"] == "geom").expect("the geometry column is listed");
+        assert_eq!(geo["is_geometry"], true);
+        // And it is the only one that grew: the rest stay at identifying fields.
+        assert!(
+            cols.iter().filter(|c| c.get("bbox").is_some()).count() == 1,
+            "only the geometry column carries an extent"
+        );
+    }
+
+    /// The depth that gives up the column list promises an aggregate in its
+    /// place, and past the cell cap that aggregate cannot be taken: the columns
+    /// are not laid end to end into the one vector it is a summary over.
+    /// Deciding the depth on width and one type alone therefore wrote a record
+    /// with no column list, nothing in place of it, and a confidence of `exact`
+    /// over the silence, which is worse than the truncation the depths replace.
+    #[test]
+    fn a_frame_too_big_to_lay_flat_keeps_its_columns() {
+        let ncol = COLUMN_DETAIL_CAP + 1;
+        let nrow = CELL_CAP / ncol + 1;
+        assert!(nrow * ncol > CELL_CAP, "the frame has to be past the cell cap to test anything");
+        let cols: Vec<Node> = (0..ncol)
+            .map(|_| Node {
+                val: Val::Ints {
+                    len: nrow,
+                    vals: (0..nrow).map(|i| (i % 97) as i32).collect(),
+                    logical: false,
+                },
+                attr: None,
+            })
+            .collect();
+        let refs: Vec<&Node> = cols.iter().collect();
+        let names: Vec<String> = (0..ncol).map(|j| format!("v{j}")).collect();
+
+        // One type across the whole width, which is the condition that used to
+        // decide this on its own.
+        assert_eq!(one_base_type(&refs), Some("integer"));
+        assert!(flatten_columns(&refs).is_none(), "and yet the aggregate cannot be produced");
+        assert_ne!(column_detail(&refs), ColumnDetail::None, "so no depth may promise one");
+
+        let p = profile_columns(&refs, &names).expect("a wide frame still profiles");
+        let mut rec = json!({ "ncol": ncol, "confidence": "exact" });
+        attach_profile(&mut rec, p, &refs);
+
+        let listed = rec["columns"].as_array().map(|c| c.len()).unwrap_or(0);
+        assert!(
+            listed > 0 || rec.get("summary_over").is_some(),
+            "a record with neither a column list nor an aggregate describes nothing at all"
+        );
+        assert_eq!(listed, ncol, "every column is kept instead, none of them dropped");
+        assert_eq!(s(&rec, "column_detail"), "reduced");
+        assert_eq!(s(&rec, "confidence"), "exact", "nothing here was measured wrongly");
+    }
+
+    /// The same defence at the point the record is written. However the depth
+    /// was arrived at, a record that has given up its column list and then
+    /// cannot produce the aggregate has to say so, rather than go quiet and
+    /// call itself exact.
+    #[test]
+    fn a_promised_aggregate_that_cannot_be_taken_is_said_on_the_record() {
+        // Columns of different lengths are not a grid, so there is nothing to
+        // lay flat and no margins to summarise.
+        let a = Node { val: Val::Reals { len: 3, vals: vec![1.0, 2.0, 3.0] }, attr: None };
+        let b = Node { val: Val::Reals { len: 2, vals: vec![4.0, 5.0] }, attr: None };
+        let refs: Vec<&Node> = vec![&a, &b];
+        let p = Profile {
+            detail: ColumnDetail::None,
+            columns: Vec::new(),
+            n_missing_total: Some(0),
+            schema_fp: String::new(),
+            shape_fp: String::new(),
+            content_fp: String::new(),
+            row_sketch: Vec::new(),
+            capped: false,
+        };
+        let mut rec = json!({ "confidence": "exact" });
+        attach_profile(&mut rec, p, &refs);
+
+        assert!(rec.get("columns").is_none(), "the list was given up");
+        assert!(rec.get("summary_over").is_none(), "and the aggregate could not be taken");
+        assert_ne!(s(&rec, "confidence"), "exact", "so the record cannot claim to be exact");
+        assert!(!s(&rec, "notes").is_empty(), "and it has to say what is missing");
+    }
+
+    /// A wide frame with no rows is the one object that gives up its column
+    /// list and needs no aggregate to replace it: there are no values, which
+    /// `nrow` and `n_cells` say between them, and a per-column list would be a
+    /// name and four zeroes for each of however many columns there are. A
+    /// malformed wide file parses to exactly this shape with two and a half
+    /// million of them.
+    #[test]
+    fn a_wide_frame_with_no_rows_says_it_holds_nothing() {
+        let r = by_name("wide_empty");
+        assert_eq!(s(&r, "column_detail"), "none");
+        assert_eq!(r["ncol"], 600);
+        assert_eq!(r["nrow"], 0);
+        assert_eq!(r["n_cells"], 0, "and the count of cells says there are none");
+        assert!(r.get("columns").is_none(), "no list of six hundred vacant columns");
+        assert!(r.get("summary_over").is_none(), "no summary of values that are not there");
+        assert_eq!(s(&r, "confidence"), "exact", "nothing about it is uncertain");
+    }
+
+    /// A frame whose columns were never read lists every column and describes
+    /// none of them, which is a different list from the one a wide frame of
+    /// mixed types carries. Both wearing one label is how a consumer builds a
+    /// column specification around fields that are never there.
+    #[test]
+    fn a_frame_read_without_its_values_says_so_at_its_own_depth() {
+        let r = by_name("unread_columns");
+        assert_eq!(s(&r, "column_detail"), "structural");
+        assert_eq!(s(&r, "confidence"), "degraded");
+        assert_eq!(s(&r, "notes"), "value scan skipped (size cap)");
+        assert_eq!(r["nrow"], 9_000_000i64, "the width is not what put it here");
+        assert_eq!(r["ncol"], 3);
+        let cols = r["columns"].as_array().expect("every column is still listed");
+        assert_eq!(cols.len(), 3);
+        for c in cols {
+            for k in ["name", "type", "is_factor"] {
+                assert!(c.get(k).is_some(), "{} has no {k}", c["name"]);
+            }
+            for k in ["n_missing", "n_unique"] {
+                assert!(c.get(k).is_none(), "{} claims {k} with no value read", c["name"]);
+            }
+        }
+        assert!(r.get("content_fp").is_none(), "no value was read, so nothing is fingerprinted");
+    }
+
+    /// An attribute pairlist, so a node of a given shape can be built here
+    /// without a fixture file of the size that shape implies.
+    fn attrs(items: &[(&str, Node)]) -> Option<Box<Node>> {
+        let mut cur = Node { val: Val::Nil, attr: None };
+        for (k, v) in items.iter().rev() {
+            cur = Node {
+                val: Val::List {
+                    tag: Box::new(Node { val: Val::Sym((*k).to_string()), attr: None }),
+                    car: Box::new(v.clone()),
+                    cdr: Box::new(cur),
+                },
+                attr: None,
+            };
+        }
+        Some(Box::new(cur))
+    }
+    fn strs(v: &[&str]) -> Node {
+        Node { val: Val::Str(v.iter().map(|s| Some((*s).to_string())).collect()), attr: None }
+    }
+    fn ints(v: &[i32]) -> Node {
+        Node { val: Val::Ints { len: v.len(), vals: v.to_vec(), logical: false }, attr: None }
+    }
+    /// A column of `len` doubles the reader declined to hold, which is what the
+    /// value pass leaves behind past the cell cap: the length is known, not one
+    /// cell of it is, and the digest is what it took of the bytes on the way
+    /// past.
+    fn dropped_reals(len: usize) -> Node {
+        let digest = fnv(&(len as u64).to_be_bytes());
+        Node { val: Val::Blob { len, of: "numeric", digest: Some(digest) }, attr: None }
+    }
+    /// The same thing with a shape on it: a grid the reader went past.
+    fn dropped_grid(nr: usize, nc: usize) -> Node {
+        let mut g = dropped_reals(nr * nc);
+        g.attr = attrs(&[("dim", ints(&[nr as i32, nc as i32]))]);
+        g
+    }
+    fn describe_here(name: &str, node: &Node) -> Value {
+        describe(name, "data/x.rda", node, "rda", 3, "none", false, 0)
+    }
+
+    /// Past the cell cap the reader keeps a vector's length and drops its
+    /// values. A column left that way is still a `Reals`, so every count taken
+    /// over it was taken over an empty slice and came out zero: no missing
+    /// values in a column that has them, no distinct values in nine million,
+    /// and a fingerprint over nothing, which is the same fingerprint for every
+    /// object this happens to. A record cannot report a measurement it did not
+    /// take.
+    #[test]
+    fn a_frame_whose_cells_the_cap_dropped_measures_nothing() {
+        let n = CELL_CAP + 1;
+        let node = Node {
+            val: Val::Vec(vec![dropped_reals(n), dropped_reals(n)]),
+            attr: attrs(&[
+                ("names", strs(&["a", "b"])),
+                ("class", strs(&["data.frame"])),
+                ("row.names", ints(&[NA_INT, -(n as i32)])),
+            ]),
+        };
+        let r = describe_here("tall_real", &node);
+
+        assert_eq!(r["ncol"], 2);
+        assert_eq!(r["nrow"], n as i64, "the length is the one thing that was read");
+        assert_eq!(s(&r, "column_detail"), "structural");
+        assert_eq!(s(&r, "confidence"), "degraded");
+        assert!(!s(&r, "notes").is_empty(), "and it says why");
+        let cols = r["columns"].as_array().expect("every column is still listed");
+        assert_eq!(cols.len(), 2);
+        for c in cols {
+            for k in ["n_missing", "n_unique", "col_fp"] {
+                assert!(c.get(k).is_none(), "{} claims {k} with no cell read", c["name"]);
+            }
+        }
+        assert!(r.get("n_missing_total").is_none(), "nothing was counted as missing");
+        assert!(
+            r.get("row_sketch").is_none(),
+            "and no row was assembled, so there is nothing to sketch"
+        );
+        // Counting nothing is not the same as being nothing. The bytes went
+        // past the reader and were hashed on the way, so the object keeps an
+        // identity even though no statistic can be taken off it.
+        for k in ["content_fp", "schema_fp", "shape_fp"] {
+            assert!(
+                !s(&r, k).is_empty(),
+                "the frame carries no {k}, so a consumer keyed on one drops it outright"
+            );
+        }
+    }
+
+    /// The identity of a value the reader went past.
+    ///
+    /// Nothing built by hand can settle this one. The question is what the
+    /// reader does with bytes it does not keep, so the bytes have to go
+    /// through it, which means a real serialized vector past the cell cap.
+    /// Two of them one value apart were the same dataset before: every object
+    /// the cap ever touched hashed to one of four values, and a 149 million
+    /// cell matrix and a 131 million cell matrix were recorded as the same
+    /// data.
+    #[test]
+    fn a_value_the_cap_skipped_is_still_told_apart_from_another() {
+        let dir = std::env::temp_dir().join("rpkg-analyzer-skipped-identity");
+        std::fs::create_dir_all(&dir).expect("a directory to write into");
+        let n = CELL_CAP + 1;
+        let read_back = |stem: &str, name: &str| -> Value {
+            let path = dir.join(format!("{stem}.rds"));
+            let objs = read_file(&path).expect("the vector reads back");
+            let (_, node, ..) = &objs[0];
+            describe(name, "data/x.rds", node, "rds", 2, "none", false, 0)
+        };
+        write_ints_rds(&dir.join("a.rds"), n, 0);
+        write_ints_rds(&dir.join("c.rds"), n, n - 1);
+
+        let a = read_back("a", "a");
+        let renamed = read_back("a", "under_another_name");
+        let c = read_back("c", "c");
+        for f in [&a, &c] {
+            assert_eq!(f["length"], n as i64, "the length is what the cap keeps");
+            assert_eq!(s(f, "confidence"), "degraded", "and no cell of it was read");
+        }
+        assert!(
+            !s(&a, "content_fp").is_empty(),
+            "a value the cap skipped has no identity, so it leaves the catalogue"
+        );
+        assert_eq!(
+            s(&a, "content_fp"),
+            s(&renamed, "content_fp"),
+            "the same bytes under another name are the same data"
+        );
+        assert_ne!(
+            s(&a, "content_fp"),
+            s(&c, "content_fp"),
+            "and one value apart is not"
+        );
+        for stem in ["a", "c"] {
+            let _ = std::fs::remove_file(dir.join(format!("{stem}.rds")));
+        }
+    }
+
+    /// An integer vector serialized the way `save(compress = FALSE)` writes
+    /// one: uncompressed XDR, no attributes, `hot` set to 1 and the rest 0.
+    fn write_ints_rds(path: &std::path::Path, n: usize, hot: usize) {
+        let mut b: Vec<u8> = Vec::with_capacity(18 + 4 * n);
+        b.extend_from_slice(b"X\n");
+        // Serialization version, the R that wrote it, the oldest that can read
+        // it. Only the first is looked at.
+        for v in [2i32, 0x0004_0400, 0x0002_0300] {
+            b.extend_from_slice(&v.to_be_bytes());
+        }
+        b.extend_from_slice(&(INTSXP as i32).to_be_bytes());
+        b.extend_from_slice(&(n as i32).to_be_bytes());
+        for i in 0..n {
+            let v: i32 = if i == hot { 1 } else { 0 };
+            b.extend_from_slice(&v.to_be_bytes());
+        }
+        std::fs::write(path, &b).expect("write the serialized vector");
+    }
+
+    /// The same cap, and the same silence required of it, on the grid that has
+    /// no columns to hang the counts on. A matrix past the cap summarised an
+    /// empty slice as its cells: a distinct count of zero, no missing values in
+    /// a grid that has them, and `exact` over the lot.
+    #[test]
+    fn a_grid_whose_cells_the_cap_dropped_measures_nothing() {
+        let node = dropped_grid(3000, 3000);
+        let r = describe_here("big_matrix", &node);
+
+        assert_eq!(r["nrow"], 3000);
+        assert_eq!(r["ncol"], 3000);
+        assert_eq!(r["length"], 9_000_000i64);
+        for k in ["n_unique", "n_missing_total", "summary_over", "mean", "row_sketch"] {
+            assert!(r.get(k).is_none(), "the grid reports {k} with no cell read");
+        }
+        assert_eq!(s(&r, "confidence"), "degraded");
+        assert!(!s(&r, "notes").is_empty(), "and it says why");
+        for k in ["content_fp", "schema_fp", "shape_fp"] {
+            assert!(!s(&r, k).is_empty(), "the grid carries no {k} to be known by");
+        }
+    }
+
+    /// The margins of a grid whose cells were never read.
+    ///
+    /// `margin_summaries` walked every cell before finding out there were
+    /// none. The accessor it builds over a dropped vector answers "missing" to
+    /// every position, so the largest such object in the published corpus, a
+    /// 26,687 by 5,593 matrix, cost 149,260,391 closure calls to produce no
+    /// field at all. No field is written either way, so the only observable
+    /// difference is that the walk is not made.
+    #[test]
+    fn a_grid_the_cap_skipped_is_not_averaged_across() {
+        let (nr, nc) = (26_687usize, 5_593usize);
+        let node = dropped_grid(nr, nc);
+        let started = std::time::Instant::now();
+        let r = describe_here("big_matrix", &node);
+        let took = started.elapsed();
+
+        for k in ["row_mean_mean", "row_mean_sd", "col_mean_mean", "col_mean_sd"] {
+            assert!(r.get(k).is_none(), "the grid reports {k} over cells it never read");
+        }
+        assert!(
+            took < std::time::Duration::from_millis(200),
+            "describing a grid of {} unread cells took {took:?}, which is the per-cell \
+             walk still being made",
+            nr * nc
+        );
+    }
+
+    /// What a grid holds, whether or not its cells were read.
+    ///
+    /// The element type is read off the object and has nothing to do with the
+    /// value pass. A grid took its `type` out of the summary over its cells,
+    /// so once the summary stopped being taken over cells nobody read, the
+    /// type went with it: a 3000 by 3000 matrix of doubles came back saying
+    /// nothing about what was in it. The bare vector in the same position has
+    /// always said, because it reads the type off the value.
+    #[test]
+    fn a_grid_says_what_it_holds_whether_or_not_its_cells_were_read() {
+        let read = by_name("mat_named"); // matrix(1:12, nrow = 3)
+        assert_eq!(s(&read, "type"), "integer", "a grid whose cells were read");
+
+        let skipped = describe_here("big_matrix", &dropped_grid(3000, 3000));
+        assert_eq!(s(&skipped, "type"), "numeric", "and one whose cells were not");
+        let v = describe_here("big_vector", &dropped_reals(CELL_CAP + 1));
+        assert_eq!(s(&v, "type"), s(&skipped, "type"), "the two paths agree");
+    }
+
+    /// One type is not on its own a reason to give up per-column detail. A
+    /// narrow all-numeric frame is exactly the case where the per-column means
+    /// and ranges are the description.
+    #[test]
+    fn one_type_does_not_cost_a_narrow_frame_its_detail() {
+        let r = by_name("narrow_homogeneous");
+        assert_eq!(s(&r, "column_detail"), "full");
+        let cols = r["columns"].as_array().unwrap();
+        assert_eq!(cols.len(), 8);
+        assert!(cols.iter().all(|c| c.get("mean").is_some()), "every column keeps its own mean");
+        assert!(cols.iter().all(|c| c.get("q1").is_some()), "and its own quantiles");
+        assert!(r.get("row_mean_sd").is_none(), "the whole-object form is not imposed on it");
+        assert!(r.get("summary_over").is_none());
+    }
+
+    /// The depth is on the record whether or not it cost anything, so a
+    /// consumer reads the rule rather than inferring it from which fields
+    /// happen to be absent. And an object with no column structure at all does
+    /// not carry the field, because there is no list for it to describe.
+    #[test]
+    fn every_record_with_column_structure_says_how_deep_it_goes() {
+        for r in records() {
+            let name = s(&r, "name");
+            let tier = s(&r, "column_detail");
+            match r.get("columns") {
+                Some(_) => assert!(
+                    tier == "full" || tier == "reduced" || tier == "structural",
+                    "{name} carries a column list and calls its depth {tier:?}"
+                ),
+                None if !tier.is_empty() => {
+                    assert_eq!(tier, "none", "{name} has no column list and calls its depth {tier:?}");
+                    assert!(
+                        r["ncol"].as_u64().unwrap_or(0) > COLUMN_DETAIL_CAP as u64,
+                        "{name} gave up its column list below the cap"
+                    );
+                    // The whole of what the depth is for: the list is given up
+                    // in exchange for an aggregate, so a record carrying
+                    // neither says nothing about its values while reading as
+                    // though it had been measured. An object with no cells is
+                    // the one exception, and it is not silence: it has no
+                    // values, and n_cells of zero states that.
+                    let cells = r["n_cells"].as_u64();
+                    assert!(cells.is_some(), "{name} gave up its column list and states no size");
+                    assert!(
+                        cells == Some(0) || r.get("summary_over").is_some(),
+                        "{name} gave up its column list and put nothing in its place"
+                    );
+                }
+                None => {}
+            }
+        }
+    }
+
+    /// Kinds that never had a column list must not grow one, or a claim about
+    /// the depth of something that has no columns.
+    #[test]
+    fn a_grid_or_a_vector_says_nothing_about_column_depth() {
+        for r in records() {
+            let kind = s(&r, "kind");
+            if !matches!(kind.as_str(), "matrix" | "array" | "vector" | "list" | "graph") {
+                continue;
+            }
+            assert!(
+                r.get("column_detail").is_none(),
+                "{} is a {kind} and claims a column depth",
+                s(&r, "name")
+            );
+            assert!(r.get("columns").is_none(), "{} is a {kind} and carries columns", s(&r, "name"));
+        }
+    }
+
+    /// The vocabulary a column's `type` is drawn from is closed, and the
+    /// README is where a consumer building a column specification learns it.
+    /// A value appearing that the file does not name is a specification with a
+    /// case missing; a value the file names that nothing produces is a case
+    /// nobody needs. Both directions are checked here.
+    #[test]
+    fn the_readme_names_every_type_a_column_can_be() {
+        // Every arm of base_type, written out once. `unknown` is the arm for a
+        // value this reader holds no representation of, which no fixture
+        // produces and the file still has to name.
+        let vocabulary = [
+            "logical", "integer", "numeric", "character", "factor", "Date", "POSIXct",
+            "list", "raw", "complex", "unknown",
+        ];
+        let readme = std::fs::read_to_string("README.md").expect("read README.md");
+        for t in vocabulary {
+            assert!(
+                readme.contains(&format!("`{t}`")),
+                "the README does not name `{t}`, which a column's type can be"
+            );
+        }
+        for r in records() {
+            let mut seen: Vec<String> = vec![s(&r, "type")];
+            for c in r["columns"].as_array().into_iter().flatten() {
+                seen.push(s(c, "type"));
+            }
+            for t in seen.iter().filter(|t| !t.is_empty()) {
+                assert!(
+                    vocabulary.contains(&t.as_str()),
+                    "{} holds a column of type {t}, which is not in the vocabulary",
+                    s(&r, "name")
+                );
+            }
+        }
+    }
+
+    /// A record never says that the reader stopped early: an extdata walk that
+    /// hit its cap looks exactly like a package with 200 files, and a truncated
+    /// attribute list looks exactly like an object with 24 attributes. That
+    /// makes every downstream census of these a floor rather than a total, and
+    /// the README is the only place a consumer can learn it. So the numbers
+    /// there are these numbers, and moving a cap without saying so fails here.
+    #[test]
+    fn the_readme_states_the_bounds_the_records_do_not() {
+        let readme = std::fs::read_to_string("README.md").expect("read README.md");
+        for (what, phrase) in [
+            ("the extdata file cap", format!("{EXTDATA_FILE_CAP} files")),
+            ("the extdata walk depth", format!("depth {EXTDATA_DEPTH}")),
+            ("the leftover-attribute cap", format!("{ATTRS_OTHER_CAP} entries")),
+            ("the row sketch size", format!("bottom-{SKETCH_K}")),
+            ("the per-column detail cap", format!("{COLUMN_DETAIL_CAP} columns")),
+            ("the cell cap", format!("{CELL_CAP} values")),
+            // The cap is against the length of one vector. Stating it as the
+            // object's cell count instead is the difference between a 600 by
+            // 14,000 frame being fully measured, which it is, and its being
+            // read for structure alone.
+            ("what the cell cap is against", "not the cell count of the object".to_string()),
+            // Two column types carry no distinct count, and a consumer building
+            // a column specification off this file has to know which.
+            ("the columns that carry no distinct count", "no `n_unique`".to_string()),
+            // And the one that carries no missing count either, for the same
+            // reason: its cells were never looked at, so none of them was ever
+            // found missing.
+            ("the column that carries no missing count", "no `n_missing`".to_string()),
+            // A record for an object the cap skipped is identified by a hash
+            // of its bytes and by nothing taken over its rows, and a consumer
+            // matching on row sketches has to know that one is missing rather
+            // than empty.
+            ("the key a skipped object does not carry", "no `row_sketch`".to_string()),
+            (
+                "the column depth vocabulary",
+                "`column_detail` is `full`, `reduced`, `none` or `structural`".to_string(),
+            ),
+            // The bound that fires first for a character or a list column, and
+            // the only one that gives up a whole file rather than an object.
+            ("the item budget", format!("{ITEM_BUDGET} items")),
+            // Past this a column keeps its mean and loses its quartiles, and
+            // everything worked out off the sorted copy goes with them.
+            ("the quantile cap", format!("{QUANTILE_CAP} values")),
+            ("the mode cardinality cap", format!("{MODE_CARDINALITY_CAP} distinct values")),
+            // The length rule is on three types and the file says which, since
+            // a character column of that size never reaches it.
+            ("which types the length rule is on", "`logical`, `integer` and `numeric`".to_string()),
+        ] {
+            assert!(
+                readme.contains(&phrase),
+                "the README does not state {what}: no \"{phrase}\" in it"
+            );
+        }
     }
 }

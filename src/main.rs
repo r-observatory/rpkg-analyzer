@@ -3720,3 +3720,37 @@ fn main() {
         println!("{rec}");
     }
 }
+
+// ---- tests ------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn version_parts(v: &str) -> Vec<u64> {
+        v.split('.')
+            .map(|p| p.parse::<u64>().expect("version component is a number"))
+            .collect()
+    }
+
+    /// The summary record carries `analyzer_version`, and the pipelines decide
+    /// from it whether the rows they already hold were written by a build that
+    /// reads datasets the way this one does. The last release of the narrower reader
+    /// was 0.3.2, so a tree that still calls itself 0.3.2 is indistinguishable
+    /// from that release and no rescan downstream can ever fire. Any build
+    /// carrying the wider reader has to announce a version past it.
+    #[test]
+    fn analyzer_version_is_past_the_last_narrow_reader_release() {
+        let parts = version_parts(ANALYZER_VERSION);
+        assert!(
+            parts.len() >= 3,
+            "ANALYZER_VERSION is {ANALYZER_VERSION}, which a consumer cannot compare \
+             component-wise against a released tag"
+        );
+        assert!(
+            version_ge(&parts, &[0, 4, 0]),
+            "ANALYZER_VERSION is {ANALYZER_VERSION}, at or below the 0.3.2 release that \
+             shipped the narrower dataset reader"
+        );
+    }
+}

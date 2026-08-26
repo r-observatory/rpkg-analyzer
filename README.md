@@ -10,6 +10,8 @@ an archive.
 
 ```
 rpkg-analyzer <package_dir>        # NDJSON to stdout
+rpkg-analyzer --datasets <dir>     # the dataset records only, nothing else
+rpkg-analyzer --version            # the build that would write them
 rpkg-analyzer --sexp  <file>       # debug: print the tree-sitter parse tree
 rpkg-analyzer --kinds <file>       # debug: node-kind histogram
 ```
@@ -26,9 +28,11 @@ One `summary` record per run, followed by intermediate records:
 | `function` | R or compiled function | `lang` (`r`/`c`/`cpp`/`rust`/`fortran`), `name`, `file`, `line`, `loc`; R nodes also `exported`, `n_params`, `cyclocomp` |
 | `call_edge` | one call-graph edge | `graph` (`r`/`native`/`c`/`rust`/`fortran`), `from`, `to` |
 | `dcf` | package version | every DESCRIPTION field verbatim (the catch-all) |
-| `dataset` | dataset under `data/` or `R/sysdata.rda` | `name`, `file`, `format`, `compression`, `class`, `nrow`, `ncol`, `columns[]` (`name`, `type`, `n_missing`, `n_unique`, `col_min`/`col_max`, `col_fp`), `schema_fp`, `shape_fp`, `content_fp`, `row_sketch`, `confidence` |
+| `dataset` | object shipped under `data/`, `R/sysdata.rda`, or `inst/extdata` | `name`, `file`, `origin_dir`, `format`, `compression`, `class`, `kind`, `nrow`, `ncol`, `column_detail`, `columns[]`, `schema_fp`, `shape_fp`, `content_fp`, `row_sketch`, `confidence`; see [Dataset records](#dataset-records) |
 
-The `dataset` records come from reading R's serialization format (`.rda`/`.rds`/`.RData`) and delimited text (`.csv`/`.tab`) directly, with no R: the reader walks each object for its class, dimensions, and per-column names/types/factor levels, then makes one bounded value pass for the missing/unique/range profile and the fingerprints. The fingerprints identify the same or similar datasets across packages: `content_fp` matches identical data regardless of packaging, `schema_fp` matches the same columns and types, and `row_sketch` (a bottom-k row hash) estimates row overlap for subsets and near-duplicates. S4 objects report their class (and dimensions for common Bioconductor containers); `.R` data scripts are flagged as needing R.
+The summary record also carries `analyzer_version`, the build that wrote it. A consumer storing these results needs it to tell rows it has already collected from rows a newer build would describe differently, which is what makes a rescan decidable rather than a guess.
+
+The `dataset` records are described in full under [Dataset records](#dataset-records) below.
 
 The `function` records are the graph's nodes (R and compiled alike, tagged by
 `lang`, each with file/line/loc) and the `call_edge` records its edges, so the
@@ -45,6 +49,116 @@ languages stays distinct. On data.table that is one connected structure of about
 
 The `dcf` record preserves the full parsed DESCRIPTION so any field can be
 promoted to a metric later without re-reading the source.
+
+## Dataset records
+
+One `dataset` record per object a package ships. The values are read straight out of R's serialization format (`.rda`, `.rds`, `.RData`) or out of delimited text, with no R runtime and no evaluation of package code, so a version pulled from an archive reads the same way a current release does.
+
+### Where they come from
+
+Three places, and `origin_dir` says which one a record came from.
+
+`data/` is the loadable catalogue, so only the extensions `data()` itself dispatches on are opened, in `data()`'s own precedence order. A package that ships one name twice (`mtcars.rda` beside `mtcars.csv`) gets one record, for the file `data()` would actually load, because the other copy is not reachable by that name. An `.rds` here is not opened at all: `data()` cannot load one, and in an installed tree `data/Rdata.rds` is the lazy-load index rather than a dataset, which once put a fingerprinted dataset called `Rdata` in the catalogue for every package.
+
+A `.tsv` or a `.dat` under `data/` gets no record at all, for the same reason: `data()` does not dispatch on those extensions, so a row for one would put a dataset in the catalogue that nobody can reach. Of the text formats it does dispatch on, `.csv` is read with a semicolon and `.tab` and `.txt` with whitespace, which is what `data()` itself does and not what the extension usually means elsewhere.
+
+`R/sysdata.rda` holds objects the package uses internally. These get records with `internal` true and `origin_dir` `sysdata`: they are real data the package carries, but nothing outside the package can load them by name.
+
+`inst/extdata` (or `extdata`, in an installed tree) is covered too, under the rules in [inst/extdata](#instextdata) below.
+
+`file` is the path relative to the package root. `title` is the title of the Rd help page whose alias matches the dataset name, when the package documents it, so a catalogue row can say what the data is rather than only what it is called.
+
+### How much of it was read
+
+Every record carries `confidence`, and this is the whole vocabulary:
+
+- `exact`: the object was read as itself. Its class, its dimensions, its columns and their values were all seen, and the fingerprints below cover the data.
+- `degraded`: something is described, but not everything. A class with no reader of its own arrives as its class name plus whatever its attributes give up; a delimited text file has its column types inferred rather than declared; an object holding a vector past the cell cap keeps its structure and drops the value pass; a file that would not parse carries the reader's own message. `notes` says which of these happened.
+- `needs_r`: an `.R` script under `data/`. Only R can evaluate one, so nothing but the file itself is described.
+
+A `degraded` record is not a failure to be filtered out. It is the difference between what was measured and what exists, stated on the row, and a consumer that treats it as missing data throws away most of what Bioconductor ships.
+
+### What a record carries
+
+Provenance and format: `name`, `file`, `origin_dir` (`data`, `sysdata`, `extdata`), `internal`, `title`, `format` (`rda`, `rds`, `csv`, `tsv`, `tab`, `psv`, `txt`, `script`), `format_version` (R's serialization version, 1, 2 or 3), `compression` (`none`, `gzip`, `bzip2`, `xz`), `compressed_bytes`.
+
+Class and shape: `class` (the class vector as written, slash-joined), `kind` (`data.frame`, `matrix`, `array`, `vector`, `list`, `table`, `graph`, `object`, or the class name for a container with a reader of its own), `nrow`, `ncol`, `dim`, `n_dim`, `length`, `n_cells`, `has_rownames`, `has_dimnames`, `dimnames` (per margin, the labels and how many there are), `frame_class` (which flavour of data frame), `object_system` (`S4`, `R6`, `RefClass`, `S7`) and `s4_package`.
+
+`columns[]` is one object per column: `name`, `type` and `col_fp` on every column, `n_missing` on every column but `complex`, `n_unique` on every column but `complex` and `raw`, and then whatever the type supports. Those two are the ones whose elements this reader does not keep. The whole vector is hashed on the way past instead, so every cell of one carries the same digest and a distinct count taken off those digests would say 1 however many different values are in there. It never looks at a value of either, which is also why it never finds one missing: on a `complex` column that is a count it cannot take, and three NAs in ten came back as none, so the field is left off. A `raw` vector has no missing value to find, R has none of that kind, so its 0 is a fact about the type and stays. The same exceptions apply at `reduced` depth below. `type` is drawn from a closed list: `logical`, `integer`, `numeric`, `character`, `factor`, `Date`, `POSIXct`, `list`, `raw`, `complex`, and `unknown` for a value this reader holds no representation of. The first three of those are decided by what the column is made of, `factor`, `Date` and `POSIXct` by its class, so a factor reports `factor` and never `integer`.
+
+Past those, every field is conditional, on the type of the column and on what its values turn out to be, and a consumer building a column specification off this file should treat each of them as one that can be absent. The conditions, with how often each held over 2,151 profiled columns of real packages and fixtures:
+
+- Numeric columns (`integer`, `numeric`, and `Date` and `POSIXct`, which are numbers underneath) add `col_min`, `col_max`, `mean`, `n_zero` and `p_zero` where at least one value is finite; `median`, `q1` and `q3` beside them where the column is also no longer than 5000000 values, past which holding a second sorted copy of it to take quantiles from stops being worth the memory; `sd` and `sort_order` (`ascending`, `descending`, `constant`, `unsorted`) where at least two values are finite; `skewness` and `kurtosis` where at least three are and the spread is not zero, which is 1,749 of 1,752 numeric columns; `n_outliers` with `n_outliers_low` and `n_outliers_high`, counted against the fences a boxplot would draw, where the quartiles are apart and something falls outside them, which is 820 of 1,752; `mode_value` with `mode_share` where the column has between 2 and 20 distinct values and the commonest of them is at least a fifth of the column; and `is_integer_valued`, only ever `true`, on a double column whose values are all whole, which is 37 of 1,752. On `integer` columns `sort_order` held 245 times in 248.
+- Logical columns add `n_true` and `n_false`, and carry no `col_min` or `col_max`: a range of 0 to 1 says nothing that the counts do not.
+- Character columns add `min_nchar` and `max_nchar` where at least one value is present, and `n_blank` only where some value is the empty string, which was 2 of 33 character columns.
+- Doubles add `n_infinite` only where the column holds an infinity, and then `n_infinite_pos`, `n_infinite_neg`, `max_infinite` and `min_infinite` for whichever end runs off; and `n_nan` only where some missing value is a NaN arithmetic produced rather than an NA nobody recorded. `n_missing` counts R's NA and a NaN alike, because `is.na()` does, and `n_nan` is the part of it that is the second kind.
+- Missingness has a position as well as a count, and only where there is any: `max_missing_run` where the column has a missing value at all, with `n_missing_leading` and `n_missing_trailing` where a run reaches the respective end. A column with nothing missing carries none of the three, which separates a column that starts late from one that is unreliable throughout without writing three zeroes against every complete column in the corpus.
+- Factors add `is_factor`, which at this depth is written only where it is true, and `n_levels` and `levels`, `level_counts` where any level is used, `is_ordered` only where the factor is ordered, and `levels_truncated` or `level_counts_truncated` where there are more than 50 to list. `is_factor` and `n_levels` are the two that survive to `structural` depth, since neither needs a value read, and `structural` is the one depth that writes `is_factor` when it is false. Neither survives to `reduced`.
+- A column holding a matrix of its own adds `cell_nrow` and `cell_ncol`, which is why it holds more values than the frame has rows. A geometry column adds the spatial fields listed further down.
+- Whatever was written beside the values comes through as well where it is there: `label`, `comment`, `units` and `attrs_other`.
+
+So at `full` depth `name`, `type` and `col_fp` are on every column without exception, `n_missing` on every one but `complex`, and `n_unique` on every one but `complex` and `raw`. Nothing else is.
+
+How much of that a record carries depends on how wide the object is, on what its columns are, and on whether the values were read at all, and `column_detail` is `full`, `reduced`, `none` or `structural` to say which. Width alone is not the test, because a frame is only repeating itself when its columns are also alike.
+
+- `full`: every column and every statistic above. Anything up to 512 columns, whatever its columns hold. Ten numeric columns need their own means and ranges however alike their types are, so uniformity counts for nothing here.
+- `reduced`: every column, carrying `name`, `type`, `n_missing` and `n_unique`, except that a `raw` column carries no `n_unique` and a `complex` column carries no `n_unique` and no `n_missing`, for the reasons given above, so those two carry three fields and two. A factor there carries neither `is_factor` nor `n_levels`, which `full` and `structural` both give it, and no column there carries `col_fp`. A frame past 512 columns whose columns are not all one type, and also one whose columns are all one type but which has too many cells to summarise whole. Each column there is a different variable, so the list keeps all of them and the statistics are what goes. One column can carry more: a geometry column keeps `is_geometry`, `geom_type`, `geom_dimension`, `n_geometries`, `n_empty`, `bbox`, `crs_input`, `crs_epsg` and `crs_wkt` as well, because the record's own extent and projection are read off that column and a frame has at most one of it. Those are the object's geography rather than a statistic about a column, and a frame that lost them would report as an ordinary table.
+- `none`: no `columns[]` at all, and in its place the whole-object treatment a matrix gets, described below: `n_cells`, `n_missing_total`, the summary over every cell with `summary_over` of `cells`, and the `row_mean_*` and `col_mean_*` margin summaries. A frame past 512 columns whose columns are all one of `numeric`, `integer`, `logical` or `character` is a matrix wearing a data.frame coat, and a per-column profile of one is the word `numeric` nineteen thousand times over. A factor is not counted as one type for this: its levels are per-column vocabulary that no whole-object summary can carry. The list is given up only in exchange for that summary, so this depth is used only where the summary can be taken: a frame of one type whose cells run past the cell cap of 8000000, or whose columns are not all the same length, is `reduced` instead and keeps every column. The 8000000 here is the object's own cell count, `nrow` times `ncol`, because taking the summary means laying every column end to end into one vector. The same number bounds the length of a single column in the `structural` rule below, which is a different test on a different quantity. The one `none` record without a summary is a frame with no rows, where `nrow` and `n_cells` are both 0 and there are no values to describe; every other one carries `n_cells` and `summary_over` of `cells`.
+- `structural`: every column, carrying `name`, `type` and `is_factor`, the last of those written whether it is true or false, which no other depth does, plus `n_levels` where the column declares levels. No count of anything, because no value was read. Such a record is `degraded` with `notes` of `value scan skipped (size cap)` and carries no `n_missing_total`. It does carry `content_fp`, and on a frame or a grid `schema_fp` and `shape_fp` as well, because the reader hashed the bytes of every column as it went past them, and it never carries a `row_sketch`, because no row was assembled to hash. A column the reader could not hash at all takes the other three with it, under [Fingerprints](#fingerprints) below. What puts a frame here is a column whose values were never materialised, which happens two ways. The first is length, and it is on three types only, `logical`, `integer` and `numeric`: one of those longer than 8000000 values has its length read and its values skipped over. That is the length of one column and not the cell count of the object, so a frame reaches this depth when `nrow` passes 8000000 at any width, and never because `nrow` times `ncol` does. A 600 by 14000 frame is 8400000 cells and every column in it is 600 long, so nothing is skipped and it is `reduced`. No other type is bounded by length. A `character` or a `list` column of that size runs into the item budget under [Known limits](#known-limits) first and takes the whole file with it, so a frame never reaches this depth on one of those; a `raw` or a `complex` column is read for its size at any length whatever, and a nine million element raw vector comes back `exact`. The second is type: a column the reader cannot materialise at all, which is a compact sequence (`1:n`, `seq_len(n)`) declaring more than 8000000 elements, or a value it holds no representation for, an S4 object for instance. `complex` and `raw` columns are not that case even though their elements are not kept either, because the whole vector is hashed on the way past and so they can be profiled. One such column is enough: a frame is at this depth or it is not, and the other columns come with it. Width has nothing to do with any of it, so a three column frame lands here if it is long enough.
+
+`ncol` is the true width at all four depths. `content_fp`, `schema_fp`, `shape_fp` and `row_sketch` are taken over every column at `full`, `reduced` and `none` alike, so nothing about which of those was used changes which objects are the same data. A `structural` record has no `row_sketch` and carries the other three off the digests of its columns rather than off their values. Records with no column structure at all, a matrix or a vector or a list, carry no `column_detail`: there is no list for it to describe.
+
+An object with values but no columns (a vector, a matrix, an array, a sparse matrix) gets the same summary lifted to the top level, with `summary_over` naming what it was taken over: `cells` for a dense grid, `stored values` for a sparse one, where a mean over the cells and a mean over the stored values are different numbers. Such a record also carries `type` for what its cells are, from the same vocabulary a column's `type` comes from, with `is_factor` and `n_levels` where they are a factor. Those are read off the object rather than off the summary, so a grid or a vector says what it holds whether or not a cell of it was read. `n_missing_total` is the object-wide count where there was one to take, summed over the values that were counted: a complex value has no cell the reader looked at, so an object made of them carries no total at all and a frame with a complex column among others carries the total over the rest.
+
+Matrices say how they are held rather than only how big they are: `matrix_shape` (`general`, `symmetric`, `triangular`, `diagonal`, `positive-definite`), `matrix_storage` (`dense`, `packed`, `column-compressed`, `row-compressed`, `triplet`, `diagonal`), `matrix_value_type` (`double`, `logical`, `integer`, `complex`, or `pattern` for a matrix that stores only where its entries are), `matrix_uplo` (which triangle a symmetric or triangular matrix keeps), `matrix_diag`, and for a sparse one `n_stored` and `density`. A grid of two dimensions or more also carries a six number summary of each margin's means, `row_mean_min` through `row_mean_max` with `row_mean_sd`, and the same for `col_mean_*`: a grid whose row means spread widely while its column means barely move is saying where its structure is, which one summary over every cell cannot say.
+
+Containers with a reader of their own report what makes them that kind of thing. Time series and indexed series: `ts_start`, `ts_end`, `ts_frequency`, `ts_span`, and for zoo, xts, tsibble and the Rmetrics series `index_class`, `index_start`, `index_end`, `index_n`, `index_delta`, `index_regular`, `index_span`, `index_n_gaps`, `index_max_gap`, `index_tz`. Spatial objects (sf, sp, and the sfc geometry columns inside a frame, where `is_geometry` marks the column): `is_spatial`, `bbox`, `crs_epsg`, `crs_input`, `crs_wkt`, `geom_type`, `n_geometries`, `geom_dimension`, and `n_empty` for geometries that are present and hold nothing, since they count as rows and draw as nothing. Raster and terra grids: `n_layers`, `layer_names`, `layer_min`, `layer_max`, `resolution`, `nodata_value`, `in_memory`. Graphs: `n_vertices`, `n_edges`, `directed`. data.table: `dt_key` and `dt_indices`, the closest thing such a table has to a primary key. Grouped dplyr frames: `is_grouped`, `group_vars`, `n_groups`. Lists: `elements`, `element_names`, `element_class` or `element_classes`, `element_lens`, `element_len_min`, `element_len_max`, `element_len_total`, `max_depth`, `n_empty_slots` (a list of four with two of them NULL is not the list its length suggests), and for a list of frames the inner `inner_names`, `inner_ncol`, `inner_nrow_total`. Bioconductor S4 containers report their dimensions from the assay or element-metadata slot they keep them in.
+
+Whatever no reader consumes by name is still reported rather than dropped, because dropping it would say it was not there. `label`, `comment` and `units` come through as text when they hold text, and `attrs_other` names every remaining attribute with the kind and the length of each, plus its values or its two ends when they are short enough to be worth having.
+
+A delimited file under `data/`, where the extension does promise a separator, says when its header does not look like what the extension claims: `delimiter_looks_like` and `delimiter_would_give_ncol` report the separator that would have produced a different table, which is more use to a reader than one column named after the whole header line.
+
+### Fingerprints
+
+Four keys, and each answers a different question about sameness.
+
+`content_fp` is blake3 over the per-column fingerprints in column order, where a column's own fingerprint covers its type and its values and never its name. So `content_fp` matches the same data packaged under different column names, and stops matching when a type changes or the columns are reordered. That is deliberate in both directions: renamed headers over the same numbers are the same data, while the same numbers read as character instead of numeric are not.
+
+`schema_fp` is over `name:type` for every column in order, so it matches the same columns of the same types under the same names, whatever the rows hold.
+
+`shape_fp` is over the column types in order with the names dropped, so it matches a table built the same way out of different data. It says nothing about how many rows there are.
+
+`row_sketch` is a bottom-32 KMV sketch: the 32 smallest distinct row hashes, each a mix of that row's per-column cell hashes, sorted and hex encoded. Comparing two sketches estimates Jaccard similarity and containment, which is how a subset or a near-duplicate is found. Exact copies are what `content_fp` is for.
+
+The fingerprints appear only when everything they cover was read or hashed. One column the reader can do neither with, a generated sequence too long to hold whose length alone would make two different sequences one dataset, suppresses all four rather than fingerprinting a partial read, so a fingerprint that is present is a fingerprint over everything.
+
+A value past the cell cap is not that case. Its cells were skipped, so nothing in it can be counted, but its bytes were hashed on the way past, and that hash stands in for the values in `content_fp`. `schema_fp` and `shape_fp` come with it, since names and types need no values at all. There is no `row_sketch`, because a sketch is built out of rows and no row was assembled. Such a `content_fp` is taken over digests rather than over cells, so it is comparable with another object the cap skipped and not with one the reader read through: an object is on one side of the cap or the other, and two copies of the same object are on the same side. Without it 34 objects in the published corpus had no identity at all, one of them a 149 million cell matrix, and a consumer that keys on `content_fp` drops a record that has none.
+
+### inst/extdata
+
+R points authors here for data files that are not datasets, and for many packages it is the only real data they carry. Nothing under it is loadable by name, so a record from here is not a catalogue entry: `origin_dir` is `extdata` and presenting one as something `data()` can reach is wrong.
+
+`data()`'s conventions do not apply here either, so the extension promises nothing. A `.csv` under extdata is an ordinary comma separated file rather than the semicolon one `data()` expects, and the separator used is whichever of comma, tab, semicolon or pipe the header actually holds the most of.
+
+What is opened: `.rds`, `.rda` and `.RData` as serialized objects, and `.csv`, `.tsv`, `.tab`, `.txt`, `.psv` and `.dat` as delimited text. Files above 8 MiB are skipped whatever their extension, because fingerprinting an 11 MB sequence file describes nothing a reader would ask about. Everything else, a spreadsheet or an image or a compressed archive, is left shut.
+
+What is left shut is still counted. The summary record's `extdata` object reports `files`, `bytes` and `largest_bytes` over the whole directory, per-extension counts and byte totals split into `read` and `unread`, and up to 100 names of the unread ones, because `gz 1/11.0M` says a great deal less than `dm3_upstream2000.fa.gz`.
+
+### Known limits
+
+Two limits are silent: nothing on a record or in the inventory says the reader stopped, so any census built on them is a floor rather than a total.
+
+- The extdata walk stops after 200 files, and it does not follow directories past depth 3. `inst/extdata/a/b` is read, `inst/extdata/a/b/c` is not.
+- `attrs_other` sorts the leftover attributes alphabetically and keeps the first 24 entries. An object with more of them reports the alphabetical head, and says nothing about the tail.
+
+The remaining bounds announce themselves, one way or another:
+
+- Per-column detail stops being written column by column past 512 columns, and `column_detail` on the record says at which of the four depths it was written. No column is dropped: at `none` the whole list is replaced by a summary over every cell, and at the other three every column is listed. `ncol` reports the true width throughout.
+- `level_counts` stops at 50 levels and sets `level_counts_truncated`; margin labels stop at 50 and set `labels_truncated`.
+- A vector longer than 8000000 values has its length read and its values skipped, so an object built out of one keeps its structure and gets no value pass. On a frame that is `column_detail` of `structural`; on a grid or a bare vector, which have no column list to say it on, there is no summary and no `n_unique`. Either way the record is `degraded` with `notes` of `value scan skipped (size cap)`, counts nothing, and is identified by the hash the reader took of its bytes rather than by its values. The test is the length of one vector, not the cell count of the object: a 600 by 14000 frame is 8400000 cells and is fully measured, while a 3 by 9000000 frame is not measured at all. A column the reader cannot materialise for a reason other than length puts a frame at `structural` too, and the depth bullets above say which.
+- A file is read on a budget of 5000000 items, where an item is one object on the wire: a vector, an attribute, and every element of a character vector or a list one apiece. Past it the read stops and the whole file is given up rather than the object that overran it, because the read is one pass through one byte stream. The record is `degraded` with `notes` of `item budget exceeded`, carrying the file's name, its path and its size on disk and nothing else: no `format`, no `class`, no dimensions, no columns and no fingerprints. An `.rda` holding several objects loses all of them under the one name. For a `character` or a `list` column this is the tighter of the two bounds by nearly a factor of two, so it is what actually fires: a frame of 8000001 rows of character comes back as that one line, while the same frame of doubles comes back at `structural` depth with every column named and typed. The same frame at 4000000 rows of character reads exactly.
+- Help-page titles are read from at most 4000 Rd files per package, each up to 1 MiB.
+- The extdata inventory splits files by whether their extension is one this reader opens, so a `.csv` above the 8 MiB parse limit is counted under `read` although no record was written for it. `read` is the count of files whose extension we open, not of files we opened.
 
 ## Static fields
 
@@ -70,6 +184,8 @@ installed size, and reverse dependencies live outside the analyzer.
 `num_data_files`, `data_size_total`, `data_size_median`, `data_files` (file
 names), `datasets` (object names from `data/datalist` or file stems),
 `total_source_size` (extracted bytes on disk).
+
+`extdata` is an inventory of `inst/extdata` rather than a count: `files`, `bytes`, `largest_bytes`, per-extension counts and bytes split into `read` and `unread`, and the names of the files left shut. It is null when the package has no such directory. See [inst/extdata](#instextdata) for what read and unread mean.
 
 ### File and subdirectory counts
 
