@@ -4497,8 +4497,7 @@ pub fn scan_package(root: &Path, excluded: &BTreeSet<String>) -> Vec<Value> {
         let src = root.join("inst").join("extdata");
         if src.is_dir() { src } else { root.join("extdata") }
     };
-    walk_extdata(&ext_root, EXTDATA_DEPTH, &mut extra);
-    extra.retain(|p| !excluded.contains(&rel_path(root, p)));
+    walk_extdata(root, excluded, &ext_root, EXTDATA_DEPTH, &mut extra);
     for p in extra {
         targets.push((p, false));
     }
@@ -4637,11 +4636,9 @@ pub fn extdata_inventory(root: &Path, excluded: &BTreeSet<String>) -> Value {
         return Value::Null;
     }
     let mut files = Vec::new();
-    walk_extdata(&ext_root, EXTDATA_DEPTH, &mut files);
-    let walked = files.len();
-    files.retain(|p| !excluded.contains(&rel_path(root, p)));
-    // Every file left out means the release has no such directory.
-    if walked > 0 && files.is_empty() {
+    walk_extdata(root, excluded, &ext_root, EXTDATA_DEPTH, &mut files);
+    // A directory whose every file, at any depth, is left out is not in the release.
+    if files.is_empty() && holds_only_left_out_files(root, excluded, &ext_root) {
         return Value::Null;
     }
     // Size per extension, not just per directory. A file we read carries its own
@@ -4717,7 +4714,9 @@ fn extdata_is_readable(lower: &str) -> bool {
 fn rd_titles(root: &Path, excluded: &BTreeSet<String>) -> std::collections::HashMap<String, String> {
     let mut out = std::collections::HashMap::new();
     let Ok(rd) = std::fs::read_dir(root.join("man")) else { return out };
-    let mut paths: Vec<_> = rd.flatten().map(|e| e.path()).collect();
+    // Pages the build leaves out are dropped first, so they never use up the cap.
+    let mut paths: Vec<_> =
+        rd.flatten().map(|e| e.path()).filter(|p| !excluded.contains(&rel_path(root, p))).collect();
     paths.sort();
     for p in paths.iter().take(RD_FILE_CAP) {
         let is_rd = p
@@ -4725,7 +4724,7 @@ fn rd_titles(root: &Path, excluded: &BTreeSet<String>) -> std::collections::Hash
             .and_then(|e| e.to_str())
             .map(|e| e.eq_ignore_ascii_case("rd"))
             .unwrap_or(false);
-        if !is_rd || excluded.contains(&rel_path(root, p)) {
+        if !is_rd {
             continue;
         }
         let Ok(raw) = std::fs::read(&p) else { continue };
@@ -4919,7 +4918,15 @@ const EXTDATA_PARSE_LIMIT: u64 = 8 << 20;
 const EXTDATA_FILE_CAP: usize = 200;
 const EXTDATA_NAME_CAP: usize = 100;
 
-fn walk_extdata(dir: &Path, depth: u32, out: &mut Vec<std::path::PathBuf>) {
+/// Files under `dir` the release keeps. A file the build leaves out is skipped
+/// before it counts, so left-out files cannot fill the cap ahead of kept ones.
+fn walk_extdata(
+    root: &Path,
+    excluded: &BTreeSet<String>,
+    dir: &Path,
+    depth: u32,
+    out: &mut Vec<std::path::PathBuf>,
+) {
     if depth == 0 || out.len() >= EXTDATA_FILE_CAP {
         return;
     }
@@ -4931,11 +4938,23 @@ fn walk_extdata(dir: &Path, depth: u32, out: &mut Vec<std::path::PathBuf>) {
             return;
         }
         if p.is_dir() {
-            walk_extdata(&p, depth - 1, out);
-        } else {
+            walk_extdata(root, excluded, &p, depth - 1, out);
+        } else if !excluded.contains(&rel_path(root, &p)) {
             out.push(p);
         }
     }
+}
+
+/// True when `dir` holds files and the build leaves out every one of them, at any depth.
+fn holds_only_left_out_files(root: &Path, excluded: &BTreeSet<String>, dir: &Path) -> bool {
+    let prefix = format!("{}/", rel_path(root, dir));
+    // No left-out file under the directory means nothing here was taken away.
+    if !excluded.range(prefix.clone()..).next().is_some_and(|f| f.starts_with(&prefix)) {
+        return false;
+    }
+    let mut kept = Vec::new();
+    walk_extdata(root, excluded, dir, u32::MAX, &mut kept);
+    kept.is_empty()
 }
 
 // ---- tests ------------------------------------------------------------------

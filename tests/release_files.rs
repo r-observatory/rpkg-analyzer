@@ -80,3 +80,66 @@ fn an_unreadable_rbuildignore_nulls_every_release_content_value() {
     assert!(recs.iter().all(|r| r["rec"] != "function"), "no release-content detail records");
     assert!(recs.iter().any(|r| r["rec"] == "dcf"), "the DESCRIPTION record is kept");
 }
+
+#[test]
+fn a_kept_extdata_file_is_seen_behind_more_left_out_files_than_the_walk_takes() {
+    // More left-out files than the extdata walk's cap, sorted ahead of the one the release keeps.
+    let mut owned: Vec<(String, &str)> =
+        (0..201).map(|i| (format!("inst/extdata/a_big/f{i:03}.csv"), "a,b\n1,2\n")).collect();
+    owned.push(("inst/extdata/z.csv".to_string(), "a,b\n1,2\n"));
+    owned.push((".Rbuildignore".to_string(), "^inst/extdata/a_big$\n"));
+    owned.push(("DESCRIPTION".to_string(), DESC));
+    let files: Vec<(&str, &str)> = owned.iter().map(|(p, t)| (p.as_str(), *t)).collect();
+    let t = tree(&files);
+    let recs = records(&t, "git");
+    let s = recs.iter().find(|r| r["rec"] == "summary").unwrap();
+    assert_eq!(s["extdata"]["files"], 1, "only z.csv is in the release");
+    assert_eq!(s["extdata"]["read"]["csv"]["n"], 1);
+    let ext: Vec<&str> = recs
+        .iter()
+        .filter(|r| r["rec"] == "dataset" && r["origin_dir"] == "extdata")
+        .filter_map(|r| r["file"].as_str())
+        .collect();
+    assert_eq!(ext, vec!["inst/extdata/z.csv"]);
+}
+
+#[test]
+fn a_wholly_left_out_extdata_is_absent_on_git_and_present_on_release() {
+    let t = tree(&[
+        ("DESCRIPTION", DESC),
+        ("inst/extdata/x.csv", "a,b\n1,2\n"),
+        ("inst/extdata/sub/y.txt", "hello\n"),
+        (".Rbuildignore", "^inst/extdata$\n"),
+    ]);
+    let recs = records(&t, "git");
+    let s = recs.iter().find(|r| r["rec"] == "summary").unwrap();
+    assert_eq!(s["extdata"], Value::Null, "the release has no inst/extdata");
+    assert!(recs.iter().all(|r| r["origin_dir"] != "extdata"));
+    let rel = summary(&t, "release");
+    assert_eq!(rel["extdata"]["files"], 2, "the tree as given has both files");
+
+    // A file the release keeps below the walk's depth still means the directory is there.
+    let deep = tree(&[
+        ("DESCRIPTION", DESC),
+        ("inst/extdata/top.csv", "a,b\n1,2\n"),
+        ("inst/extdata/a/b/c/deep.csv", "a,b\n1,2\n"),
+        (".Rbuildignore", "^inst/extdata/top\\.csv$\n"),
+    ]);
+    assert_eq!(summary(&deep, "git")["extdata"]["files"], 0);
+}
+
+#[test]
+fn a_kept_help_page_is_read_behind_more_left_out_pages_than_the_cap() {
+    let mut owned: Vec<(String, String)> = (0..4000)
+        .map(|i| (format!("man/a_{i:04}.Rd"), format!("\\name{{a_{i}}}\\alias{{a_{i}}}\\title{{Page {i}}}\n")))
+        .collect();
+    owned.push(("man/z.Rd".to_string(), "\\name{z}\\alias{z}\\title{The z data}\n".to_string()));
+    owned.push(("data/z.csv".to_string(), "a;b\n1;2\n".to_string()));
+    owned.push((".Rbuildignore".to_string(), "^man/a_\n".to_string()));
+    owned.push(("DESCRIPTION".to_string(), DESC.to_string()));
+    let files: Vec<(&str, &str)> = owned.iter().map(|(p, t)| (p.as_str(), t.as_str())).collect();
+    let t = tree(&files);
+    let recs = records(&t, "git");
+    let z = recs.iter().find(|r| r["rec"] == "dataset" && r["name"] == "z").expect("a z dataset record");
+    assert_eq!(z["title"], "The z data");
+}
