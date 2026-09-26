@@ -11,6 +11,7 @@ use tree_sitter::Parser;
 
 mod cli;
 mod news;
+mod rd_pages;
 mod rds;
 mod release_files;
 mod repo_practices;
@@ -965,7 +966,7 @@ fn metrics_docs(
     exports: &[String],
     news_file: Option<&str>,
 ) -> Docs {
-    let rd_files = find_files(files, r"^man/.*\.Rd$");
+    let rd_files = rd_pages::rd_page_files(files);
     let n_rd = rd_files.len();
 
     let exports_filtered: Vec<&String> =
@@ -2029,7 +2030,7 @@ fn metrics_extra(desc: &BTreeMap<String, String>, root: &Path, files: &[String],
     let repo = detect_repo(&[desc.get("URL").cloned(), desc.get("BugReports").cloned()]);
 
     // Rd help pages with an \examples section.
-    let rd_files = find_files(files, r"^man/.*\.Rd$");
+    let rd_files = rd_pages::rd_page_files(files);
     let mut help_pages_with_examples = 0i64;
     for f in &rd_files {
         if rd_has_block(&read(root, f).unwrap_or_default(), "examples") {
@@ -3317,7 +3318,7 @@ fn main() {
     let int_locs: Vec<i64> = fn_stats.iter().filter(|f| !f.exported).map(|f| f.loc as i64).collect();
 
     // Documentation lines per help page (Rd file LOC).
-    let rd_locs: Vec<i64> = find_files(&files, r"^man/.*\.Rd$")
+    let rd_locs: Vec<i64> = rd_pages::rd_page_files(&files)
         .iter()
         .filter_map(|f| read(&root, f).map(|c| loc(&c) as i64))
         .collect();
