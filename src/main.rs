@@ -9,6 +9,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use tree_sitter::Parser;
 
+mod citation;
 mod cli;
 mod news;
 mod rd_pages;
@@ -3367,6 +3368,10 @@ fn main() {
     let meta = metrics_meta(&desc, &root, &files);
     let security = metrics_security(&desc, &root, &files);
     let practices = repo_practices::metrics_repo_practices(&root, &tree_files, kind);
+    let cit = exists(&files, "inst/CITATION").then(|| match std::fs::read(root.join("inst/CITATION")) {
+        Ok(bytes) => citation::read_citation(&bytes, &desc),
+        Err(_) => citation::Citation::parse_error(),
+    });
 
     // --- additional static signals ---
     // OpenMP: SystemRequirements, Makevars -fopenmp, or a src #pragma omp / _OPENMP.
@@ -3445,6 +3450,14 @@ fn main() {
         "spdx_valid": legal.spdx_valid,
         "osi_approved": legal.osi_approved,
         "license_file_completeness": legal.license_file_completeness,
+        "has_citation": cit.is_some(),
+        "citation_read": cit.as_ref().map(|c| c.read),
+        "citation_kind": cit.as_ref().and_then(|c| c.kind),
+        "citation_n_entries": cit.as_ref().and_then(|c| c.n_entries),
+        "citation_bibtype": cit.as_ref().and_then(|c| c.bibtypes.clone()),
+        "citation_dois": cit.as_ref().and_then(|c| c.dois.clone()),
+        "citation_venue": cit.as_ref().and_then(|c| c.venues.clone()),
+        "has_rd_bibliography": exists(&files, "inst/REFERENCES.bib") || exists(&files, "inst/REFERENCES.R"),
         "copyright_holder_declared": legal.copyright_holder_declared,
         "min_r_version": port.min_r_version,
         "system_requirements_count": port.system_requirements_count,
