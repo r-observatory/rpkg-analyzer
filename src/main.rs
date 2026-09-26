@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 use tree_sitter::Parser;
 
 mod cli;
+mod news;
 mod rds;
 mod release_files;
 mod repo_practices;
@@ -921,11 +922,22 @@ fn version_ge(a: &[u64], b: &[u64]) -> bool {
     true
 }
 
+/// README names in the order they are tried, matched case-insensitively at the root.
+const README_NAMES: [&str; 6] = ["README.md", "README.markdown", "README.Rmd", "README.qmd", "README", "README.txt"];
+
+fn readme_file(files: &[String]) -> Option<&str> {
+    README_NAMES
+        .iter()
+        .find_map(|n| files.iter().find(|f| !f.contains('/') && f.eq_ignore_ascii_case(n)))
+        .map(String::as_str)
+}
+
 fn metrics_docs(
     _desc: &BTreeMap<String, String>,
     root: &Path,
     files: &[String],
     exports: &[String],
+    news_file: Option<&str>,
 ) -> Docs {
     let rd_files = find_files(files, r"^man/.*\.Rd$");
     let n_rd = rd_files.len();
@@ -1058,18 +1070,12 @@ fn metrics_docs(
     };
 
     // ---- 6. has_readme ----------------------------------------------------------
-    let has_readme = exists(files, "README.md") || exists(files, "README.Rmd");
+    let readme = readme_file(files);
+    let has_readme = readme.is_some();
 
     // ---- 7. readme_prose_length --------------------------------------------------
     let readme_prose_length = {
-        let rpath = if exists(files, "README.md") {
-            Some("README.md")
-        } else if exists(files, "README.Rmd") {
-            Some("README.Rmd")
-        } else {
-            None
-        };
-        rpath.map(|p| {
+        readme.map(|p| {
             let text = read(root, p).unwrap_or_default();
             if text.is_empty() {
                 0i64
@@ -1088,17 +1094,12 @@ fn metrics_docs(
     };
 
     // ---- 9. news_present ------------------------------------------------------------
-    let news_present = exists(files, "NEWS") || exists(files, "NEWS.md");
+    let news_present = news_file.is_some();
 
     // ---- 10. news_structure_quality ---------------------------------------------------
     let news_structure_quality = {
-        let npath = if exists(files, "NEWS.md") {
-            Some("NEWS.md")
-        } else if exists(files, "NEWS") {
-            Some("NEWS")
-        } else {
-            None
-        };
+        // Its Markdown and bullet heuristics say nothing about Rd.
+        let npath = news_file.filter(|p| *p != "inst/NEWS.Rd");
         npath.map(|p| {
             let text = read(root, p).unwrap_or_default();
             if text.trim().is_empty() {
@@ -1998,7 +1999,7 @@ fn detect_repo(fields: &[Option<String>]) -> Option<(String, String)> {
     None
 }
 
-fn metrics_extra(desc: &BTreeMap<String, String>, root: &Path, files: &[String]) -> Extra {
+fn metrics_extra(desc: &BTreeMap<String, String>, root: &Path, files: &[String], news_file: Option<&str>) -> Extra {
     let repo = detect_repo(&[desc.get("URL").cloned(), desc.get("BugReports").cloned()]);
 
     // Rd help pages with an \examples section.
@@ -2013,9 +2014,8 @@ fn metrics_extra(desc: &BTreeMap<String, String>, root: &Path, files: &[String])
         (!rd_files.is_empty()).then(|| help_pages_with_examples as f64 / rd_files.len() as f64);
 
     // NEWS synced to version: the first version token in NEWS equals the package Version.
-    let news_up_to_date = ["NEWS.md", "NEWS", "inst/NEWS.md", "inst/NEWS"]
-        .iter()
-        .find_map(|p| read(root, p))
+    let news_up_to_date = news_file
+        .and_then(|p| read(root, p))
         .map(|news| {
             let ver_re = regex::Regex::new(r"\d+\.\d+(?:[.-]\d+)*").unwrap();
             let latest = ver_re.find(&news).map(|m| m.as_str().to_string());
@@ -3266,7 +3266,8 @@ fn main() {
         fn_stats.iter().filter(|f| f.exported).map(|f| f.n_params).collect();
     let n_fns_r = fn_stats.len();
     let n_fns_r_exported = fn_stats.iter().filter(|f| f.exported).count();
-    let ex = metrics_extra(&desc, &root, &files);
+    let news_file = news::news_file(&files);
+    let ex = metrics_extra(&desc, &root, &files, news_file);
     let (net, r_edges) = metrics_network(&fn_stats);
     let ws = metrics_whitespace(&root, &files);
     let src_fns = count_src_functions(&root, &files);
@@ -3322,7 +3323,7 @@ fn main() {
     let legal = metrics_legal(&desc, &root, &files);
     let port = metrics_portability(&desc, &root, &files);
     let tests = metrics_tests(&desc, &root, &files, &ns.exports);
-    let docs = metrics_docs(&desc, &root, &files, &ns.exports);
+    let docs = metrics_docs(&desc, &root, &files, &ns.exports, news_file);
     let health = metrics_health(&desc, &root, &files);
     let meta = metrics_meta(&desc, &root, &files);
     let security = metrics_security(&desc, &root, &files);
@@ -3435,6 +3436,8 @@ fn main() {
         "has_pkgdown": practices.has_pkgdown,
         "news_present": docs.news_present,
         "news_structure_quality": docs.news_structure_quality,
+        "news_file": news_file,
+        "changelog_file": news::changelog_file(&files),
         "on_exit_coverage_rate": health.on_exit_coverage_rate,
         "global_state_write_density": health.global_state_write_density,
         "deprecated_idiom_density": health.deprecated_idiom_density,
