@@ -149,36 +149,44 @@ fn parse(parser: &mut Parser, src: &str) -> Option<tree_sitter::Tree> {
     parser.parse(src, None)
 }
 
+// The walks below keep an explicit stack: a long generated expression nests one level
+// per term, and a recursive walk would overflow on it.
 fn calls_any(node: Node, src: &str, pick: &dyn Fn(&str) -> bool) -> bool {
-    if node.kind() == "call" && crate::call_fn_name(&node, src.as_bytes()).is_some_and(|n| pick(&n)) {
-        return true;
+    let mut st = vec![node];
+    while let Some(n) = st.pop() {
+        if n.kind() == "call" && crate::call_fn_name(&n, src.as_bytes()).is_some_and(|name| pick(&name)) {
+            return true;
+        }
+        let mut c = n.walk();
+        st.extend(n.children(&mut c));
     }
-    let mut c = node.walk();
-    node.children(&mut c).any(|ch| calls_any(ch, src, pick))
+    false
 }
 
-/// test_that() and it() calls with whether an enclosing if mentions NOT_CRAN. An it()
-/// is not searched for more.
+fn is_not_cran_if(node: Node, src: &str) -> bool {
+    node.kind() == "if_statement"
+        && node.child_by_field_name("condition").is_some_and(|c| text(c, src).contains("NOT_CRAN"))
+}
+
+/// test_that() and it() calls, in source order, with whether an enclosing if mentions
+/// NOT_CRAN. An it() is not searched for more.
 fn collect_blocks<'a>(node: Node<'a>, src: &str, gated: bool, out: &mut Vec<(Node<'a>, bool)>) {
-    let mut gated = gated;
-    if node.kind() == "if_statement" {
-        if node.child_by_field_name("condition").is_some_and(|c| text(c, src).contains("NOT_CRAN")) {
-            gated = true;
-        }
-    }
-    if node.kind() == "call" {
-        match crate::call_fn_name(&node, src.as_bytes()).as_deref() {
-            Some("test_that") => out.push((node, gated)),
-            Some("it") => {
-                out.push((node, gated));
-                return;
+    let mut st = vec![(node, gated)];
+    while let Some((n, gated)) = st.pop() {
+        let gated = gated || is_not_cran_if(n, src);
+        if n.kind() == "call" {
+            match crate::call_fn_name(&n, src.as_bytes()).as_deref() {
+                Some("test_that") => out.push((n, gated)),
+                Some("it") => {
+                    out.push((n, gated));
+                    continue;
+                }
+                _ => {}
             }
-            _ => {}
         }
-    }
-    let mut c = node.walk();
-    for ch in node.children(&mut c) {
-        collect_blocks(ch, src, gated, out);
+        let mut c = n.walk();
+        let children: Vec<Node<'a>> = n.children(&mut c).collect();
+        st.extend(children.into_iter().rev().map(|ch| (ch, gated)));
     }
 }
 
@@ -208,31 +216,24 @@ fn skip_wrappers(root: &Path, files: &[String], parser: &mut Parser) -> HashSet<
 
 /// Whether every test_check() in the tests/*.R runners sits inside a NOT_CRAN condition.
 fn runner_gated(root: &Path, files: &[String], parser: &mut Parser) -> bool {
-    fn walk(node: Node, src: &str, gated: bool, seen: &mut (usize, usize)) {
-        let mut gated = gated;
-        if node.kind() == "if_statement"
-            && node.child_by_field_name("condition").is_some_and(|c| text(c, src).contains("NOT_CRAN"))
-        {
-            gated = true;
-        }
-        if node.kind() == "call" && crate::call_fn_name(&node, src.as_bytes()).as_deref() == Some("test_check") {
-            seen.0 += 1;
-            if gated {
-                seen.1 += 1;
-            }
-        }
-        let mut c = node.walk();
-        for ch in node.children(&mut c) {
-            walk(ch, src, gated, seen);
-        }
-    }
-    let mut seen = (0usize, 0usize);
+    let (mut calls, mut gated_calls) = (0usize, 0usize);
     for f in files.iter().filter(|f| SCRIPT.is_match(f)) {
         let Some(src) = crate::read_lossy(root, f) else { continue };
         let Some(tree) = parse(parser, &src) else { continue };
-        walk(tree.root_node(), &src, false, &mut seen);
+        let mut st = vec![(tree.root_node(), false)];
+        while let Some((n, gated)) = st.pop() {
+            let gated = gated || is_not_cran_if(n, &src);
+            if n.kind() == "call" && crate::call_fn_name(&n, src.as_bytes()).as_deref() == Some("test_check") {
+                calls += 1;
+                if gated {
+                    gated_calls += 1;
+                }
+            }
+            let mut c = n.walk();
+            st.extend(n.children(&mut c).map(|ch| (ch, gated)));
+        }
     }
-    seen.0 > 0 && seen.0 == seen.1
+    calls > 0 && calls == gated_calls
 }
 
 pub fn cran_skipped_blocks(root: &Path, files: &[String]) -> BlockCounts {

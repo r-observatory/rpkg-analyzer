@@ -142,3 +142,22 @@ fn testit_counts_assertions_and_unitizer_names_no_unit() {
     assert_eq!(s["test_unit"], Value::Null);
     assert_eq!(s["n_test_blocks"], Value::Null);
 }
+
+#[test]
+fn a_deeply_nested_expression_does_not_abort_the_run() {
+    // A long sum nests one level per term, so a walk that recurses per level overflows.
+    let sum = vec!["1"; 200_000].join(" + ");
+    let wrapper = format!("f <- function() {sum}\n");
+    let runner = format!("x <- {sum}\ntest_check(\"fixpkg\")\n");
+    let test = format!("test_that(\"a\", {{ x <- {sum}; expect_true(TRUE) }})\n");
+    let t = tree(&[
+        ("DESCRIPTION", TT_DESC),
+        ("R/f.R", &wrapper),
+        ("tests/testthat.R", &runner),
+        ("tests/testthat/test-a.R", &test),
+    ]);
+    let s = summary(&t, "release");
+    assert_eq!(s["n_test_blocks"], 1);
+    assert_eq!(s["n_test_blocks_cran_skipped"], 0);
+    assert_eq!(s["tests_gated_not_cran"], false);
+}
