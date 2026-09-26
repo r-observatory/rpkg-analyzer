@@ -15,6 +15,7 @@ mod rd_pages;
 mod rds;
 mod release_files;
 mod repo_practices;
+mod test_suite;
 mod vignettes;
 
 // ---- file walking -----------------------------------------------------------
@@ -3354,6 +3355,8 @@ fn main() {
     let legal = metrics_legal(&desc, &root, &files);
     let port = metrics_portability(&desc, &root, &files);
     let tests = metrics_tests(&desc, &root, &files, &ns.exports);
+    let suite = test_suite::test_suite(&root, &files, &dep_names(&get("Suggests")));
+    let blocks = suite.blocks.as_ref();
     let docs = metrics_docs(&desc, &root, &files, &ns.exports, news_file);
     let rd = rd_pages::page_facts(&root, &files, &package);
     let exc = rd_pages::example_counts(&rd);
@@ -3458,6 +3461,15 @@ fn main() {
         "test_isolation_libs": tests.test_isolation_libs,
         "exported_fn_test_linkage": tests.exported_fn_test_linkage,
         "stochastic_seed_discipline": tests.stochastic_seed_discipline,
+        "test_framework_primary": suite.primary,
+        "test_frameworks_used": suite.used,
+        "test_frameworks_declared": suite.declared,
+        "n_test_units": suite.n_units,
+        "test_unit": suite.unit,
+        "n_rout_save": suite.n_rout_save,
+        "n_test_blocks": blocks.map(|b| b.total),
+        "n_test_blocks_cran_skipped": blocks.map(|b| b.skipped),
+        "tests_gated_not_cran": blocks.map(|b| b.gated),
         "ci_present": practices.ci_present,
         "ci_type": practices.ci_type,
         "ci_matrix_breadth": practices.ci_matrix_breadth,
