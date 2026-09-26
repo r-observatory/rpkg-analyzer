@@ -62,15 +62,15 @@ fn help_topics_are_counted_and_coverage_uses_exported_pages() {
         ("NAMESPACE", "export(f)\nexport(g)\nexport(\"%>%\")\n"),
         ("man/fixpkg-package.Rd", "\\name{fixpkg-package}\n\\alias{fixpkg}\n\\docType{package}\n"),
         ("man/f.Rd", "\\name{f}\n\\alias{f}\n\\examples{\nf()\n}\n"),
-        ("man/g.Rd", "\\name{g}\n\\alias{g}\n"),
+        ("man/g.Rd", "\\name{g}\n\\alias{g}\n% \\keyword{internal}\n"),
         ("man/pipe.Rd", "\\name{pipe}\n\\alias{\\%>\\%}\n"),
-        ("man/h.Rd", "\\name{h}\n\\keyword{internal}\n% \\keyword{data}\n"),
+        ("man/h.Rd", "\\name{h}\n\\keyword{internal}\n% \\docType{data}\n"),
         ("man/d.Rd", "\\name{d}\n\\docType{data}\n\\examples{\nd\n}\n"),
     ]);
     let s = summary(&t, "release");
     assert_eq!(s["n_help_topics"], 6);
-    assert_eq!(s["n_help_topics_internal"], 1);
-    assert_eq!(s["n_help_topics_data"], 1, "a commented-out \\keyword is not read");
+    assert_eq!(s["n_help_topics_internal"], 1, "a commented-out \\keyword is not read");
+    assert_eq!(s["n_help_topics_data"], 1, "a commented-out \\docType is not read");
     assert_eq!(s["n_help_topics_package"], 1);
     let cov = s["examples_coverage_fn"].as_f64().unwrap();
     assert!((cov - 1.0 / 3.0).abs() < 1e-9, "f has examples; g and the %>% page, an escaped alias, do not: {cov}");
@@ -89,6 +89,12 @@ fn without_a_plain_export_the_denominator_falls_back() {
     let s = summary(&t, "release");
     assert_eq!(s["examples_coverage_fn"], 1.0);
     assert_eq!(s["examples_coverage_fn_basis"], "not_internal");
+    let alias_only = tree(&[
+        ("DESCRIPTION", DESC),
+        ("man/fixpkg-package.Rd", "\\name{fixpkg-package}\n\\alias{fixpkg-package}\n"),
+        ("man/other.Rd", "\\name{other}\n\\alias{otherpkg-package}\n"),
+    ]);
+    assert_eq!(summary(&alias_only, "release")["n_help_topics_package"], 1, "the <Package>-package alias alone marks the overview page");
     let none = tree(&[("DESCRIPTION", DESC)]);
     let s = summary(&none, "release");
     assert_eq!(s["n_help_topics"], 0);
