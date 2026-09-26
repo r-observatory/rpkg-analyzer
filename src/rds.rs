@@ -4822,14 +4822,14 @@ fn rd_all_fields(text: &str, tag: &str) -> Vec<String> {
 /// of a function; carrying it as Rd puts a backslash in the middle of a
 /// sentence. Markdown is what the page it lands on can render.
 fn rd_plain(s: &str) -> String {
-    let out = rd_to_markdown(s, 0);
+    let out = rd_to_markdown(s, 0, false);
     let collapsed = out.split_whitespace().collect::<Vec<_>>().join(" ");
     collapsed.chars().take(300).collect()
 }
 
 /// Rd markup as one line of Markdown, with no length cap.
 pub(crate) fn rd_inline_text(s: &str) -> String {
-    rd_to_markdown(s, 0).split_whitespace().collect::<Vec<_>>().join(" ")
+    rd_to_markdown(s, 0, false).split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 /// The inside of the brace group whose body starts at `start`, and the index just past its closing brace.
@@ -4849,14 +4849,32 @@ fn rd_group(s: &str, start: usize) -> (&str, usize) {
     (inner, k)
 }
 
-fn rd_to_markdown(s: &str, depth: u32) -> String {
+/// One-argument Rd and R system macros with no rendering of their own. A group written
+/// straight after one of them is text of its own, as R reads it, not a second argument.
+const RD_ONE_ARG: &[&str] = &[
+    "abbr", "acronym", "describe", "email", "enumerate", "itemize", "link", "linkS4class", "out",
+    "preformatted", "special", "url", "verb", "CRANpkg", "I", "PR", "bibcitep", "bibcitet", "bibshow",
+    "doi", "packageAuthor", "packageDESCRIPTION", "packageDescription", "packageIndices",
+    "packageMaintainer", "packageTitle", "proglang",
+];
+
+/// Rd markup as Markdown. `verbatim` is set inside code and verbatim arguments,
+/// where R keeps a brace as text; elsewhere a bare brace group only groups.
+fn rd_to_markdown(s: &str, depth: u32, verbatim: bool) -> String {
     if depth > 8 {
         return String::new();
     }
+    let render = |t: &str, verbatim: bool| rd_to_markdown(t, depth + 1, verbatim);
     let b = s.as_bytes();
     let mut out = String::new();
     let mut i = 0usize;
     while i < b.len() {
+        if b[i] == b'{' && !verbatim {
+            let (inner, k) = rd_group(s, i + 1);
+            out.push_str(&render(inner, false));
+            i = k;
+            continue;
+        }
         if b[i] != b'\\' {
             let c = s[i..].chars().next().unwrap_or(' ');
             out.push(if c == '\n' || c == '\t' || c == '\r' { ' ' } else { c });
@@ -4875,6 +4893,16 @@ fn rd_to_markdown(s: &str, depth: u32) -> String {
             j += 1;
         }
         let cmd = &s[name_start..j];
+        // A macro that takes no argument stands for a word; a group after it, as in \R{}, is its own text.
+        if matches!(cmd, "R" | "dots" | "ldots" | "cr" | "tab") {
+            out.push_str(match cmd {
+                "R" => "R",
+                "dots" | "ldots" => "...",
+                _ => "",
+            });
+            i = j;
+            continue;
+        }
         // The option of \link[pkg]{x} names where it points, not what it reads as.
         let mut arg = j;
         if cmd == "link" && arg < b.len() && b[arg] == b'[' {
@@ -4884,17 +4912,17 @@ fn rd_to_markdown(s: &str, depth: u32) -> String {
         }
         if arg < b.len() && b[arg] == b'{' {
             let (inner, mut k) = rd_group(s, arg + 1);
-            let rendered = rd_to_markdown(inner, depth + 1);
+            // The group written straight after the first, which two-argument macros read.
+            let second = (k < b.len() && b[k] == b'{').then(|| rd_group(s, k + 1));
             match cmd {
                 // \href{url}{text} keeps both halves as a Markdown link.
                 "href" => {
                     let mut text = String::new();
-                    if k < b.len() && b[k] == b'{' {
-                        let (t, after) = rd_group(s, k + 1);
-                        text = rd_to_markdown(t, depth + 1);
+                    if let Some((t, after)) = second {
+                        text = render(t, false);
                         k = after;
                     }
-                    let url: String = rendered.split_whitespace().collect();
+                    let url: String = render(inner, true).split_whitespace().collect();
                     if text.trim().is_empty() {
                         out.push_str(&url);
                     } else {
@@ -4902,6 +4930,7 @@ fn rd_to_markdown(s: &str, depth: u32) -> String {
                     }
                 }
                 "code" | "command" | "env" | "file" | "kbd" | "option" | "pkg" | "samp" => {
+                    let rendered = render(inner, matches!(cmd, "code" | "env" | "kbd" | "option" | "samp"));
                     if !rendered.is_empty() {
                         out.push('`');
                         out.push_str(&rendered);
@@ -4910,35 +4939,80 @@ fn rd_to_markdown(s: &str, depth: u32) -> String {
                 }
                 "emph" | "var" | "dfn" | "cite" => {
                     out.push('*');
-                    out.push_str(&rendered);
+                    out.push_str(&render(inner, false));
                     out.push('*');
                 }
                 "strong" | "bold" => {
                     out.push_str("**");
-                    out.push_str(&rendered);
+                    out.push_str(&render(inner, false));
                     out.push_str("**");
                 }
                 "dQuote" => {
                     out.push('"');
-                    out.push_str(&rendered);
+                    out.push_str(&render(inner, false));
                     out.push('"');
                 }
                 "sQuote" => {
                     out.push('\'');
-                    out.push_str(&rendered);
+                    out.push_str(&render(inner, false));
                     out.push('\'');
                 }
+                // Rd2txt prints the plain second form of an equation or figure when there is one.
+                "eqn" | "deqn" | "figure" => match second {
+                    Some((plain, after)) => {
+                        out.push_str(&render(plain, true));
+                        k = after;
+                    }
+                    None => out.push_str(&render(inner, true)),
+                },
+                "tabular" => {
+                    if let Some((rows, after)) = second {
+                        out.push_str(&render(rows, false));
+                        k = after;
+                    }
+                }
+                // A \describe item reads as its label and its text.
+                "item" | "section" | "subsection" => {
+                    out.push_str(&render(inner, false));
+                    if let Some((text, after)) = second {
+                        out.push_str(": ");
+                        out.push_str(&render(text, false));
+                        k = after;
+                    }
+                }
+                // Rd2txt keeps the branch for text output: \if{fmt}{x}, \ifelse{fmt}{x}{y}.
+                "if" | "ifelse" => {
+                    if let Some((then, after)) = second {
+                        k = after;
+                        let mut other = None;
+                        if cmd == "ifelse" && k < b.len() && b[k] == b'{' {
+                            let (e, after_else) = rd_group(s, k + 1);
+                            other = Some(e);
+                            k = after_else;
+                        }
+                        if inner.split(',').any(|f| matches!(f.trim(), "text" | "TRUE")) {
+                            out.push_str(&render(then, false));
+                        } else if let Some(e) = other {
+                            out.push_str(&render(e, false));
+                        }
+                    }
+                }
                 // A cross-reference reads as the thing it names.
-                _ => out.push_str(&rendered),
+                c if RD_ONE_ARG.contains(&c) => {
+                    out.push_str(&render(inner, matches!(c, "url" | "verb" | "special" | "preformatted" | "out")));
+                }
+                // \enc, \method, \S3method, \S4method and user macros such as \insertRef{key}{pkg}
+                // read as their first argument; the second is an alternative or a qualifier.
+                _ => {
+                    out.push_str(&render(inner, false));
+                    if let Some((_, after)) = second {
+                        k = after;
+                    }
+                }
             }
             i = k;
         } else {
-            // A bare command such as \R or \dots stands for a word.
-            out.push_str(match cmd {
-                "R" => "R",
-                "dots" | "ldots" => "...",
-                _ => "",
-            });
+            // Any other bare command stands for nothing we can print.
             i = j.max(i + 1);
         }
     }
@@ -5996,6 +6070,41 @@ mod tests {
         assert_eq!(r["delimiter_would_give_ncol"], 3);
         // A file that is what it says carries no such claim.
         assert!(s(&by_name("csv_semicolon"), "delimiter_looks_like").is_empty());
+    }
+
+    #[test]
+    fn brace_groups_and_second_arguments_read_as_r_prints_them() {
+        let r = |s: &str| rd_inline_text(s);
+        // A bare group only groups, so its braces are not text.
+        assert_eq!(r("{Maxime Taillardat}"), "Maxime Taillardat");
+        assert_eq!(r("{ Eurostat -- accounts } and {{nested}} words"), "Eurostat -- accounts and nested words");
+        assert_eq!(r("\\emph{a {b} c}"), "*a b c*");
+        // Code and verbatim arguments keep their braces.
+        assert_eq!(r("\\code{function(x) {x}}"), "`function(x) {x}`");
+        assert_eq!(r("\\samp{a {b} c}"), "`a {b} c`");
+        assert_eq!(r("\\url{https://x.org/{a}}"), "https://x.org/{a}");
+        assert_eq!(r("\\eqn{x^{2}}"), "x^{2}");
+        // \eqn and \deqn print their ASCII form when they have one.
+        assert_eq!(r("the \\eqn{r}{r}-largest"), "the r-largest");
+        assert_eq!(r("\\eqn{\\alpha}{alpha}"), "alpha");
+        assert_eq!(r("\\deqn{a^2}{a squared}"), "a squared");
+        // \enc, \method and \S4method keep their first argument.
+        assert_eq!(r("\\enc{M\u{fc}ller}{Mueller}"), "M\u{fc}ller");
+        assert_eq!(r("\\method{print}{foo} and \\S3method{print}{bar} and \\S4method{show}{baz}"), "print and print and show");
+        // A user macro keeps its first argument too, never a literal second group.
+        assert_eq!(r("\\insertRef{kapraun2022fetalmodel}{httk}"), "kapraun2022fetalmodel");
+        // A group after a one-argument macro is text of its own.
+        assert_eq!(r("\\link{foo}{bar}"), "foobar");
+        assert_eq!(r("\\pkg{foo}{bar}"), "`foo`bar");
+        // Macros that take no argument keep their word before an empty group.
+        assert_eq!(r("\\R{} package, \\dots{} more"), "R package, ... more");
+        // A two-part item reads as its label and text, and a conditional keeps its text branch.
+        assert_eq!(r("\\describe{\\item{Label}{Its text.}}"), "Label: Its text.");
+        assert_eq!(r("\\if{html}{hidden}\\if{html,text}{shown}"), "shown");
+        assert_eq!(r("\\ifelse{html}{h}{t}"), "t");
+        assert_eq!(r("\\figure{f.png}{alt text}"), "alt text");
+        // Titles read through the same renderer.
+        assert_eq!(rd_plain("The {Venice} sea levels"), "The Venice sea levels");
     }
 
     #[test]

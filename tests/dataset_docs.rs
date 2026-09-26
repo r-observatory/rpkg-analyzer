@@ -117,3 +117,21 @@ fn a_kept_help_page_is_read_behind_more_left_out_pages_than_the_cap() {
     assert_eq!(z["dataset_doc_source"], "Kept source.");
     assert_eq!(z["dataset_doc_format"], 1);
 }
+
+#[test]
+fn a_source_written_with_brace_groups_stores_its_text_without_braces() {
+    let t = tree(&[
+        ("DESCRIPTION", DESC),
+        ("data/grouped.csv", "a;b\n1;2\n"),
+        (
+            "man/grouped.Rd",
+            "\\name{grouped}\n\\alias{grouped}\n\\docType{data}\n\\title{Grouped}\n\\source{{T.R. Fleming}, after \\enc{M\u{fc}ller}{Mueller} on the \\eqn{r}{r}-largest events, \\insertRef{key2022}{pkg}.}\n",
+        ),
+    ]);
+    let recs = records(&t, "release");
+    let g = recs.iter().find(|r| r["rec"] == "dataset" && r["name"] == "grouped").unwrap();
+    assert_eq!(
+        g["dataset_doc_source"],
+        "T.R. Fleming, after M\u{fc}ller on the r-largest events, key2022."
+    );
+}
