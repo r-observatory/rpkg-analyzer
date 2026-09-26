@@ -181,19 +181,83 @@ pub fn classify_examples(blocks: &[String]) -> Option<ExamplePage> {
     Some(ExamplePage { class, conditional })
 }
 
+static INTERNAL: LazyLock<regex::Regex> = LazyLock::new(|| regex::Regex::new(r"\\keyword\s*\{\s*internal\s*\}").unwrap());
+static DOC_TYPE: LazyLock<regex::Regex> = LazyLock::new(|| regex::Regex::new(r"\\docType\s*\{\s*([^}]*?)\s*\}").unwrap());
+
+/// An Rd name as R reads it: `\%>\%` is the operator `%>%`.
+fn rd_unescape(s: &str) -> String {
+    s.trim().replace("\\%", "%").replace("\\{", "{").replace("\\}", "}").replace("\\\\", "\\")
+}
+
 /// What one help page says, read once.
 pub struct PageFacts {
     pub examples: Option<ExamplePage>,
+    /// \name and every \alias.
+    pub names: Vec<String>,
+    pub internal: bool,
+    pub doc_type: Option<String>,
+    /// \docType{package} or an alias <Package>-package.
+    pub package_overview: bool,
 }
 
-pub fn page_facts(root: &Path, files: &[String]) -> Vec<PageFacts> {
+pub fn page_facts(root: &Path, files: &[String], package: &str) -> Vec<PageFacts> {
+    let overview_alias = format!("{package}-package");
     rd_page_files(files)
         .into_iter()
         .map(|f| {
             let text = crate::strip_rd_comments(&crate::read_lossy(root, f).unwrap_or_default());
-            PageFacts { examples: classify_examples(&example_blocks(&text)) }
+            let mut names: Vec<String> = crate::rd_all_blocks(&text, "name").iter().map(|s| rd_unescape(s)).collect();
+            let aliases: Vec<String> = crate::rd_all_blocks(&text, "alias").iter().map(|s| rd_unescape(s)).collect();
+            let doc_type = DOC_TYPE.captures(&text).map(|c| c[1].to_string());
+            let package_overview = doc_type.as_deref() == Some("package") || aliases.iter().any(|a| *a == overview_alias);
+            names.extend(aliases);
+            PageFacts {
+                examples: classify_examples(&example_blocks(&text)),
+                internal: INTERNAL.is_match(&text),
+                doc_type,
+                package_overview,
+                names,
+            }
         })
         .collect()
+}
+
+pub struct TopicCounts {
+    pub pages: i64,
+    pub internal: i64,
+    pub data: i64,
+    pub package: i64,
+    pub examples_coverage_fn: Option<f64>,
+    pub basis: Option<&'static str>,
+}
+
+/// Page counts, and the share of pages aliasing an export that have examples; with no plain
+/// export, the share of pages that are not internal and not data, package, class or methods.
+pub fn topic_counts(pages: &[PageFacts], exports: &[String]) -> TopicCounts {
+    let n = |f: &dyn Fn(&PageFacts) -> bool| pages.iter().filter(|p| f(p)).count() as i64;
+    let plain: Vec<&String> = exports.iter().filter(|e| !e.starts_with("pattern:")).collect();
+    let (denominator, basis): (Vec<&PageFacts>, &'static str) = if !plain.is_empty() {
+        (pages.iter().filter(|p| p.names.iter().any(|nm| plain.contains(&nm))).collect(), "exports")
+    } else {
+        let skip = ["data", "package", "class", "methods"];
+        (
+            pages
+                .iter()
+                .filter(|p| !p.internal && !p.doc_type.as_deref().is_some_and(|d| skip.contains(&d)))
+                .collect(),
+            "not_internal",
+        )
+    };
+    let coverage = (!denominator.is_empty())
+        .then(|| denominator.iter().filter(|p| p.examples.is_some()).count() as f64 / denominator.len() as f64);
+    TopicCounts {
+        pages: pages.len() as i64,
+        internal: n(&|p| p.internal),
+        data: n(&|p| p.doc_type.as_deref() == Some("data")),
+        package: n(&|p| p.package_overview),
+        examples_coverage_fn: coverage,
+        basis: coverage.map(|_| basis),
+    }
 }
 
 pub struct ExampleCounts {

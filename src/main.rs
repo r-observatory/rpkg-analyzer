@@ -3355,8 +3355,9 @@ fn main() {
     let port = metrics_portability(&desc, &root, &files);
     let tests = metrics_tests(&desc, &root, &files, &ns.exports);
     let docs = metrics_docs(&desc, &root, &files, &ns.exports, news_file);
-    let rd = rd_pages::page_facts(&root, &files);
+    let rd = rd_pages::page_facts(&root, &files, &package);
     let exc = rd_pages::example_counts(&rd);
+    let topics = rd_pages::topic_counts(&rd, &ns.exports);
     // With no example pages there is nothing to break down, so the buckets stay NULL.
     let bucket = |v: i64| (exc.pages > 0).then_some(v);
     let health = metrics_health(&desc, &root, &files);
@@ -3462,6 +3463,12 @@ fn main() {
         "ci_matrix_breadth": practices.ci_matrix_breadth,
         "ci_pr_gated": practices.ci_pr_gated,
         "dontrun_example_ratio": docs.dontrun_example_ratio,
+        "n_help_topics": topics.pages,
+        "n_help_topics_internal": topics.internal,
+        "n_help_topics_data": topics.data,
+        "n_help_topics_package": topics.package,
+        "examples_coverage_fn": topics.examples_coverage_fn,
+        "examples_coverage_fn_basis": topics.basis,
         "rd_example_pages": exc.pages,
         "rd_example_pages_run": bucket(exc.run),
         "rd_example_pages_donttest_only": bucket(exc.donttest_only),
