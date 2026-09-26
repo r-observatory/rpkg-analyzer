@@ -9,6 +9,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use tree_sitter::Parser;
 
+mod cli;
 mod rds;
 
 // ---- file walking -----------------------------------------------------------
@@ -3030,55 +3031,65 @@ fn graph_stats(n: usize, edges: &[(usize, usize)]) -> Network {
 /// data a newer build would describe differently.
 const ANALYZER_VERSION: &str = env!("CARGO_PKG_VERSION");
 
-fn main() {
-    let dir = std::env::args().nth(1).expect("usage: rpkg-analyzer <package_dir>");
-
-    if dir == "--version" || dir == "-V" {
-        println!("rpkg-analyzer {ANALYZER_VERSION}");
+/// Debug output: the parse tree of one file, or a histogram of its node kinds.
+fn print_parse_tree(f: &str, histogram: bool) {
+    let mut parser = Parser::new();
+    parser
+        .set_language(&tree_sitter_r::LANGUAGE.into())
+        .expect("load tree-sitter-r");
+    let src = std::fs::read_to_string(f).expect("read");
+    if let Some(lang) = language_for_ext(f) {
+        parser.set_language(&lang).expect("load grammar");
+    }
+    let tree = parser.parse(&src, None).expect("parse");
+    if !histogram {
+        println!("{}", tree.root_node().to_sexp());
         return;
     }
+    let mut hist: BTreeMap<String, i64> = BTreeMap::new();
+    let mut st = vec![tree.root_node()];
+    while let Some(x) = st.pop() {
+        *hist.entry(x.kind().to_string()).or_insert(0) += 1;
+        let mut c = x.walk();
+        for ch in x.children(&mut c) {
+            st.push(ch);
+        }
+    }
+    for (k, v) in hist {
+        println!("{v}\t{k}");
+    }
+}
+
+fn main() {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let mode = match cli::parse_args(&args) {
+        Ok(mode) => mode,
+        Err(usage) => {
+            eprintln!("{usage}");
+            std::process::exit(2);
+        }
+    };
+    let (dir, kind) = match mode {
+        cli::Mode::Version => {
+            println!("rpkg-analyzer {ANALYZER_VERSION}");
+            return;
+        }
+        // The dataset records only, read from the tree as given.
+        cli::Mode::Datasets(f) => {
+            for rec in rds::scan_package(Path::new(&f)) {
+                println!("{rec}");
+            }
+            return;
+        }
+        cli::Mode::Sexp(f) => return print_parse_tree(&f, false),
+        cli::Mode::Kinds(f) => return print_parse_tree(&f, true),
+        cli::Mode::Analyze { dir, kind } => (dir, kind),
+    };
 
     let mut parser = Parser::new();
     parser
         .set_language(&tree_sitter_r::LANGUAGE.into())
         .expect("load tree-sitter-r");
-
-    // --datasets <package_dir>: emit one `dataset` record per shipped dataset,
-    // read straight from R serialization with no R runtime.
-    if dir == "--datasets" {
-        let f = std::env::args().nth(2).expect("usage: rpkg-analyzer --datasets <package_dir>");
-        for rec in rds::scan_package(Path::new(&f)) {
-            println!("{rec}");
-        }
-        return;
-    }
-
-    // Debug: --sexp <file.R> prints the parse tree, for learning node kinds.
-    if dir == "--sexp" || dir == "--kinds" {
-        let f = std::env::args().nth(2).expect("<file>");
-        let src = std::fs::read_to_string(&f).expect("read");
-        if let Some(lang) = language_for_ext(&f) {
-            parser.set_language(&lang).expect("load grammar");
-        }
-        let tree = parser.parse(&src, None).expect("parse");
-        if dir == "--sexp" {
-            println!("{}", tree.root_node().to_sexp());
-        } else {
-            let mut hist: BTreeMap<String, i64> = BTreeMap::new();
-            let mut st = vec![tree.root_node()];
-            while let Some(x) = st.pop() {
-                *hist.entry(x.kind().to_string()).or_insert(0) += 1;
-                let mut c = x.walk();
-                for ch in x.children(&mut c) {
-                    st.push(ch);
-                }
-            }
-            for (k, v) in hist {
-                println!("{v}\t{k}");
-            }
-        }
-        return;
-    }
 
     let root = PathBuf::from(&dir);
     let files = list_files(&root);
@@ -3453,6 +3464,7 @@ fn main() {
     let summary = serde_json::json!({
         "rec": "summary",
         "analyzer_version": ANALYZER_VERSION,
+        "input_kind": kind.as_str(),
         "extdata": rds::extdata_inventory(&root),
         "package": package,
         "version": version,
@@ -3733,14 +3745,10 @@ mod tests {
             .collect()
     }
 
-    /// The summary record carries `analyzer_version`, and the pipelines decide
-    /// from it whether the rows they already hold were written by a build that
-    /// reads datasets the way this one does. The last release of the narrower reader
-    /// was 0.3.2, so a tree that still calls itself 0.3.2 is indistinguishable
-    /// from that release and no rescan downstream can ever fire. Any build
-    /// carrying the wider reader has to announce a version past it.
+    /// 0.4.0 was the last release under the old column contract, so this build must
+    /// report 0.5.0 or later or a pipeline cannot tell the two kinds of row apart.
     #[test]
-    fn analyzer_version_is_past_the_last_narrow_reader_release() {
+    fn analyzer_version_is_past_the_last_release_under_the_old_column_contract() {
         let parts = version_parts(ANALYZER_VERSION);
         assert!(
             parts.len() >= 3,
@@ -3748,9 +3756,9 @@ mod tests {
              component-wise against a released tag"
         );
         assert!(
-            version_ge(&parts, &[0, 4, 0]),
-            "ANALYZER_VERSION is {ANALYZER_VERSION}, at or below the 0.3.2 release that \
-             shipped the narrower dataset reader"
+            version_ge(&parts, &[0, 5, 0]),
+            "ANALYZER_VERSION is {ANALYZER_VERSION}, at or below 0.4.0, the last release \
+             under the old column contract"
         );
     }
 }

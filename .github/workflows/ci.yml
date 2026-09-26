@@ -22,6 +22,10 @@ jobs:
           mkdir -p "$pkg/R"
           printf 'Package: smoke\nVersion: 1.0\n' > "$pkg/DESCRIPTION"
           printf 'f <- function(x) x + 1\n' > "$pkg/R/a.R"
-          out="$(./target/release/rpkg-analyzer "$pkg" | head -1)"
+          out="$(./target/release/rpkg-analyzer "$pkg" --input-kind release | head -1)"
           echo "$out"
           echo "$out" | grep -q '"rec":"summary"'
+          echo "$out" | grep -q '"input_kind":"release"'
+          if ./target/release/rpkg-analyzer "$pkg" > /dev/null 2>&1; then
+            echo "the analyzer ran without --input-kind"; exit 1
+          fi
