@@ -29,3 +29,26 @@ fn version_datasets_and_sexp_need_no_input_kind() {
     let r = t.root.join("R/a.R");
     assert!(run(&["--sexp", r.to_str().unwrap()]).status.success());
 }
+
+#[test]
+fn explain_lists_each_decision_per_file() {
+    let t = tree(&[
+        ("DESCRIPTION", DESC),
+        (".Rbuildignore", "^notes$\n"),
+        ("notes/todo.md", "x\n"),
+        ("man/f.Rd", "\\name{f}\n\\examples{\n\\donttest{f()}\n}\n"),
+        ("vignettes/a.Rmd", "%\\VignetteEngine{knitr::rmarkdown}\n```{r, eval=FALSE}\n1\n```\n"),
+    ]);
+    let out = run(&["--explain", t.path(), "--input-kind", "git"]);
+    assert!(out.status.success());
+    let recs: Vec<serde_json::Value> =
+        String::from_utf8(out.stdout).unwrap().lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+    let file = |p: &str| recs.iter().find(|r| r["rec"] == "release_file" && r["path"] == p).cloned().unwrap();
+    assert_eq!(file("notes/todo.md")["kept"], false);
+    assert_eq!(file("man/f.Rd")["kept"], true);
+    let page = recs.iter().find(|r| r["rec"] == "rd_page").unwrap();
+    assert_eq!(page["file"], "man/f.Rd");
+    assert_eq!(page["examples"], "donttest_only");
+    let vig = recs.iter().find(|r| r["rec"] == "vignette").unwrap();
+    assert_eq!(vig["run"], "static");
+}

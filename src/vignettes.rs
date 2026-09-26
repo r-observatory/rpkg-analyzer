@@ -151,6 +151,16 @@ pub enum VignetteRun {
     Dynamic,
 }
 
+impl VignetteRun {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            VignetteRun::Static => "static",
+            VignetteRun::Gated => "gated",
+            VignetteRun::Dynamic => "dynamic",
+        }
+    }
+}
+
 pub fn classify(path: &str, text: &str, has_orig_sibling: bool) -> VignetteRun {
     let headers = chunk_headers(path, text);
     let evals: Vec<String> = headers.iter().flatten().filter_map(|h| eval_value(h)).collect();

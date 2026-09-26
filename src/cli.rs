@@ -24,6 +24,7 @@ pub enum Mode {
     Datasets(String),
     Sexp(String),
     Kinds(String),
+    Explain { dir: String, kind: InputKind },
     Analyze { dir: String, kind: InputKind },
 }
 
@@ -49,6 +50,12 @@ pub fn parse_args(args: &[String]) -> Result<Mode, String> {
         Some("--datasets") => file_arg("usage: rpkg-analyzer --datasets <package_dir>").map(Mode::Datasets),
         Some("--sexp") => file_arg("usage: rpkg-analyzer --sexp <file>").map(Mode::Sexp),
         Some("--kinds") => file_arg("usage: rpkg-analyzer --kinds <file>").map(Mode::Kinds),
+        Some("--explain") => {
+            let usage = "usage: rpkg-analyzer --explain <package_dir> --input-kind release|git";
+            let dir = args.get(1).cloned().ok_or_else(|| usage.to_string())?;
+            let kind = kind_after(&args[2..]).ok_or_else(|| usage.to_string())?;
+            Ok(Mode::Explain { dir, kind })
+        }
         Some(dir) => {
             let kind = kind_after(&args[1..]).ok_or_else(|| USAGE.to_string())?;
             Ok(Mode::Analyze { dir: dir.to_string(), kind })
@@ -92,5 +99,10 @@ mod tests {
         assert_eq!(parse_args(&args(&["--datasets", "pkg"])), Ok(Mode::Datasets("pkg".into())));
         assert_eq!(parse_args(&args(&["--sexp", "a.R"])), Ok(Mode::Sexp("a.R".into())));
         assert_eq!(parse_args(&args(&["--kinds", "a.R"])), Ok(Mode::Kinds("a.R".into())));
+        assert_eq!(
+            parse_args(&args(&["--explain", "pkg", "--input-kind", "git"])),
+            Ok(Mode::Explain { dir: "pkg".into(), kind: InputKind::Git })
+        );
+        assert!(parse_args(&args(&["--explain", "pkg"])).is_err());
     }
 }

@@ -3106,6 +3106,40 @@ fn print_parse_tree(f: &str, histogram: bool) {
     }
 }
 
+/// Debug output: the per-file decisions behind the summary (release boundary, help
+/// pages, vignettes), one record per file.
+fn explain(dir: &str, kind: cli::InputKind) {
+    let root = PathBuf::from(dir);
+    let tree_files = list_files(&root);
+    let desc = read(&root, "DESCRIPTION").map(|t| parse_dcf(&t)).unwrap_or_default();
+    let package = desc.get("Package").map(|s| s.trim().to_string()).unwrap_or_default();
+    let release = release_files::ReleaseList::for_input(&root, &tree_files, &package, kind);
+    let files = release.files(&tree_files);
+    let known = release.is_known();
+    for f in &tree_files {
+        let kept = known.then(|| files.contains(f));
+        println!("{}", serde_json::json!({"rec": "release_file", "path": f, "kept": kept}));
+    }
+    for p in rd_pages::page_facts(&root, &files, &package) {
+        println!(
+            "{}",
+            serde_json::json!({
+                "rec": "rd_page", "file": p.file,
+                "examples": p.examples.as_ref().map(|e| e.class.as_str()),
+                "conditional": p.examples.as_ref().map(|e| e.conditional),
+                "internal": p.internal, "doc_type": p.doc_type, "package_overview": p.package_overview,
+            })
+        );
+    }
+    for v in vignettes::vignette_sources(&root, &files) {
+        let run = read_lossy(&root, &v).map(|t| {
+            let orig = format!("{v}.orig");
+            vignettes::classify(&v, &t, files.contains(&orig)).as_str()
+        });
+        println!("{}", serde_json::json!({"rec": "vignette", "file": v, "run": run}));
+    }
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mode = match cli::parse_args(&args) {
@@ -3129,6 +3163,7 @@ fn main() {
         }
         cli::Mode::Sexp(f) => return print_parse_tree(&f, false),
         cli::Mode::Kinds(f) => return print_parse_tree(&f, true),
+        cli::Mode::Explain { dir, kind } => return explain(&dir, kind),
         cli::Mode::Analyze { dir, kind } => (dir, kind),
     };
 

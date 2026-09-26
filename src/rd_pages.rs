@@ -77,6 +77,17 @@ pub enum ExampleClass {
     Empty,
 }
 
+impl ExampleClass {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ExampleClass::Run => "run",
+            ExampleClass::DonttestOnly => "donttest_only",
+            ExampleClass::NeverRun => "never_run",
+            ExampleClass::Empty => "empty",
+        }
+    }
+}
+
 #[derive(Default)]
 struct ExampleText {
     plain: String,
@@ -191,6 +202,7 @@ fn rd_unescape(s: &str) -> String {
 
 /// What one help page says, read once.
 pub struct PageFacts {
+    pub file: String,
     pub examples: Option<ExamplePage>,
     /// \name and every \alias.
     pub names: Vec<String>,
@@ -212,6 +224,7 @@ pub fn page_facts(root: &Path, files: &[String], package: &str) -> Vec<PageFacts
             let package_overview = doc_type.as_deref() == Some("package") || aliases.iter().any(|a| *a == overview_alias);
             names.extend(aliases);
             PageFacts {
+                file: f.to_string(),
                 examples: classify_examples(&example_blocks(&text)),
                 internal: INTERNAL.is_match(&text),
                 doc_type,
