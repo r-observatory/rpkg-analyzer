@@ -119,16 +119,24 @@ fn language_for_ext(path: &str) -> Option<tree_sitter::Language> {
     })
 }
 
+static VENDORED_SRC: std::sync::LazyLock<regex::Regex> =
+    std::sync::LazyLock::new(|| regex::Regex::new(r"^src/rust/vendor[^/]*/|^src/(?:[^/]+/)*target/").unwrap());
+
+/// Vendored crates and cargo build output, which are not the package's own code.
+fn is_vendored_src(path: &str) -> bool {
+    VENDORED_SRC.is_match(path)
+}
+
 /// the is_src: src/ files with a compiled-language extension only (structure.R).
 /// Excludes Makevars, configure, .in, etc.
 fn is_src_file(path: &str) -> bool {
-    if !path.starts_with("src/") {
+    if !path.starts_with("src/") || is_vendored_src(path) {
         return false;
     }
     let ext = path.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
     matches!(
         ext.as_str(),
-        "c" | "cc" | "cpp" | "cxx" | "h" | "hpp" | "hxx" | "f" | "f90" | "f95"
+        "c" | "cc" | "cpp" | "cxx" | "h" | "hpp" | "hxx" | "f" | "f90" | "f95" | "rs"
     )
 }
 
@@ -2238,7 +2246,7 @@ fn count_src_functions(root: &Path, files: &[String]) -> SrcFns {
     let mut parser = Parser::new();
     let (mut c, mut cpp, mut fortran, mut rust, mut nf) = (0i64, 0i64, 0i64, 0i64, 0i64);
     for f in files {
-        if !f.starts_with("src/") {
+        if !f.starts_with("src/") || is_vendored_src(f) {
             continue;
         }
         let Some(lang) = language_for_ext(f) else { continue };
@@ -2540,7 +2548,7 @@ fn build_src_graph(
     let mut calls: Vec<Vec<String>> = Vec::new();
     let mut nodes: Vec<SrcFn> = Vec::new();
     for f in files {
-        if !f.starts_with("src/") {
+        if !f.starts_with("src/") || (lang == SrcLang::Rust && is_vendored_src(f)) {
             continue;
         }
         let ext = f.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
@@ -3799,6 +3807,16 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rust_sources_count_and_vendored_crates_do_not() {
+        assert!(is_src_file("src/rust/src/lib.rs"));
+        assert!(is_src_file("src/init.c"));
+        assert!(!is_src_file("src/rust/vendor/cfg-if/src/lib.rs"));
+        assert!(!is_src_file("src/rust/vendor-patched/x/src/lib.rs"));
+        assert!(!is_src_file("src/rust/target/release/build/x.rs"));
+        assert!(!is_src_file("src/Makevars"));
+    }
 
     #[test]
     fn a_filled_template_or_a_full_text_is_complete() {
