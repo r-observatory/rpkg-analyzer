@@ -66,3 +66,54 @@ fn only_a_data_directory_dataset_takes_its_page_source_and_format() {
     assert!(e.as_object().unwrap().contains_key("dataset_doc_source"));
     assert!(e.as_object().unwrap().contains_key("dataset_doc_format"));
 }
+
+#[test]
+fn a_page_without_a_title_gives_way_to_a_titled_page_for_the_same_name() {
+    // The untitled pages sort first; the titled page gives all three fields.
+    let t = tree(&[
+        ("DESCRIPTION", DESC),
+        ("data/x.csv", "a;b\n1;2\n"),
+        ("data/y.csv", "a;b\n1;2\n"),
+        ("data/z.csv", "a;b\n1;2\n"),
+        ("man/a_x.Rd", "\\name{a_x}\n\\alias{x}\n\\source{Untitled source.}\n"),
+        ("man/a_y.Rd", "\\name{a_y}\n\\alias{y}\n\\title{ }\n"),
+        ("man/a_z.Rd", "\\name{a_z}\n\\alias{z}\n\\format{A frame.}\n\\source{Only page.}\n"),
+        ("man/b_x.Rd", "\\name{b_x}\n\\alias{x}\n\\title{The X}\n\\format{A frame.}\n\\source{Titled source.}\n"),
+        ("man/b_y.Rd", "\\name{b_y}\n\\alias{y}\n\\title{The Y}\n\\format{A frame.}\n\\source{Y source.}\n"),
+        ("man/c_x.Rd", "\\name{c_x}\n\\alias{x}\n\\title{A later X}\n\\source{Later source.}\n"),
+    ]);
+    let recs = records(&t, "release");
+    let ds = |n: &str| recs.iter().find(|r| r["rec"] == "dataset" && r["name"] == n).cloned().unwrap();
+    let x = ds("x");
+    assert_eq!(x["title"], "The X");
+    assert_eq!(x["dataset_doc_source"], "Titled source.");
+    assert_eq!(x["dataset_doc_format"], 1);
+    let y = ds("y");
+    assert_eq!(y["title"], "The Y", "an empty title gives way too");
+    assert_eq!(y["dataset_doc_source"], "Y source.");
+    assert_eq!(y["dataset_doc_format"], 1);
+    // With no titled page for the name, the untitled page still speaks.
+    let z = ds("z");
+    assert_eq!(z["title"], Value::Null);
+    assert_eq!(z["dataset_doc_source"], "Only page.");
+    assert_eq!(z["dataset_doc_format"], 1);
+}
+
+#[test]
+fn a_kept_help_page_is_read_behind_more_left_out_pages_than_the_cap() {
+    // More left-out pages than the help page cap, sorted ahead of the one the release keeps.
+    let mut owned: Vec<(String, &str)> = (0..4001)
+        .map(|i| (format!("man/a{i:04}.Rd"), "\\name{left}\n\\alias{z}\n\\title{Left out}\n\\source{Left out.}\n"))
+        .collect();
+    owned.push(("man/z.Rd".to_string(), "\\name{z}\n\\alias{z}\n\\title{The Z}\n\\format{A frame.}\n\\source{Kept source.}\n"));
+    owned.push(("data/z.csv".to_string(), "a;b\n1;2\n"));
+    owned.push((".Rbuildignore".to_string(), "^man/a[0-9]+\\.Rd$\n"));
+    owned.push(("DESCRIPTION".to_string(), DESC));
+    let files: Vec<(&str, &str)> = owned.iter().map(|(p, t)| (p.as_str(), *t)).collect();
+    let t = tree(&files);
+    let recs = records(&t, "git");
+    let z = recs.iter().find(|r| r["rec"] == "dataset" && r["name"] == "z").unwrap();
+    assert_eq!(z["title"], "The Z");
+    assert_eq!(z["dataset_doc_source"], "Kept source.");
+    assert_eq!(z["dataset_doc_format"], 1);
+}

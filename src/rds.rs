@@ -4725,7 +4725,12 @@ const RD_SOURCE_CAP: usize = 4096;
 fn rd_dataset_docs(root: &Path, excluded: &BTreeSet<String>) -> std::collections::HashMap<String, RdDatasetDoc> {
     let mut out = std::collections::HashMap::new();
     let Ok(rd) = std::fs::read_dir(root.join("man")) else { return out };
-    let mut paths: Vec<_> = rd.flatten().map(|e| e.path()).collect();
+    // Pages the build leaves out go before the cap, so they cannot fill it ahead of kept ones.
+    let mut paths: Vec<_> = rd
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| !excluded.contains(&rel_path(root, p)))
+        .collect();
     paths.sort();
     for p in paths.iter().take(RD_FILE_CAP) {
         let is_rd = p
@@ -4733,7 +4738,7 @@ fn rd_dataset_docs(root: &Path, excluded: &BTreeSet<String>) -> std::collections
             .and_then(|e| e.to_str())
             .map(|e| e.eq_ignore_ascii_case("rd"))
             .unwrap_or(false);
-        if !is_rd || excluded.contains(&rel_path(root, p)) {
+        if !is_rd {
             continue;
         }
         let Ok(raw) = std::fs::read(&p) else { continue };
@@ -4753,11 +4758,14 @@ fn rd_dataset_docs(root: &Path, excluded: &BTreeSet<String>) -> std::collections
         });
         let has_format = rd_field(&text, "format").is_some();
         for alias in rd_all_fields(&text, "alias") {
-            out.entry(rd_plain(&alias)).or_insert_with(|| RdDatasetDoc {
-                title: title.clone(),
-                source: source.clone().filter(|s| !s.is_empty()),
-                has_format,
-            });
+            let key = rd_plain(&alias);
+            // The first titled page gives all three fields; an untitled one only stands in until then.
+            if out.get(&key).is_none_or(|d: &RdDatasetDoc| d.title.is_none() && title.is_some()) {
+                out.insert(
+                    key,
+                    RdDatasetDoc { title: title.clone(), source: source.clone().filter(|s| !s.is_empty()), has_format },
+                );
+            }
         }
     }
     out
