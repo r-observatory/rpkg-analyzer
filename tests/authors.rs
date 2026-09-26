@@ -24,3 +24,12 @@ fn a_legacy_author_field_is_split_into_clean_names() {
         r#"[{"given":"Ann","family":"Lee","roles":[],"comment":"University of X"},{"given":"Bob","family":"Gray","roles":[]}]"#
     );
 }
+
+#[test]
+fn a_non_ascii_comment_before_an_orcid_url_keeps_the_record() {
+    let desc = "Package: fixpkg\nVersion: 1.0.0\nAuthors@R: person(\"Ayse\", \"Kaya\", comment = c(\"İTÜ, orcid.org/\"))\n";
+    let t = tree(&[("DESCRIPTION", desc)]);
+    let s = summary(&t, "release");
+    assert_eq!(s["n_authors"], 1);
+    assert_eq!(s["authors"], r#"[{"given":"Ayse","family":"Kaya","roles":[],"comment":"İTÜ, orcid.org/"}]"#);
+}

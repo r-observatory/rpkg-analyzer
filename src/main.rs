@@ -1467,7 +1467,8 @@ struct Meta {
     maintainer: Option<String>,
     maintainer_email: Option<String>,
     n_authors: Option<i64>,
-    /// Pre-serialized JSON array of {given,family,roles} objects, matching the
+    /// Pre-serialized JSON array of {given,family,roles} objects, each followed by
+    /// comment, orcid and ror keys only when declared, matching the
     /// `as.character(jsonlite::toJSON(parsed, auto_unbox = TRUE))`. we store this
     /// as a character scalar containing JSON text (double-encoded when embedded in
     /// the outer summary object), so this is a String, not a Vec<String>.
@@ -1577,20 +1578,21 @@ fn meta_parse_person(inner: &str) -> Person {
     // parenthesis inside a quoted part does not end the c(...).
     let comment_c_re = regex::Regex::new(r#"comment\s*=\s*c\(((?:"[^"]*"|'[^']*'|[^)"'])*)\)"#).unwrap();
     let comment_s_re = regex::Regex::new(r#"comment\s*=\s*(?:"([^"]*)"|'([^']*)')"#).unwrap();
-    // A part's name may be quoted: c('ORCID' = "...") reads as c(ORCID = "...").
-    let key_re = |key: &str| regex::Regex::new(&format!(r#"(?i)["']?\b{key}\b["']?\s*=\s*(?:"([^"]*)"|'([^']*)')"#)).unwrap();
-    let comment_named_re =
-        regex::Regex::new(r#"(?:[A-Za-z_.][A-Za-z0-9_.]*|"[^"]*"|'[^']*')\s*=\s*(?:"[^"]*"|'[^']*')"#).unwrap();
     let (mut orcid, mut ror, mut free) = (None, None, Vec::new());
     let mut comment_text = String::new();
     if let Some(c) = comment_c_re.captures(inner) {
         let body = c.get(1).map(|m| m.as_str()).unwrap_or("");
-        let value = |re: &regex::Regex| {
-            re.captures(body).and_then(|c| c.get(1).or_else(|| c.get(2))).map(|m| m.as_str().to_string())
-        };
-        orcid = value(&key_re("ORCID")).and_then(|v| authors::orcid_checked(&v));
-        ror = value(&key_re("ROR")).and_then(|v| authors::ror_checked(&v));
-        free = extract_quoted(&comment_named_re.replace_all(body, ""));
+        // A part's name may be quoted: c('ORCID' = "...") reads as c(ORCID = "...").
+        let parts = authors::comment_parts(body);
+        let is_key = |name: &Option<String>, key: &str| name.as_deref().is_some_and(|n| n.eq_ignore_ascii_case(key));
+        orcid = parts.iter().filter(|(n, _)| is_key(n, "ORCID")).find_map(|(_, v)| authors::orcid_checked(v));
+        ror = parts.iter().filter(|(n, _)| is_key(n, "ROR")).find_map(|(_, v)| authors::ror_checked(v));
+        // Other named parts keep their value without the name, as CRAN keeps them.
+        free = parts
+            .into_iter()
+            .filter(|(n, _)| !is_key(n, "ORCID") && !is_key(n, "ROR"))
+            .map(|(_, v)| v)
+            .collect();
         comment_text = body.to_string();
     } else if let Some(c) = comment_s_re.captures(inner) {
         let v = c.get(1).or_else(|| c.get(2)).map(|m| m.as_str()).unwrap_or("");
@@ -1600,8 +1602,8 @@ fn meta_parse_person(inner: &str) -> Person {
     if orcid.is_none() {
         orcid = authors::orcid_in_text(&comment_text);
     }
-    // A part that is only an ORCID is the identifier, not a comment.
-    free.retain(|f| authors::orcid_checked(f).is_none());
+    // A part that is only the kept ORCID is the identifier; any other iD stays in the comment.
+    free.retain(|f| orcid.is_none() || authors::orcid_checked(f) != orcid);
 
     if given.is_none() || family.is_none() {
         let cleaned = named_c_re.replace_all(inner, "");
@@ -1629,9 +1631,10 @@ fn meta_parse_author_text(text: &str) -> Vec<Person> {
     }
     // Some Author fields hold person() calls; those read as Authors@R.
     if regex::Regex::new(r"\bperson\s*\(").unwrap().is_match(t) {
-        let inners = meta_person_inners(t);
-        if !inners.is_empty() {
-            return inners.iter().map(|inner| meta_parse_person(inner)).collect();
+        let persons: Vec<Person> = meta_person_inners(t).iter().map(|inner| meta_parse_person(inner)).collect();
+        // Prose such as "person(s)" parses to no name, so that text is split as prose instead.
+        if persons.iter().any(|p| p.given.is_some() || p.family.is_some()) {
+            return persons;
         }
     }
 
@@ -3930,6 +3933,40 @@ mod tests {
     }
 
     #[test]
+    fn the_rest_of_the_comment_is_kept() {
+        let turkish = meta_parse_person(r#""Ayse", "Kaya", comment = c("İTÜ, orcid.org/")"#);
+        assert_eq!((turkish.given.as_deref(), turkish.family.as_deref()), (Some("Ayse"), Some("Kaya")));
+        assert_eq!(turkish.orcid, None);
+        assert_eq!(turkish.comment.as_deref(), Some("İTÜ, orcid.org/"));
+        let mixed = meta_parse_person(r#""Ann", "Lee", comment = "Univ of X, https://orcid.org/0000-0002-1825-0097""#);
+        assert_eq!(mixed.orcid.as_deref(), Some("0000-0002-1825-0097"));
+        assert_eq!(mixed.comment.as_deref(), Some("Univ of X, https://orcid.org/0000-0002-1825-0097"));
+        let named = meta_parse_person(
+            r#""Ann", "Lee", comment = c(affiliation = "Univ (X)", 'github' = "annlee", ORCID = "0000-0002-1825-0097", "Wrote it")"#,
+        );
+        assert_eq!(named.orcid.as_deref(), Some("0000-0002-1825-0097"));
+        assert_eq!(named.comment.as_deref(), Some("Univ (X); annlee; Wrote it"));
+        let org = meta_parse_person(r#""ACME", role = "fnd", comment = c(ror = "05dxps055", project = "Edicitnet", grant_agreement = "776665")"#);
+        assert_eq!(org.ror.as_deref(), Some("05dxps055"));
+        assert_eq!(org.comment.as_deref(), Some("Edicitnet; 776665"));
+    }
+
+    #[test]
+    fn an_id_part_is_dropped_only_when_it_is_the_kept_orcid() {
+        assert!(authors::orcid_checked("0000-0001-8715-4771").is_some());
+        let bare = meta_parse_person(r#""Ingo", "Rohlfing", comment = c("0000-0001-8715-4771")"#);
+        assert_eq!(bare.orcid, None, "an unnamed iD is not declared as an ORCID");
+        assert_eq!(bare.comment.as_deref(), Some("0000-0001-8715-4771"));
+        let other = meta_parse_person(r#""Ann", "Lee", comment = c(ORCID = "0000-0002-1825-0097", "0000-0001-5109-3700")"#);
+        assert_eq!(other.orcid.as_deref(), Some("0000-0002-1825-0097"));
+        assert_eq!(other.comment.as_deref(), Some("0000-0001-5109-3700"));
+        let same = meta_parse_person(
+            r#""Ann", "Lee", comment = c(ORCID = "0000-0002-1825-0097", "https://orcid.org/0000-0002-1825-0097")"#,
+        );
+        assert_eq!(same.comment, None);
+    }
+
+    #[test]
     fn positional_slots_keep_their_place_and_never_hold_an_email() {
         let p = meta_parse_person(r#""", "Smith", role = "aut""#);
         assert_eq!((p.given.as_deref(), p.family.as_deref()), (None, Some("Smith")));
@@ -3977,6 +4014,15 @@ mod tests {
         assert_eq!(ps[2].comment.as_deref(), Some("R port by"));
         let as_r = meta_parse_author_text(r#"c(person("Ann", "Lee", role = "aut"), person("Bob", "Gray"))"#);
         assert_eq!(names(&as_r), vec![(Some("Ann"), Some("Lee")), (Some("Bob"), Some("Gray"))]);
+    }
+
+    #[test]
+    fn person_s_in_prose_is_not_a_person_call() {
+        let prose = meta_parse_author_text("Ann Lee and other person(s)");
+        assert_eq!(names(&prose), vec![(Some("Ann"), Some("Lee")), (Some("other"), Some("person"))]);
+        let noted = meta_parse_author_text("Ann Lee (a person (s) who wrote it), Bob Gray");
+        assert_eq!(noted.len(), 2);
+        assert_eq!(names(&noted)[1], (Some("Bob"), Some("Gray")));
     }
 
     #[test]

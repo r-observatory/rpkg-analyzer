@@ -7,6 +7,8 @@ static ORCID_FORM: LazyLock<regex::Regex> =
     LazyLock::new(|| regex::Regex::new(r"^(\d{4})-?(\d{4})-?(\d{4})-?(\d{3}[\dX])$").unwrap());
 static ORCID_URL: LazyLock<regex::Regex> =
     LazyLock::new(|| regex::Regex::new(r"(?i)orcid\.org/(\d{4}-\d{4}-\d{4}-\d{3}[\dX])").unwrap());
+static ORCID_PREFIX: LazyLock<regex::Regex> =
+    LazyLock::new(|| regex::Regex::new(r"(?i)^(?:https?://)?(?:www\.)?orcid\.org/").unwrap());
 static ROR_FORM: LazyLock<regex::Regex> =
     LazyLock::new(|| regex::Regex::new(r"^0[a-hj-km-np-tv-z0-9]{6}[0-9]{2}$").unwrap());
 static EMAIL: LazyLock<regex::Regex> =
@@ -14,12 +16,20 @@ static EMAIL: LazyLock<regex::Regex> =
 static EMAIL_BRACKETED: LazyLock<regex::Regex> = LazyLock::new(|| regex::Regex::new(r"\s*<[^<>]*@[^<>]*>").unwrap());
 static EMAIL_ONLY: LazyLock<regex::Regex> =
     LazyLock::new(|| regex::Regex::new(r"^[<(]?[^\s<>()@,;]+@[^\s<>()@,;]+\.[^\s<>()@,;]+[>)]?$").unwrap());
+// One part of a comment = c(...) body: an optional name (bare, quoted or backticked), then a
+// quoted value. Every quoted value is consumed from its opening quote, so text inside it is never a name.
+static COMMENT_PART: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(
+        r#"(?:([A-Za-z_.][A-Za-z0-9_.]*)|`([^`]*)`|"([^"]*)"|'([^']*)')\s*=\s*(?:"([^"]*)"|'([^']*)')|"([^"]*)"|'([^']*)'"#,
+    )
+    .unwrap()
+});
 
 /// A bare ORCID iD, kept only when its ISO 7064 MOD 11-2 check digit holds.
 pub fn orcid_checked(raw: &str) -> Option<String> {
     let v = raw.trim();
-    let start = v.to_lowercase().find("orcid.org/").map(|i| i + "orcid.org/".len()).unwrap_or(0);
-    let bare = v[start..].trim_end_matches('/').to_uppercase();
+    // Only a leading orcid.org URL is stripped, so text before it means the value is not an iD.
+    let bare = ORCID_PREFIX.replace(v, "").trim_end_matches('/').to_ascii_uppercase();
     let c = ORCID_FORM.captures(&bare)?;
     let digits = format!("{}{}{}{}", &c[1], &c[2], &c[3], &c[4]);
     let mut total = 0u32;
@@ -63,6 +73,18 @@ pub fn clean_comment(parts: &[String]) -> Option<String> {
     (!trimmed.is_empty()).then(|| trimmed.chars().take(120).collect())
 }
 
+/// The quoted parts of a comment = c(...) body in order, each with its name when it has one.
+pub fn comment_parts(body: &str) -> Vec<(Option<String>, String)> {
+    COMMENT_PART
+        .captures_iter(body)
+        .map(|c| {
+            let name = (1..=4).find_map(|i| c.get(i)).map(|m| m.as_str().to_string());
+            let value = (5..=8).find_map(|i| c.get(i)).map_or("", |m| m.as_str()).to_string();
+            (name, value)
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -74,6 +96,34 @@ mod tests {
         assert_eq!(orcid_checked("0000-0002-1825-0098"), None);
         assert_eq!(orcid_checked("0000-0002-1825"), None);
         assert_eq!(orcid_in_text("see https://orcid.org/0000-0001-5109-3700.").as_deref(), Some("0000-0001-5109-3700"));
+        assert_eq!(orcid_checked("http://www.orcid.org/0000-0002-1825-0097/").as_deref(), Some("0000-0002-1825-0097"));
+    }
+
+    #[test]
+    fn only_a_leading_orcid_url_is_read_as_an_id() {
+        // Lower-casing changes the byte length of these letters, which must not move a slice.
+        assert_eq!(orcid_checked("\u{130}T\u{dc}, orcid.org/"), None);
+        assert_eq!(orcid_checked("\u{212a}\u{212a}\u{212a} orcid.org/0000-0002-1825-0097"), None);
+        assert_eq!(orcid_checked("\u{130} https://orcid.org/0000-0002-1825-0097"), None);
+        assert_eq!(orcid_checked("Univ of X, https://orcid.org/0000-0002-1825-0097"), None);
+        assert_eq!(
+            orcid_in_text("\u{130}T\u{dc}, https://orcid.org/0000-0002-1825-0097").as_deref(),
+            Some("0000-0002-1825-0097")
+        );
+    }
+
+    #[test]
+    fn comment_parts_come_in_order_with_their_names() {
+        let parts = comment_parts(r#"affiliation = "Univ (X)", 'ORCID'="0000-0002-1825-0097", "King's College", `grant` = 'G-1', "a = 'b'""#);
+        let want: Vec<(Option<&str>, &str)> = vec![
+            (Some("affiliation"), "Univ (X)"),
+            (Some("ORCID"), "0000-0002-1825-0097"),
+            (None, "King's College"),
+            (Some("grant"), "G-1"),
+            (None, "a = 'b'"),
+        ];
+        let got: Vec<(Option<&str>, &str)> = parts.iter().map(|(n, v)| (n.as_deref(), v.as_str())).collect();
+        assert_eq!(got, want);
     }
 
     #[test]
