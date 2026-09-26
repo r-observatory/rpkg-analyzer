@@ -74,7 +74,7 @@ fn an_unreadable_rbuildignore_nulls_every_release_content_value() {
     assert_eq!(s["input_kind"], "git");
     assert_eq!(s["package"], "fixpkg");
     assert_eq!(s["ci_present"], true, "repository-only values are still computed");
-    for k in ["files_r", "n_files", "loc_r", "has_readme", "license", "build_ignore_bad_lines"] {
+    for k in ["files_r", "n_files", "loc_r", "has_readme", "license", "build_ignore_bad_lines", "build_ignored"] {
         assert_eq!(s[k], Value::Null, "{k} is undetermined");
     }
     assert!(recs.iter().all(|r| r["rec"] != "function"), "no release-content detail records");
@@ -144,4 +144,12 @@ fn build_ignored_names_the_left_out_items_on_git_input_only() {
     assert_eq!(summary(&t, "release")["build_ignored"], Value::Null);
     let none = tree(&[("DESCRIPTION", DESC)]);
     assert_eq!(summary(&none, "git")["build_ignored"], serde_json::json!([]));
+    // The left-out source is found in the tree, not in the release, so refs.bib does not hide it.
+    let vig = tree(&[
+        ("DESCRIPTION", DESC),
+        ("vignettes/a.Rnw", "\\documentclass{article}\n"),
+        ("vignettes/refs.bib", "@book{x}\n"),
+        (".Rbuildignore", "^vignettes/a\\.Rnw$\n"),
+    ]);
+    assert_eq!(summary(&vig, "git")["build_ignored"], serde_json::json!(["vignettes"]));
 }

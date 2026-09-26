@@ -406,6 +406,17 @@ mod tests {
             vec!["README.md", "vignettes", "vignettes/articles", "_pkgdown.yml", "pkgdown", "CODE_OF_CONDUCT.md", ".github"],
             "vignettes is reported although refs.bib survives; inst/CITATION and tests stay in"
         );
+
+        let filtered = |tree: &[String], rbi: &str| match filter_release(tree, &RbuildignoreText::Text(rbi.into()), "fixpkg") {
+            ReleaseList::Filtered(f) => f,
+            _ => panic!("expected a filtered list"),
+        };
+        let two = files(&["vignettes/a.Rmd", "vignettes/b.Rmd"]);
+        let f = filtered(&two, "^vignettes/a\\.Rmd$\n");
+        assert!(build_ignored_items(&two, &f, &two).is_empty(), "b.Rmd is still built");
+        let bib_only = files(&["vignettes/refs.bib"]);
+        let f = filtered(&bib_only, "^vignettes/refs\\.bib$\n");
+        assert!(build_ignored_items(&bib_only, &f, &[]).is_empty(), "no source means no vignettes to leave out");
     }
 
     #[test]
