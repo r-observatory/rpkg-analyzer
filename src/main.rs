@@ -297,6 +297,29 @@ fn legal_tokenize(lic: &str) -> Vec<String> {
         .collect()
 }
 
+/// A value CRAN's template leaves unfilled: blank, <...>, YEAR, COPYRIGHT HOLDER or "your name".
+fn is_license_placeholder(v: &str) -> bool {
+    let v = v.trim();
+    v.is_empty()
+        || (v.starts_with('<') && v.ends_with('>'))
+        || v.eq_ignore_ascii_case("YEAR")
+        || v.eq_ignore_ascii_case("COPYRIGHT HOLDER")
+        || v.to_lowercase().contains("your name")
+}
+
+/// A filled MIT/BSD template (both lines, real values), or a full license text (neither line).
+fn license_template_complete(content: &str) -> bool {
+    let year_re = regex::Regex::new(r"(?m)^\s*YEAR:\s*(.*)$").unwrap();
+    let holder_re = regex::Regex::new(r"(?m)^\s*COPYRIGHT HOLDER:\s*(.*)$").unwrap();
+    let year = year_re.captures(content).map(|c| c[1].to_string());
+    let holder = holder_re.captures(content).map(|c| c[1].to_string());
+    match (year, holder) {
+        (Some(y), Some(h)) => !is_license_placeholder(&y) && !is_license_placeholder(&h),
+        (None, None) => !content.trim().is_empty(),
+        _ => false,
+    }
+}
+
 fn metrics_legal(desc: &BTreeMap<String, String>, root: &Path, files: &[String]) -> Legal {
     let license = desc
         .get("License")
@@ -325,13 +348,11 @@ fn metrics_legal(desc: &BTreeMap<String, String>, root: &Path, files: &[String])
         match path {
             None => Some(false),
             Some(p) => {
-                let content = read(root, p).unwrap_or_default();
+                let content = read_lossy(root, p).unwrap_or_default();
                 if content.trim().is_empty() {
                     Some(false)
                 } else if tokens.iter().any(|t| TEMPLATE_TOKENS.contains(&t.as_str())) {
-                    let year = regex::Regex::new(r"\bYEAR\b").unwrap().is_match(&content);
-                    let ch = regex::Regex::new(r"\bCOPYRIGHT HOLDER\b").unwrap().is_match(&content);
-                    Some(!(year || ch))
+                    Some(license_template_complete(&content))
                 } else {
                     Some(true)
                 }
@@ -3776,6 +3797,20 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_filled_template_or_a_full_text_is_complete() {
+        assert!(license_template_complete("YEAR: 2024\nCOPYRIGHT HOLDER: Ann Lee\n"));
+        assert!(license_template_complete("YEAR: 2024\r\nCOPYRIGHT HOLDER: fixpkg authors\r\n"));
+        assert!(license_template_complete("MIT License\n\nCopyright (c) 2024 Ann Lee\n\nPermission is hereby granted"));
+        assert!(!license_template_complete("YEAR: <year>\nCOPYRIGHT HOLDER: Ann Lee\n"));
+        assert!(!license_template_complete("YEAR: 2024\nCOPYRIGHT HOLDER: <Your Name>\n"));
+        assert!(!license_template_complete("YEAR: 2024\nCOPYRIGHT HOLDER: your name\n"));
+        assert!(!license_template_complete("YEAR: YEAR\nCOPYRIGHT HOLDER: COPYRIGHT HOLDER\n"));
+        assert!(!license_template_complete("YEAR: 2024\nCOPYRIGHT HOLDER:\n"));
+        assert!(!license_template_complete("YEAR: 2024\n"), "one line alone is not complete");
+        assert!(!license_template_complete("  \n"));
+    }
 
     fn version_parts(v: &str) -> Vec<u64> {
         v.split('.')
