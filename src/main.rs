@@ -13,6 +13,7 @@ mod cli;
 mod rds;
 mod release_files;
 mod repo_practices;
+mod vignettes;
 
 // ---- file walking -----------------------------------------------------------
 
@@ -80,6 +81,11 @@ fn loc(content: &str) -> usize {
 
 fn read(root: &Path, rel: &str) -> Option<String> {
     std::fs::read_to_string(root.join(rel)).ok()
+}
+
+/// A file's text with any invalid UTF-8 replaced, so a Latin-1 byte cannot hide it.
+fn read_lossy(root: &Path, rel: &str) -> Option<String> {
+    std::fs::read(root.join(rel)).ok().map(|b| String::from_utf8_lossy(&b).into_owned())
 }
 
 /// Median of a slice (average of the two middle values for an even count).
@@ -352,8 +358,6 @@ struct Port {
     nonportable_compiler_flags: i64,
     nonportable_compiler_flags_json: Vec<String>,
     min_r_version: Option<String>,
-    has_vignettes: bool,
-    vignette_dynamic: Option<bool>,
 }
 
 fn find_files<'a>(files: &'a [String], pat: &str) -> Vec<&'a str> {
@@ -422,52 +426,12 @@ fn metrics_portability(desc: &BTreeMap<String, String>, root: &Path, files: &[St
             re.captures(dep).map(|c| c[1].to_string())
         });
 
-    // vignettes
-    let vig_files = find_files(files, r"^vignettes/.*\.[Rr](md|nw)$");
-    let has_vignettes = !vig_files.is_empty();
-    let vignette_dynamic = if !has_vignettes {
-        None
-    } else {
-        let rmd_hdr = regex::Regex::new(r"```\{r[^}]*\}").unwrap();
-        let rnw_hdr = regex::Regex::new(r"<<[^>]*>>=").unwrap();
-        let eval_off = fancy_regex::Regex::new(r"eval\s*=\s*(FALSE|F)(?=[,}\s]|$)").unwrap();
-        let mut found_any = false;
-        let mut found_active = false;
-        for vf in &vig_files {
-            let Some(content) = read(root, vf) else { continue };
-            if content.is_empty() {
-                continue;
-            }
-            let headers: Vec<&str> = if regex::Regex::new(r"\.[Rr]md$").unwrap().is_match(vf) {
-                rmd_hdr.find_iter(&content).map(|m| m.as_str()).collect()
-            } else {
-                rnw_hdr.find_iter(&content).map(|m| m.as_str()).collect()
-            };
-            if headers.is_empty() {
-                continue;
-            }
-            found_any = true;
-            for h in headers {
-                if !eval_off.is_match(h).unwrap_or(false) {
-                    found_active = true;
-                    break;
-                }
-            }
-            if found_active {
-                break;
-            }
-        }
-        Some(if !found_any { true } else { found_active })
-    };
-
     Port {
         system_requirements_count,
         cxx_standard_required,
         nonportable_compiler_flags,
         nonportable_compiler_flags_json: found_flags,
         min_r_version,
-        has_vignettes,
-        vignette_dynamic,
     }
 }
 
@@ -3379,7 +3343,7 @@ fn main() {
                 .unwrap_or(false)
         });
 
-    let num_vignettes = find_files(&files, r"^vignettes/.*\.[Rr](md|nw)$").len();
+    let vig = vignettes::vignette_facts(&root, &files);
     let num_demos = find_files(&files, r"^demo/.*\.[Rr]$").len();
     let count_prefix = |p: &str| files.iter().filter(|f| f.starts_with(p)).count();
     let files_r = count_prefix("R/");
@@ -3447,8 +3411,9 @@ fn main() {
         "cxx_standard_required": port.cxx_standard_required,
         "nonportable_compiler_flags": port.nonportable_compiler_flags,
         "nonportable_compiler_flags_json": port.nonportable_compiler_flags_json,
-        "has_vignettes": port.has_vignettes,
-        "vignette_dynamic": port.vignette_dynamic,
+        "has_vignettes": !vig.sources.is_empty(),
+        "vignette_dynamic": vig.dynamic,
+        "vignette_eval_gated": vig.eval_gated,
         "has_tests": tests.has_tests,
         "test_to_code_ratio": tests.test_to_code_ratio,
         "testthat_edition": tests.testthat_edition,
@@ -3593,7 +3558,7 @@ fn main() {
         "rel_space_tests": ws.rel_space_tests,
         "indentation": ws.indentation,
         "uses_openmp": uses_openmp,
-        "num_vignettes": num_vignettes,
+        "num_vignettes": vig.sources.len(),
         "num_demos": num_demos,
         "files_r": files_r,
         "files_src": files_src,
