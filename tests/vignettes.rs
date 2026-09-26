@@ -28,7 +28,9 @@ fn every_vignette_static_reads_zero_and_none_reads_null() {
         ("vignettes/b.Rmd.orig", "precomputed source\n"),
     ]);
     let s = summary(&t, "release");
+    assert_eq!(s["num_vignettes"], 2);
     assert_eq!(s["vignette_dynamic"], false);
+    assert_eq!(s["vignette_eval_gated"], 0);
     let none = tree(&[("DESCRIPTION", DESC)]);
     let s = summary(&none, "release");
     assert_eq!(s["has_vignettes"], false);
@@ -46,4 +48,15 @@ fn a_gated_vignette_is_counted_and_is_not_static() {
     let s = summary(&t, "release");
     assert_eq!(s["vignette_eval_gated"], 1);
     assert_eq!(s["vignette_dynamic"], true);
+}
+
+#[test]
+fn a_latin1_vignette_is_still_counted_and_classified() {
+    let rmd: &[u8] = b"---\ntitle: M\xfcller\n---\n%\\VignetteEngine{knitr::rmarkdown}\n```{r, eval=FALSE}\n1\n```\n";
+    let t = tree_bytes(&[("DESCRIPTION", DESC.as_bytes()), ("vignettes/a.Rmd", rmd)]);
+    let s = summary(&t, "release");
+    assert_eq!(s["has_vignettes"], true);
+    assert_eq!(s["num_vignettes"], 1);
+    assert_eq!(s["vignette_dynamic"], false);
+    assert_eq!(s["vignette_eval_gated"], 0);
 }

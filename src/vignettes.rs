@@ -42,7 +42,8 @@ pub fn vignette_sources(root: &Path, files: &[String]) -> Vec<String> {
     files
         .iter()
         .filter(|f| is_candidate(f))
-        .filter(|f| super::read_lossy(root, f).map(|t| is_source(f, &t)).unwrap_or(false))
+        // An unreadable Sweave source still counts by its extension, so vignette_facts can say unknown.
+        .filter(|f| is_source(f, &super::read_lossy(root, f).unwrap_or_default()))
         .cloned()
         .collect()
 }
@@ -65,10 +66,14 @@ fn eval_value(args: &str) -> Option<String> {
     Some(out.trim().to_string())
 }
 
-/// The argument text of each opts_chunk$set(...) call.
+/// The argument text of each opts_chunk$set(...) call that is not commented out.
 fn opts_chunk_args(text: &str) -> Vec<String> {
     let mut out = Vec::new();
     for m in OPTS_SET.find_iter(text) {
+        let line_start = text[..m.start()].rfind('\n').map_or(0, |i| i + 1);
+        if text[line_start..m.start()].contains('#') {
+            continue;
+        }
         let mut depth = 1i32;
         let mut args = String::new();
         for ch in text[m.end()..].chars() {
@@ -164,7 +169,8 @@ pub fn classify(path: &str, text: &str, has_orig_sibling: bool) -> VignetteRun {
         return VignetteRun::Static;
     }
     let each_off = headers.iter().all(|h| eval_value(h).is_some_and(|v| is_off(&v)));
-    let any_on = evals.iter().any(|v| is_on(v));
+    // A later global opts_chunk$set(eval = TRUE) turns evaluation back on like a header does.
+    let any_on = evals.iter().chain(&globals).any(|v| is_on(v));
     let sweave_off = SWEAVE_OPTS
         .captures_iter(text)
         .any(|c| eval_value(&c[1]).is_some_and(|v| is_off(&v)));
@@ -224,6 +230,11 @@ mod tests {
         assert!(!is_source("vignettes/README.md", "# notes"));
         assert!(is_source("vignettes/a.qmd", "%\\VignetteEngine{quarto::html}"));
         assert!(is_source("vignettes/a.asis", "%\\VignetteEngine{R.rsp::asis}"));
+        let missing = Path::new("/nonexistent/rpkg-analyzer-vignette-root");
+        let facts = vignette_facts(missing, &["vignettes/a.Rnw".to_string(), "vignettes/b.Rmd".to_string()]);
+        assert_eq!(facts.sources, vec!["vignettes/a.Rnw".to_string()], "an unreadable Sweave source still counts");
+        assert_eq!(facts.dynamic, None, "an unreadable source leaves vignette_dynamic unknown");
+        assert_eq!(facts.eval_gated, None);
     }
 
     #[test]
@@ -243,6 +254,19 @@ mod tests {
             VignetteRun::Static
         );
         assert_eq!(classify("vignettes/a.asis", "%\\VignetteEngine{R.rsp::asis}", false), VignetteRun::Static);
+        assert_eq!(
+            classify("vignettes/a.Rmd", &rmd("```{r}\n# knitr::opts_chunk$set(eval = TRUE)\nknitr::opts_chunk$set(eval = FALSE)\n```\n```{r}\n2\n```"), false),
+            VignetteRun::Static,
+            "a commented-out call does not turn evaluation back on"
+        );
+        assert_eq!(classify("vignettes/a.Rtex", "% begin.rcode a, eval=FALSE\n1\n% end.rcode\n", false), VignetteRun::Static);
+        assert_eq!(classify("vignettes/a.Rhtml", "<!--begin.rcode a, eval=FALSE\n1\nend.rcode-->\n", false), VignetteRun::Static);
+        assert_eq!(classify("vignettes/a.Rrst", ".. {r a, eval=FALSE}\n1\n.. ..\n", false), VignetteRun::Static);
+        assert_eq!(
+            classify("vignettes/a.rsp", "<%@meta language=\"R-vignette\" content=\"\n%\\VignetteEngine{R.rsp::rsp}\n\"%>\nplain text\n", false),
+            VignetteRun::Static,
+            "an rsp directive runs no R code"
+        );
     }
 
     #[test]
@@ -251,6 +275,15 @@ mod tests {
         assert_eq!(classify("vignettes/a.Rmd", t, false), VignetteRun::Dynamic);
         assert_eq!(classify("vignettes/a.Rmd", "```{r setup}\n1\n```\n", false), VignetteRun::Dynamic);
         assert_eq!(classify("vignettes/a.Rnw", "<<a, echo=TRUE>>=\n1\n@\n", false), VignetteRun::Dynamic);
+        let commented = "```{r}\n#knitr::opts_chunk$set(eval = FALSE)\nx <- 1 # opts_chunk$set(eval = FALSE)\n```\n```{r}\n1\n```\n";
+        assert_eq!(classify("vignettes/a.Rmd", commented, false), VignetteRun::Dynamic, "a commented-out call sets nothing");
+        let toggled = "```{r}\nknitr::opts_chunk$set(eval = FALSE)\n```\n```{r}\n1\n```\n```{r}\nknitr::opts_chunk$set(eval = TRUE)\n```\n```{r}\n2\n```\n";
+        assert_eq!(classify("vignettes/a.Rmd", toggled, false), VignetteRun::Dynamic, "a later global call turns evaluation back on");
+        assert_eq!(classify("vignettes/a.Rtex", "% begin.rcode a\n1\n% end.rcode\n", false), VignetteRun::Dynamic);
+        assert_eq!(classify("vignettes/a.Rhtml", "<!--begin.rcode a\n1\nend.rcode-->\n", false), VignetteRun::Dynamic);
+        assert_eq!(classify("vignettes/a.Rrst", ".. {r a}\n1\n.. ..\n", false), VignetteRun::Dynamic);
+        assert_eq!(classify("vignettes/a.rsp", "%\\VignetteEngine{R.rsp::rsp}\n<% x <- 1 %>\n", false), VignetteRun::Dynamic);
+        assert_eq!(classify("vignettes/a.rsp", "%\\VignetteEngine{R.rsp::rsp}\nValue: <%=pi%>\n", false), VignetteRun::Dynamic);
     }
 
     #[test]
