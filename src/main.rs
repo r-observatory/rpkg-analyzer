@@ -11,6 +11,7 @@ use tree_sitter::Parser;
 
 mod cli;
 mod rds;
+mod repo_practices;
 
 // ---- file walking -----------------------------------------------------------
 
@@ -545,10 +546,6 @@ struct Tests {
     test_isolation_libs: Vec<String>,
     exported_fn_test_linkage: Option<f64>,
     stochastic_seed_discipline: Option<f64>,
-    ci_present: bool,
-    ci_type: Vec<String>,
-    ci_matrix_breadth: i64,
-    ci_pr_gated: bool,
 }
 
 fn metrics_tests(
@@ -634,29 +631,6 @@ fn metrics_tests(
         Some(seeded as f64 / stoch_files.len() as f64)
     };
 
-    let ci_yml = find_files(files, r"^\.github/workflows/.*\.ya?ml$");
-    let has_travis = exists(files, ".travis.yml");
-    let has_appveyor = exists(files, "appveyor.yml");
-    let has_circleci = !find_files(files, r"^\.circleci/").is_empty();
-    let ci_present = !ci_yml.is_empty() || has_travis || has_appveyor || has_circleci;
-    let mut ci_type = Vec::new();
-    if !ci_yml.is_empty() {
-        ci_type.push("github-actions".to_string());
-    }
-    if has_travis {
-        ci_type.push("travis".to_string());
-    }
-    if has_appveyor {
-        ci_type.push("appveyor".to_string());
-    }
-    if has_circleci {
-        ci_type.push("circleci".to_string());
-    }
-    let ci_matrix_breadth = gha_matrix_breadth(root, &ci_yml);
-    let ci_pr_gated = ci_yml
-        .iter()
-        .any(|f| read(root, f).map(|c| c.contains("pull_request")).unwrap_or(false));
-
     Tests {
         has_tests,
         test_to_code_ratio,
@@ -665,10 +639,6 @@ fn metrics_tests(
         test_isolation_libs,
         exported_fn_test_linkage,
         stochastic_seed_discipline,
-        ci_present,
-        ci_type,
-        ci_matrix_breadth,
-        ci_pr_gated,
     }
 }
 
@@ -824,7 +794,6 @@ struct Docs {
     roxygen_doc_coverage: Option<f64>,
     has_readme: bool,
     readme_prose_length: Option<i64>,
-    has_pkgdown: bool,
     news_present: bool,
     news_structure_quality: Option<f64>,
 }
@@ -1153,9 +1122,6 @@ fn metrics_docs(
         })
     };
 
-    // ---- 8. has_pkgdown -----------------------------------------------------------
-    let has_pkgdown = exists(files, "_pkgdown.yml") || exists(files, "pkgdown/_pkgdown.yml");
-
     // ---- 9. news_present ------------------------------------------------------------
     let news_present = exists(files, "NEWS") || exists(files, "NEWS.md");
 
@@ -1228,7 +1194,6 @@ fn metrics_docs(
         roxygen_doc_coverage,
         has_readme,
         readme_prose_length,
-        has_pkgdown,
         news_present,
         news_structure_quality,
     }
@@ -1241,8 +1206,6 @@ struct Health {
     global_state_write_density: Option<f64>,
     deprecated_idiom_density: Option<f64>,
     debug_artifact_density: Option<f64>,
-    has_code_of_conduct: bool,
-    has_contributing_guide: bool,
 }
 
 /// Strip a single-line comment (rough: ignores '#' inside strings), matching
@@ -1455,19 +1418,11 @@ fn metrics_health(_desc: &BTreeMap<String, String>, root: &Path, files: &[String
         cnt as f64 / kloc_r
     });
 
-    // ---- community health files ----
-    let has_code_of_conduct =
-        exists(files, "CODE_OF_CONDUCT.md") || exists(files, ".github/CODE_OF_CONDUCT.md");
-    let has_contributing_guide =
-        exists(files, "CONTRIBUTING.md") || exists(files, ".github/CONTRIBUTING.md");
-
     Health {
         on_exit_coverage_rate,
         global_state_write_density,
         deprecated_idiom_density,
         debug_artifact_density,
-        has_code_of_conduct,
-        has_contributing_guide,
     }
 }
 
@@ -3092,7 +3047,9 @@ fn main() {
         .expect("load tree-sitter-r");
 
     let root = PathBuf::from(&dir);
-    let files = list_files(&root);
+    let tree_files = list_files(&root);
+    // What the release contains. Under release input that is the tree as given.
+    let files: Vec<String> = tree_files.clone();
 
     // --- structure ---
     let n_files = files.len();
@@ -3394,6 +3351,7 @@ fn main() {
     let health = metrics_health(&desc, &root, &files);
     let meta = metrics_meta(&desc, &root, &files);
     let security = metrics_security(&desc, &root, &files);
+    let practices = repo_practices::metrics_repo_practices(&root, &tree_files, kind);
 
     // --- additional static signals ---
     // OpenMP: SystemRequirements, Makevars -fopenmp, or a src #pragma omp / _OPENMP.
@@ -3440,7 +3398,7 @@ fn main() {
             .filter(|s| s.starts_with("http"))
             .any(|s| !forges.iter().any(|d| s.contains(d)))
     }).unwrap_or(false);
-    let has_website = docs.has_pkgdown || url_website;
+    let has_website = practices.has_pkgdown == Some(true) || url_website;
 
     // Author role counts from Authors@R.
     let authors_r = desc.get("Authors@R").cloned().unwrap_or_default();
@@ -3487,10 +3445,10 @@ fn main() {
         "test_isolation_libs": tests.test_isolation_libs,
         "exported_fn_test_linkage": tests.exported_fn_test_linkage,
         "stochastic_seed_discipline": tests.stochastic_seed_discipline,
-        "ci_present": tests.ci_present,
-        "ci_type": tests.ci_type,
-        "ci_matrix_breadth": tests.ci_matrix_breadth,
-        "ci_pr_gated": tests.ci_pr_gated,
+        "ci_present": practices.ci_present,
+        "ci_type": practices.ci_type,
+        "ci_matrix_breadth": practices.ci_matrix_breadth,
+        "ci_pr_gated": practices.ci_pr_gated,
         "dontrun_example_ratio": docs.dontrun_example_ratio,
         "undocumented_params_rate": docs.undocumented_params_rate,
         "value_doc_rate": docs.value_doc_rate,
@@ -3498,15 +3456,15 @@ fn main() {
         "roxygen_doc_coverage": docs.roxygen_doc_coverage,
         "has_readme": docs.has_readme,
         "readme_prose_length": docs.readme_prose_length,
-        "has_pkgdown": docs.has_pkgdown,
+        "has_pkgdown": practices.has_pkgdown,
         "news_present": docs.news_present,
         "news_structure_quality": docs.news_structure_quality,
         "on_exit_coverage_rate": health.on_exit_coverage_rate,
         "global_state_write_density": health.global_state_write_density,
         "deprecated_idiom_density": health.deprecated_idiom_density,
         "debug_artifact_density": health.debug_artifact_density,
-        "has_code_of_conduct": health.has_code_of_conduct,
-        "has_contributing_guide": health.has_contributing_guide,
+        "has_code_of_conduct": practices.has_code_of_conduct,
+        "has_contributing_guide": practices.has_contributing_guide,
         "maintainer": meta.maintainer,
         "maintainer_email": meta.maintainer_email,
         "n_authors": meta.n_authors,
