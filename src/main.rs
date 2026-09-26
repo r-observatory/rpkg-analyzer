@@ -9,6 +9,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use tree_sitter::Parser;
 
+mod authors;
 mod citation;
 mod cli;
 mod news;
@@ -1457,6 +1458,9 @@ struct Person {
     given: Option<String>,
     family: Option<String>,
     roles: Vec<String>,
+    comment: Option<String>,
+    orcid: Option<String>,
+    ror: Option<String>,
 }
 
 struct Meta {
@@ -1566,82 +1570,148 @@ fn meta_parse_person(inner: &str) -> Person {
         }
     }
 
+    let named_c_re = regex::Regex::new(r"[A-Za-z_.][A-Za-z0-9_.]*\s*=\s*c\([^)]*\)").unwrap();
+    let named_val_re = regex::Regex::new(r#"[A-Za-z_.][A-Za-z0-9_.]*\s*=\s*(?:"[^"]*"|'[^']*')"#).unwrap();
+
+    // comment = c(ORCID = "...", ROR = "...", "free text"), or comment = "free text". A
+    // parenthesis inside a quoted part does not end the c(...).
+    let comment_c_re = regex::Regex::new(r#"comment\s*=\s*c\(((?:"[^"]*"|'[^']*'|[^)"'])*)\)"#).unwrap();
+    let comment_s_re = regex::Regex::new(r#"comment\s*=\s*(?:"([^"]*)"|'([^']*)')"#).unwrap();
+    // A part's name may be quoted: c('ORCID' = "...") reads as c(ORCID = "...").
+    let key_re = |key: &str| regex::Regex::new(&format!(r#"(?i)["']?\b{key}\b["']?\s*=\s*(?:"([^"]*)"|'([^']*)')"#)).unwrap();
+    let comment_named_re =
+        regex::Regex::new(r#"(?:[A-Za-z_.][A-Za-z0-9_.]*|"[^"]*"|'[^']*')\s*=\s*(?:"[^"]*"|'[^']*')"#).unwrap();
+    let (mut orcid, mut ror, mut free) = (None, None, Vec::new());
+    let mut comment_text = String::new();
+    if let Some(c) = comment_c_re.captures(inner) {
+        let body = c.get(1).map(|m| m.as_str()).unwrap_or("");
+        let value = |re: &regex::Regex| {
+            re.captures(body).and_then(|c| c.get(1).or_else(|| c.get(2))).map(|m| m.as_str().to_string())
+        };
+        orcid = value(&key_re("ORCID")).and_then(|v| authors::orcid_checked(&v));
+        ror = value(&key_re("ROR")).and_then(|v| authors::ror_checked(&v));
+        free = extract_quoted(&comment_named_re.replace_all(body, ""));
+        comment_text = body.to_string();
+    } else if let Some(c) = comment_s_re.captures(inner) {
+        let v = c.get(1).or_else(|| c.get(2)).map(|m| m.as_str()).unwrap_or("");
+        free = vec![v.to_string()];
+        comment_text = v.to_string();
+    }
+    if orcid.is_none() {
+        orcid = authors::orcid_in_text(&comment_text);
+    }
+    // A part that is only an ORCID is the identifier, not a comment.
+    free.retain(|f| authors::orcid_checked(f).is_none());
+
     if given.is_none() || family.is_none() {
-        let named_c_re = regex::Regex::new(r"[A-Za-z_.][A-Za-z0-9_.]*\s*=\s*c\([^)]*\)").unwrap();
-        let named_val_re =
-            regex::Regex::new(r#"[A-Za-z_.][A-Za-z0-9_.]*\s*=\s*(?:"[^"]*"|'[^']*')"#).unwrap();
         let cleaned = named_c_re.replace_all(inner, "");
         let cleaned = named_val_re.replace_all(&cleaned, "");
-        let pos_strs: Vec<String> =
-            extract_quoted(&cleaned).into_iter().filter(|s| !s.is_empty()).collect();
-        if given.is_none() && !pos_strs.is_empty() {
-            given = Some(pos_strs[0].clone());
+        // Empty slots keep their place; an email or @handle is never a name.
+        let pos_strs: Vec<String> = extract_quoted(&cleaned);
+        let usable = |s: &&String| !s.is_empty() && !authors::is_email_like(s);
+        if given.is_none() {
+            given = pos_strs.first().filter(usable).cloned();
         }
-        if family.is_none() && pos_strs.len() >= 2 {
-            family = Some(pos_strs[1].clone());
+        if family.is_none() {
+            family = pos_strs.get(1).filter(usable).cloned();
         }
     }
 
-    Person { given, family, roles }
+    Person { given, family, roles, comment: authors::clean_comment(&free), orcid, ror }
 }
 
-/// Parse the free-text Author field into person entries: split on commas/"and"
-/// (protecting commas inside `[roles]`), strip email, pull `[roles]`, then split
-/// remaining words into given/family (port of .meta_parse_author_text).
+/// The free-text Author field as persons: split on , ; "and" "&" "with contributions from", keeping
+/// [roles] and (notes) whole, dropping emails, keeping ORCIDs, and moving notes and "... by" into comments.
 fn meta_parse_author_text(text: &str) -> Vec<Person> {
     let t = text.trim();
     if t.is_empty() {
         return Vec::new();
     }
-
-    // Protect commas inside [...] blocks before splitting on comma/and.
-    let bracket_re = regex::Regex::new(r"\[[^\]]+\]").unwrap();
-    let mut protected = String::with_capacity(t.len());
-    let mut last = 0usize;
-    for m in bracket_re.find_iter(t) {
-        protected.push_str(&t[last..m.start()]);
-        protected.push_str(&m.as_str().replace(',', "\u{1}"));
-        last = m.end();
+    // Some Author fields hold person() calls; those read as Authors@R.
+    if regex::Regex::new(r"\bperson\s*\(").unwrap().is_match(t) {
+        let inners = meta_person_inners(t);
+        if !inners.is_empty() {
+            return inners.iter().map(|inner| meta_parse_person(inner)).collect();
+        }
     }
-    protected.push_str(&t[last..]);
 
-    let split_re = regex::Regex::new(r"\s*,\s*|\s+and\s+").unwrap();
-    let parts: Vec<String> = split_re
-        .split(&protected)
-        .map(|p| p.trim().replace('\u{1}', ","))
-        .filter(|p| !p.is_empty())
-        .collect();
+    // ORCIDs come out first so the split cannot cut them; each leaves a marker.
+    let orcid_re = regex::Regex::new(
+        r"(?i)<\s*https?://orcid\.org/([0-9X-]{16,19})\s*>|\(\s*ORCID:?\s*(?:<?\s*https?://orcid\.org/)?([0-9X-]{16,19})\s*>?\s*\)",
+    )
+    .unwrap();
+    let mut ids: Vec<Option<String>> = Vec::new();
+    let marked = orcid_re
+        .replace_all(t, |c: &regex::Captures| {
+            let raw = c.get(1).or_else(|| c.get(2)).map(|m| m.as_str()).unwrap_or("");
+            ids.push(authors::orcid_checked(raw));
+            format!(" \u{2}{}\u{2} ", ids.len() - 1)
+        })
+        .into_owned();
+    // Separators inside [...] and (...) belong to one entry.
+    let group_re = regex::Regex::new(r"\[[^\]]*\]|\([^)]*\)").unwrap();
+    let mut groups: Vec<String> = Vec::new();
+    let protected = group_re
+        .replace_all(&marked, |c: &regex::Captures| {
+            groups.push(c[0].to_string());
+            format!("\u{3}{}\u{3}", groups.len() - 1)
+        })
+        .into_owned();
 
+    let split_re = regex::Regex::new(r"(?i)\s*[,;]\s*|\s+and\s+|\s+&\s+|\s+with\s+contributions\s+from\s+").unwrap();
+    let restore_re = regex::Regex::new(r"\u{3}(\d+)\u{3}").unwrap();
+    let marker_re = regex::Regex::new(r"\u{2}(\d+)\u{2}").unwrap();
+    let lead_and_re = regex::Regex::new(r"(?i)^(?:and|&)\s+").unwrap();
     let email_re = regex::Regex::new(r"\s*<[^>]*>").unwrap();
+    let rd_email_re = regex::Regex::new(r"\\email\{[^}]*\}").unwrap();
     let role_re = regex::Regex::new(r"\[([^\]]+)\]").unwrap();
     let bracket_strip_re = regex::Regex::new(r"\s*\[[^\]]*\]").unwrap();
+    let paren_re = regex::Regex::new(r"\(([^)]*)\)").unwrap();
+    let label_re = regex::Regex::new(r"(?i)^(?:authors?|contributors?|maintainer)\s*:\s*").unwrap();
+    let preamble_re = regex::Regex::new(r"(?i)^(.+?\bby)\s+(\S.*)$").unwrap();
     let ws_re = regex::Regex::new(r"\s+").unwrap();
 
-    parts
-        .iter()
-        .map(|raw_entry| {
-            let mut entry = email_re.replace(raw_entry, "").into_owned();
+    split_re
+        .split(&protected)
+        .filter_map(|raw| {
+            let part = restore_re.replace_all(raw, |c: &regex::Captures| groups[c[1].parse::<usize>().unwrap()].clone());
+            let mut entry = lead_and_re.replace(part.trim(), "").into_owned();
+            let orcid = marker_re
+                .captures_iter(&entry)
+                .find_map(|c| ids.get(c[1].parse::<usize>().unwrap()).cloned().flatten());
+            entry = marker_re.replace_all(&entry, " ").into_owned();
+            entry = email_re.replace_all(&entry, "").into_owned();
+            entry = rd_email_re.replace_all(&entry, "").into_owned();
             let mut roles: Vec<String> = Vec::new();
             if let Some(c) = role_re.captures(&entry) {
-                let role_str = c.get(1).unwrap().as_str().to_string();
-                roles = role_str
-                    .split(',')
-                    .map(|s| s.trim().to_string())
-                    .filter(|s| !s.is_empty())
-                    .collect();
-                entry = bracket_strip_re.replace(&entry, "").trim().to_string();
+                roles = c[1].split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
+                entry = bracket_strip_re.replace_all(&entry, "").into_owned();
             }
-            let name_parts: Vec<&str> =
-                ws_re.split(entry.trim()).filter(|s| !s.is_empty()).collect();
-            let n = name_parts.len();
-            let (given, family) = if n == 0 {
-                (None, None)
-            } else if n == 1 {
-                (None, Some(name_parts[0].to_string()))
+            let mut notes: Vec<String> =
+                paren_re.captures_iter(&entry).map(|c| c[1].trim().to_string()).filter(|s| !s.is_empty()).collect();
+            entry = paren_re.replace_all(&entry, " ").into_owned();
+            entry = label_re.replace(entry.trim(), "").into_owned();
+            if let Some(c) = preamble_re.captures(entry.trim()) {
+                notes.insert(0, c[1].to_string());
+                entry = c[2].to_string();
+            }
+            // Bare emails and stray brackets are never part of a name.
+            let words: Vec<String> = ws_re
+                .split(entry.trim())
+                .filter(|w| !w.is_empty() && !authors::is_email_like(w))
+                .map(|w| w.trim_matches(|c| "()<>[]".contains(c)).to_string())
+                .filter(|w| !w.is_empty())
+                .collect();
+            if words.is_empty() {
+                return None;
+            }
+            let n = words.len();
+            let (given, family) = if n == 1 {
+                (None, Some(words[0].clone()))
             } else {
-                (Some(name_parts[..n - 1].join(" ")), Some(name_parts[n - 1].to_string()))
+                (Some(words[..n - 1].join(" ")), Some(words[n - 1].clone()))
             };
-            Person { given, family, roles }
+            Some(Person { given, family, roles, comment: authors::clean_comment(&notes), orcid, ror: None })
         })
         .collect()
 }
@@ -1654,9 +1724,8 @@ fn json_str_or_null(v: &Option<String>) -> String {
     }
 }
 
-/// Compact JSON array of person objects, field order given/family/roles, matching
-/// jsonlite::toJSON(parsed, auto_unbox = TRUE) byte-for-byte (roles always an
-/// array via I(); given/family unboxed strings or null).
+/// Compact JSON array of persons as jsonlite::toJSON(auto_unbox = TRUE) writes them: given, family,
+/// roles, then comment, orcid and ror only when declared, so given and family stay adjacent.
 fn persons_to_json(persons: &[Person]) -> String {
     let items: Vec<String> = persons
         .iter()
@@ -1664,7 +1733,14 @@ fn persons_to_json(persons: &[Person]) -> String {
             let given = json_str_or_null(&p.given);
             let family = json_str_or_null(&p.family);
             let roles = serde_json::to_string(&p.roles).unwrap();
-            format!("{{\"given\":{given},\"family\":{family},\"roles\":{roles}}}")
+            let mut item = format!("{{\"given\":{given},\"family\":{family},\"roles\":{roles}");
+            for (key, value) in [("comment", &p.comment), ("orcid", &p.orcid), ("ror", &p.ror)] {
+                if let Some(v) = value {
+                    item.push_str(&format!(",\"{key}\":{}", serde_json::to_string(v).unwrap()));
+                }
+            }
+            item.push('}');
+            item
         })
         .collect();
     format!("[{}]", items.join(","))
@@ -3807,6 +3883,119 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Rule J: a name the viewer treats as junk.
+    fn is_junk(p: &Person) -> bool {
+        let g = p.given.as_deref().unwrap_or("");
+        let f = p.family.as_deref().unwrap_or("");
+        let lead = g.trim().to_lowercase();
+        lead.starts_with("and ") || lead.starts_with("& ") || [g, f].iter().any(|s| s.contains(['(', ')', '<', ']', '@']))
+    }
+
+    fn names(ps: &[Person]) -> Vec<(Option<&str>, Option<&str>)> {
+        ps.iter().map(|p| (p.given.as_deref(), p.family.as_deref())).collect()
+    }
+
+    #[test]
+    fn authors_r_keeps_orcid_ror_and_a_short_comment() {
+        let p = meta_parse_person(
+            r#""Ann", "Lee", role = c("aut", "cre"), email = "ann@x.org", comment = c(ORCID = "0000-0002-1825-0097", "Wrote the parser <ann@x.org>")"#,
+        );
+        assert_eq!((p.given.as_deref(), p.family.as_deref()), (Some("Ann"), Some("Lee")));
+        assert_eq!(p.orcid.as_deref(), Some("0000-0002-1825-0097"));
+        assert_eq!(p.comment.as_deref(), Some("Wrote the parser"));
+        let org = meta_parse_person(r#""ACME Foundation", role = "fnd", comment = c(ROR = "https://ror.org/05dxps055")"#);
+        assert_eq!(org.ror.as_deref(), Some("05dxps055"));
+        assert_eq!(org.comment, None);
+        let bad = meta_parse_person(r#""Bo", "Chen", comment = c(ORCID = "0000-0002-1825-0098")"#);
+        assert_eq!(bad.orcid, None, "a failed check digit is dropped");
+        let url = meta_parse_person(r#""Cy", "Dunn", comment = "https://orcid.org/0000-0001-5109-3700""#);
+        assert_eq!(url.orcid.as_deref(), Some("0000-0001-5109-3700"));
+        assert_eq!(url.comment, None, "an ORCID URL is the identifier, not a comment");
+    }
+
+    #[test]
+    fn a_quoted_part_name_or_a_parenthesis_keeps_the_orcid() {
+        let single = meta_parse_person(r#""Zuguang", "Gu", role = c("aut", "cre"), comment = c('ORCID'="0000-0002-7395-8709")"#);
+        assert_eq!(single.orcid.as_deref(), Some("0000-0002-7395-8709"));
+        assert_eq!(single.comment, None, "the name of a part is not a comment");
+        let double = meta_parse_person(r#""Ann", "Lee", comment = c("ORCID" = "0000-0002-1825-0097", "Wrote the parser")"#);
+        assert_eq!(double.orcid.as_deref(), Some("0000-0002-1825-0097"));
+        assert_eq!(double.comment.as_deref(), Some("Wrote the parser"));
+        let paren = meta_parse_person(r#""Ann", "Lee", comment = c("Wrote f() and g()", ORCID = "0000-0002-1825-0097")"#);
+        assert_eq!(paren.orcid.as_deref(), Some("0000-0002-1825-0097"));
+        assert_eq!(paren.comment.as_deref(), Some("Wrote f() and g()"));
+        let ror = meta_parse_person(r#""ACME", role = "fnd", comment = c("ROR" = "05dxps055")"#);
+        assert_eq!(ror.ror.as_deref(), Some("05dxps055"));
+    }
+
+    #[test]
+    fn positional_slots_keep_their_place_and_never_hold_an_email() {
+        let p = meta_parse_person(r#""", "Smith", role = "aut""#);
+        assert_eq!((p.given.as_deref(), p.family.as_deref()), (None, Some("Smith")));
+        let e = meta_parse_person(r#""ann@x.org", "Lee""#);
+        assert_eq!((e.given.as_deref(), e.family.as_deref()), (None, Some("Lee")));
+        let h = meta_parse_person(r#""Ann", "@annlee""#);
+        assert_eq!((h.given.as_deref(), h.family.as_deref()), (Some("Ann"), None));
+    }
+
+    #[test]
+    fn legacy_author_text_splits_into_clean_names() {
+        let cases: Vec<(&str, Vec<(Option<&str>, Option<&str>)>)> = vec![
+            ("Ann Lee <ann@x.org>, Bob Gray <bob@y.org>", vec![(Some("Ann"), Some("Lee")), (Some("Bob"), Some("Gray"))]),
+            ("Ann Lee, and Bob Gray", vec![(Some("Ann"), Some("Lee")), (Some("Bob"), Some("Gray"))]),
+            ("Tarn Duong & Matt Wand", vec![(Some("Tarn"), Some("Duong")), (Some("Matt"), Some("Wand"))]),
+            ("Ann Lee; Bob Gray", vec![(Some("Ann"), Some("Lee")), (Some("Bob"), Some("Gray"))]),
+            (
+                "Stefan Wilhelm with contributions from Manjunath B G <bgmanjunath@gmail.com>",
+                vec![(Some("Stefan"), Some("Wilhelm")), (Some("Manjunath B"), Some("G"))],
+            ),
+            ("Ann Lee (University of X, Y) and Bob Gray", vec![(Some("Ann"), Some("Lee")), (Some("Bob"), Some("Gray"))]),
+            ("Francois Brun (ACTA) \\email{francois.brun@acta.asso.fr}", vec![(Some("Francois"), Some("Brun"))]),
+            ("James Browne (jbrowne6@jhu.edu)", vec![(Some("James"), Some("Browne"))]),
+            (
+                "Original S code by Richard A. Becker and Allan R. Wilks; R port by Ray Brownrigg",
+                vec![(Some("Richard A."), Some("Becker")), (Some("Allan R."), Some("Wilks")), (Some("Ray"), Some("Brownrigg"))],
+            ),
+        ];
+        for (text, want) in cases {
+            let ps = meta_parse_author_text(text);
+            assert_eq!(names(&ps), want, "{text}");
+            assert!(ps.iter().all(|p| !is_junk(p)), "no junk-looking name from {text}");
+        }
+    }
+
+    #[test]
+    fn legacy_notes_and_orcids_are_kept_beside_the_name() {
+        let ps = meta_parse_author_text(
+            "Ann Lee (University of X) <https://orcid.org/0000-0002-1825-0097>, Bob Gray (ORCID 0000-0001-5109-3700), R port by Cy Dunn",
+        );
+        assert_eq!(ps[0].comment.as_deref(), Some("University of X"));
+        assert_eq!(ps[0].orcid.as_deref(), Some("0000-0002-1825-0097"));
+        assert_eq!(ps[1].orcid.as_deref(), Some("0000-0001-5109-3700"));
+        assert_eq!(ps[1].comment, None);
+        assert_eq!(ps[2].comment.as_deref(), Some("R port by"));
+        let as_r = meta_parse_author_text(r#"c(person("Ann", "Lee", role = "aut"), person("Bob", "Gray"))"#);
+        assert_eq!(names(&as_r), vec![(Some("Ann"), Some("Lee")), (Some("Bob"), Some("Gray"))]);
+    }
+
+    #[test]
+    fn optional_keys_follow_roles_in_a_fixed_order() {
+        let p = Person {
+            given: Some("Ann".into()),
+            family: Some("Lee".into()),
+            roles: vec!["aut".into()],
+            comment: Some("x".into()),
+            orcid: Some("0000-0002-1825-0097".into()),
+            ror: Some("05dxps055".into()),
+        };
+        assert_eq!(
+            persons_to_json(&[p]),
+            r#"[{"given":"Ann","family":"Lee","roles":["aut"],"comment":"x","orcid":"0000-0002-1825-0097","ror":"05dxps055"}]"#
+        );
+        let bare = Person { given: None, family: Some("Lee".into()), roles: vec![], comment: None, orcid: None, ror: None };
+        assert_eq!(persons_to_json(&[bare]), r#"[{"given":null,"family":"Lee","roles":[]}]"#);
+    }
 
     #[test]
     fn rust_sources_count_and_vendored_crates_do_not() {
