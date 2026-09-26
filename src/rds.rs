@@ -11,7 +11,7 @@
 // than crash. Exposed behind the --datasets flag.
 
 use serde_json::{json, Value};
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 use std::path::Path;
 
 const SYMSXP: u8 = 1;
@@ -4447,10 +4447,10 @@ fn read_text_free(path: &Path) -> Option<(Vec<Node>, Vec<String>, usize, &'stati
 
 /// Emit one `dataset` record per dataset shipped under `root`'s data/ directory
 /// and R/sysdata.rda. Never panics on a bad file; it degrades with a note.
-pub fn scan_package(root: &Path) -> Vec<Value> {
+pub fn scan_package(root: &Path, excluded: &BTreeSet<String>) -> Vec<Value> {
     let mut out = Vec::new();
     let mut targets: Vec<(std::path::PathBuf, bool)> = Vec::new();
-    let titles = rd_titles(root);
+    let titles = rd_titles(root, excluded);
     if let Ok(rd) = std::fs::read_dir(root.join("data")) {
         let mut paths: Vec<_> = rd.flatten().map(|e| e.path()).collect();
         paths.sort();
@@ -4463,6 +4463,10 @@ pub fn scan_package(root: &Path) -> Vec<Value> {
             Default::default();
         for p in paths {
             let fname = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            // A file the build leaves out is not in the release, so data() never sees it.
+            if excluded.contains(&rel_path(root, &p)) {
+                continue;
+            }
             let Some(rank) = data_ext_rank(fname) else { continue };
             let name = dataset_name(fname);
             match best.get(&name) {
@@ -4477,7 +4481,7 @@ pub fn scan_package(root: &Path) -> Vec<Value> {
         }
     }
     let sys = root.join("R").join("sysdata.rda");
-    if sys.exists() {
+    if sys.exists() && !excluded.contains("R/sysdata.rda") {
         targets.push((sys, true));
     }
     let n_loadable = targets.len();
@@ -4494,6 +4498,7 @@ pub fn scan_package(root: &Path) -> Vec<Value> {
         if src.is_dir() { src } else { root.join("extdata") }
     };
     walk_extdata(&ext_root, EXTDATA_DEPTH, &mut extra);
+    extra.retain(|p| !excluded.contains(&rel_path(root, p)));
     for p in extra {
         targets.push((p, false));
     }
@@ -4623,7 +4628,7 @@ pub fn scan_package(root: &Path) -> Vec<Value> {
 /// `read` counts the files that also produced a dataset record, `unread` the
 /// rest. It rides the summary record, which reaches the database without any
 /// change to the pipeline, so this survives even if the per-file records do not.
-pub fn extdata_inventory(root: &Path) -> Value {
+pub fn extdata_inventory(root: &Path, excluded: &BTreeSet<String>) -> Value {
     let ext_root = {
         let src = root.join("inst").join("extdata");
         if src.is_dir() { src } else { root.join("extdata") }
@@ -4633,6 +4638,12 @@ pub fn extdata_inventory(root: &Path) -> Value {
     }
     let mut files = Vec::new();
     walk_extdata(&ext_root, EXTDATA_DEPTH, &mut files);
+    let walked = files.len();
+    files.retain(|p| !excluded.contains(&rel_path(root, p)));
+    // Every file left out means the release has no such directory.
+    if walked > 0 && files.is_empty() {
+        return Value::Null;
+    }
     // Size per extension, not just per directory. A file we read carries its own
     // byte count on its record the way one under data/ does; a file we do not
     // read has no record to carry anything, and one total for the directory
@@ -4703,7 +4714,7 @@ fn extdata_is_readable(lower: &str) -> bool {
 /// A catalogue that lists a hundred names and says nothing about any of them
 /// is a poor catalogue, and the package has already written the sentence: an
 /// Rd page for a dataset carries a title and an alias naming what it documents.
-fn rd_titles(root: &Path) -> std::collections::HashMap<String, String> {
+fn rd_titles(root: &Path, excluded: &BTreeSet<String>) -> std::collections::HashMap<String, String> {
     let mut out = std::collections::HashMap::new();
     let Ok(rd) = std::fs::read_dir(root.join("man")) else { return out };
     let mut paths: Vec<_> = rd.flatten().map(|e| e.path()).collect();
@@ -4714,7 +4725,7 @@ fn rd_titles(root: &Path) -> std::collections::HashMap<String, String> {
             .and_then(|e| e.to_str())
             .map(|e| e.eq_ignore_ascii_case("rd"))
             .unwrap_or(false);
-        if !is_rd {
+        if !is_rd || excluded.contains(&rel_path(root, p)) {
             continue;
         }
         let Ok(raw) = std::fs::read(&p) else { continue };
@@ -4893,6 +4904,13 @@ fn data_ext_rank(fname: &str) -> Option<usize> {
     })
 }
 
+/// A path relative to the package root with POSIX separators, as list_files writes it.
+fn rel_path(root: &Path, p: &Path) -> String {
+    p.strip_prefix(root)
+        .map(|r| r.to_string_lossy().replace('\\', "/"))
+        .unwrap_or_default()
+}
+
 /// How deep to follow directories under inst/extdata, and how much of a file to
 /// take on. The tail is long: a package may keep an 11 MB sequence file here,
 /// and fingerprinting one describes nothing a reader would ask about.
@@ -4931,7 +4949,7 @@ mod tests {
     use serde_json::Value;
 
     fn records() -> Vec<Value> {
-        scan_package(Path::new("tests/fixtures/pkg"))
+        scan_package(Path::new("tests/fixtures/pkg"), &BTreeSet::new())
     }
     fn by_name(name: &str) -> Value {
         records()
@@ -5966,7 +5984,7 @@ mod tests {
 
     #[test]
     fn the_inventory_says_what_extdata_holds_without_opening_it() {
-        let inv = extdata_inventory(Path::new("tests/fixtures/pkg"));
+        let inv = extdata_inventory(Path::new("tests/fixtures/pkg"), &BTreeSet::new());
         assert_eq!(inv["files"], 5);
         // The formats we would expect under data/ anyway, opened and counted.
         assert_eq!(inv["read"]["csv"]["n"], 2);
@@ -5991,7 +6009,7 @@ mod tests {
 
     #[test]
     fn a_package_without_extdata_says_so() {
-        let inv = extdata_inventory(Path::new("tests/fixtures"));
+        let inv = extdata_inventory(Path::new("tests/fixtures"), &BTreeSet::new());
         assert!(inv.is_null());
     }
 

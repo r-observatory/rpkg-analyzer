@@ -5,12 +5,13 @@
 // which map one-to-one onto the current pipeline's structure.R / parse_dcf /
 // parse_namespace.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use tree_sitter::Parser;
 
 mod cli;
 mod rds;
+mod release_files;
 mod repo_practices;
 
 // ---- file walking -----------------------------------------------------------
@@ -3031,7 +3032,7 @@ fn main() {
         }
         // The dataset records only, read from the tree as given.
         cli::Mode::Datasets(f) => {
-            for rec in rds::scan_package(Path::new(&f)) {
+            for rec in rds::scan_package(Path::new(&f), &BTreeSet::new()) {
                 println!("{rec}");
             }
             return;
@@ -3048,8 +3049,16 @@ fn main() {
 
     let root = PathBuf::from(&dir);
     let tree_files = list_files(&root);
-    // What the release contains. Under release input that is the tree as given.
-    let files: Vec<String> = tree_files.clone();
+    let desc = read(&root, "DESCRIPTION").map(|t| parse_dcf(&t)).unwrap_or_default();
+    let release = release_files::ReleaseList::for_input(
+        &root,
+        &tree_files,
+        desc.get("Package").map(|s| s.trim()).unwrap_or(""),
+        kind,
+    );
+    let files = release.files(&tree_files);
+    let excluded: BTreeSet<String> = release.excluded_files();
+    let content_known = release.is_known();
 
     // --- structure ---
     let n_files = files.len();
@@ -3120,7 +3129,6 @@ fn main() {
     }
 
     // --- DESCRIPTION ---
-    let desc = read(&root, "DESCRIPTION").map(|t| parse_dcf(&t)).unwrap_or_default();
     let get = |k: &str| desc.get(k).cloned().unwrap_or_default();
     let mut deps: Vec<String> = Vec::new();
     // the meta.R rule combines c(Imports, Depends) in that order.
@@ -3249,7 +3257,8 @@ fn main() {
     // Dataset object names: data/datalist is authoritative (a line is either
     // `name` or `file: obj1 obj2`); otherwise fall back to file stems. A single
     // .rda without a datalist can still hold several objects we cannot see here.
-    let datasets: Vec<String> = if let Some(dl) = read(&root, "data/datalist") {
+    let datalist = exists(&files, "data/datalist").then(|| read(&root, "data/datalist")).flatten();
+    let datasets: Vec<String> = if let Some(dl) = datalist {
         let mut names = Vec::new();
         for line in dl.lines() {
             let line = line.trim();
@@ -3276,7 +3285,9 @@ fn main() {
     let version = get("Version");
 
     // --- NAMESPACE ---
-    let ns = read(&root, "NAMESPACE")
+    let ns = exists(&files, "NAMESPACE")
+        .then(|| read(&root, "NAMESPACE"))
+        .flatten()
         .map(|t| parse_namespace(&t, &mut parser))
         .unwrap_or_default();
     let has_ns = exists(&files, "NAMESPACE");
@@ -3419,11 +3430,11 @@ fn main() {
     );
 
     // --- emit NDJSON ---
-    let summary = serde_json::json!({
+    let mut summary = serde_json::json!({
         "rec": "summary",
         "analyzer_version": ANALYZER_VERSION,
         "input_kind": kind.as_str(),
-        "extdata": rds::extdata_inventory(&root),
+        "extdata": rds::extdata_inventory(&root, &excluded),
         "package": package,
         "version": version,
         "license": legal.license,
@@ -3630,49 +3641,56 @@ fn main() {
         "import_from": ns.import_from,
         "imports_whole": ns.imports_whole,
         "use_dyn_lib": ns.use_dyn_lib,
+        "build_ignore_bad_lines": release.bad_lines(),
     });
+    if !content_known {
+        release_files::null_release_content(&mut summary);
+    }
     println!("{summary}");
-    for d in &deps {
-        println!("{}", serde_json::json!({"rec": "dependency", "package": d}));
-    }
-    for e in &ns.exports {
-        println!("{}", serde_json::json!({"rec": "export", "symbol": e}));
-    }
-    for fnst in &fn_stats {
-        println!(
-            "{}",
-            serde_json::json!({
-                "rec": "function", "lang": "r", "name": fnst.name, "exported": fnst.exported,
-                "file": fnst.file, "line": fnst.line, "loc": fnst.loc,
-                "n_params": fnst.n_params, "cyclocomp": fnst.cyclocomp,
-            })
-        );
-    }
-    // Compiled function nodes, so C/C++/Rust/Fortran endpoints in the unified
-    // graph carry the same file/line/loc metadata as the R nodes.
-    for sf in c_nodes.iter().chain(&rust_nodes).chain(&fortran_nodes) {
-        println!(
-            "{}",
-            serde_json::json!({
-                "rec": "function", "lang": sf.lang, "name": sf.name,
-                "file": sf.file, "line": sf.line, "loc": sf.loc,
-            })
-        );
-    }
-    // Call-graph edges: the raw structure behind the network stats. Nodes are the
-    // `function` records above (R) or compiled function names.
-    for (graph, edges) in [
-        ("r", &r_edges),
-        ("native", &ng.edges),
-        ("c", &c_edges),
-        ("rust", &rust_edges),
-        ("fortran", &fortran_edges),
-    ] {
-        for (from, to) in edges {
+    // Detail records describe release contents, which an unknown file list cannot give.
+    if content_known {
+        for d in &deps {
+            println!("{}", serde_json::json!({"rec": "dependency", "package": d}));
+        }
+        for e in &ns.exports {
+            println!("{}", serde_json::json!({"rec": "export", "symbol": e}));
+        }
+        for fnst in &fn_stats {
             println!(
                 "{}",
-                serde_json::json!({"rec": "call_edge", "graph": graph, "from": from, "to": to})
+                serde_json::json!({
+                    "rec": "function", "lang": "r", "name": fnst.name, "exported": fnst.exported,
+                    "file": fnst.file, "line": fnst.line, "loc": fnst.loc,
+                    "n_params": fnst.n_params, "cyclocomp": fnst.cyclocomp,
+                })
             );
+        }
+        // Compiled function nodes, so C/C++/Rust/Fortran endpoints in the unified
+        // graph carry the same file/line/loc metadata as the R nodes.
+        for sf in c_nodes.iter().chain(&rust_nodes).chain(&fortran_nodes) {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "rec": "function", "lang": sf.lang, "name": sf.name,
+                    "file": sf.file, "line": sf.line, "loc": sf.loc,
+                })
+            );
+        }
+        // Call-graph edges: the raw structure behind the network stats. Nodes are the
+        // `function` records above (R) or compiled function names.
+        for (graph, edges) in [
+            ("r", &r_edges),
+            ("native", &ng.edges),
+            ("c", &c_edges),
+            ("rust", &rust_edges),
+            ("fortran", &fortran_edges),
+        ] {
+            for (from, to) in edges {
+                println!(
+                    "{}",
+                    serde_json::json!({"rec": "call_edge", "graph": graph, "from": from, "to": to})
+                );
+            }
         }
     }
     // Full parsed DESCRIPTION as a raw intermediate: every field is preserved,
@@ -3684,10 +3702,12 @@ fn main() {
     }
     println!("{}", serde_json::Value::Object(dcf));
 
-    // Datasets shipped under data/ and R/sysdata.rda, read from R serialization
-    // with no R runtime.
-    for rec in rds::scan_package(&root) {
-        println!("{rec}");
+    // Datasets under data/ and R/sysdata.rda, read from R serialization with no R
+    // runtime.
+    if content_known {
+        for rec in rds::scan_package(&root, &excluded) {
+            println!("{rec}");
+        }
     }
 }
 
