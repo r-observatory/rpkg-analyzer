@@ -108,12 +108,13 @@ fn read_entry(call: Node, src: &str, name: &str, w: &mut Walk) {
             Some(k) if (k == "bibtype" && name == "bibentry") || (k == "entry" && name == "citEntry") => {
                 bibtype = value.and_then(|v| string_value(v, src));
             }
-            Some("doi") => {
+            // R lowercases bibentry and citEntry field names, so DOI = and URL = are the same fields.
+            Some(k) if k.eq_ignore_ascii_case("doi") => {
                 if let Some(d) = value.and_then(|v| string_value(v, src)).and_then(|s| normalize_doi(&s)) {
                     w.dois.push(d);
                 }
             }
-            Some("url") => {
+            Some(k) if k.eq_ignore_ascii_case("url") => {
                 if let Some(d) = value.and_then(|v| string_value(v, src)).and_then(|s| doi_in_url(&s)) {
                     w.dois.push(d);
                 }
@@ -324,6 +325,21 @@ bibentry("Manual", title = paste0("fixpkg: ", "tools"), url = "https://doi.org/1
     fn a_url_that_grows_when_lowercased_still_gives_its_doi() {
         let url = "\u{130}\u{130}\u{130}\u{130}\u{130}\u{130} https://doi.org/10.1/\u{fc}\u{fc}\u{fc}\u{fc}";
         assert_eq!(doi_in_url(url), Some("10.1/\u{fc}\u{fc}\u{fc}\u{fc}".to_string()));
+    }
+
+    #[test]
+    fn doi_and_url_fields_match_in_any_case() {
+        let src = r#"bibentry("Article", title = "T", journal = "J", year = "2020", DOI = "10.18637/JSS.v002.i02")
+bibentry("Manual", title = "U", URL = "https://doi.org/10.21105/JOSS.00001")
+citEntry(entry = "Article", title = "V", author = "A", year = "1999", Doi = "10.1/ABC")
+"#;
+        let c = read_citation(src.as_bytes(), &desc(&[]));
+        assert_eq!(c.read, "literal");
+        assert_eq!(
+            c.dois,
+            Some(vec!["10.18637/jss.v002.i02".to_string(), "10.21105/joss.00001".to_string(), "10.1/abc".to_string()])
+        );
+        assert_eq!(c.venues, Some(vec!["jss".to_string(), "joss".to_string(), "other".to_string()]));
     }
 
     #[test]
