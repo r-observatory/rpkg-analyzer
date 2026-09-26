@@ -99,10 +99,16 @@ mod tests {
         assert_eq!(parse_args(&args(&["--datasets", "pkg"])), Ok(Mode::Datasets("pkg".into())));
         assert_eq!(parse_args(&args(&["--sexp", "a.R"])), Ok(Mode::Sexp("a.R".into())));
         assert_eq!(parse_args(&args(&["--kinds", "a.R"])), Ok(Mode::Kinds("a.R".into())));
+    }
+
+    #[test]
+    fn explain_needs_an_input_kind() {
+        let usage = "usage: rpkg-analyzer --explain <package_dir> --input-kind release|git".to_string();
         assert_eq!(
             parse_args(&args(&["--explain", "pkg", "--input-kind", "git"])),
             Ok(Mode::Explain { dir: "pkg".into(), kind: InputKind::Git })
         );
-        assert!(parse_args(&args(&["--explain", "pkg"])).is_err());
+        assert_eq!(parse_args(&args(&["--explain", "pkg"])), Err(usage.clone()));
+        assert_eq!(parse_args(&args(&["--explain", "pkg", "--input-kind", "tarball"])), Err(usage));
     }
 }
