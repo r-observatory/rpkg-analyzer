@@ -61,10 +61,12 @@ pub fn test_suite(root: &Path, files: &[String], suggests: &[String]) -> TestSui
     let with = |pick: &dyn Fn(&str, &str) -> bool| -> Vec<&(&String, String)> {
         texts.iter().filter(|(f, t)| pick(f, t)).collect()
     };
-    let tinytest = with(&|f, t| f.starts_with("inst/tinytest/") || TINYTEST_CALL.is_match(t));
+    // A framework's runner counts as one of its files, so a runner never tips a tie.
+    let tinytest = with(&|f, t| f.starts_with("inst/tinytest/") || f == "tests/tinytest.R" || TINYTEST_CALL.is_match(t));
     let runit = with(&|f, t| f.starts_with("inst/unitTests/") || RUNIT_CALL.is_match(t));
     let testit = with(&|f, t| is_testit(f, t));
-    let testthat_files: Vec<&String> = files.iter().filter(|f| TESTTHAT_TEST.is_match(f)).collect();
+    let testthat_files: Vec<&String> =
+        files.iter().filter(|f| TESTTHAT_TEST.is_match(f) || *f == "tests/testthat.R").collect();
     let scripts: Vec<&String> = files.iter().filter(|f| SCRIPT.is_match(f)).collect();
     let n_unitizer = files.iter().filter(|f| f.starts_with("tests/unitizer/")).count();
 

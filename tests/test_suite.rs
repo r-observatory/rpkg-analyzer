@@ -103,6 +103,46 @@ fn ties_go_to_the_earlier_framework() {
     let s = summary(&t, "release");
     assert_eq!(s["test_frameworks_used"], json!(["testthat", "tinytest"]));
     assert_eq!(s["test_framework_primary"], "testthat");
+
+    // Each framework's runner counts as one of its files, so runners do not tip a tie.
+    let runit = tree(&[
+        ("DESCRIPTION", DESC),
+        ("tests/testthat.R", "test_check(\"fixpkg\")\n"),
+        ("tests/testthat/test-a.R", "test_that(\"a\", expect_true(TRUE))\n"),
+        ("tests/runTests.R", "BiocGenerics:::testPackage(\"fixpkg\")\n"),
+        ("inst/unitTests/test_a.R", "test.one <- function() checkTrue(TRUE)\n"),
+    ]);
+    let s = summary(&runit, "release");
+    assert_eq!(s["test_frameworks_used"], json!(["testthat", "RUnit"]));
+    assert_eq!(s["test_framework_primary"], "testthat", "one test file and a runner each is a tie");
+    let tiny = tree(&[
+        ("DESCRIPTION", DESC),
+        ("tests/testthat.R", "test_check(\"fixpkg\")\n"),
+        ("tests/testthat/test-a.R", "test_that(\"a\", expect_true(TRUE))\n"),
+        ("tests/tinytest.R", "library(tinytest)\ntest_package(\"fixpkg\")\n"),
+        ("inst/tinytest/test_a.R", "expect_true(TRUE)\n"),
+        ("inst/tinytest/test_b.R", "expect_true(TRUE)\n"),
+    ]);
+    assert_eq!(summary(&tiny, "release")["test_framework_primary"], "tinytest", "two tinytest files beat one testthat file");
+}
+
+#[test]
+fn each_cran_skip_route_counts_its_block() {
+    let t = tree(&[
+        ("DESCRIPTION", TT_DESC),
+        ("R/skip.R", "skip_if_no_net <- function() testthat::skip_if_offline()\n"),
+        ("tests/testthat.R", "test_check(\"fixpkg\")\n"),
+        ("tests/slow.R", "if (identical(Sys.getenv(\"NOT_CRAN\"), \"true\")) testthat::test_check(\"fixpkg\")\n"),
+        ("tests/testthat/setup-skip.R", "skip_heavy <- function() skip_on_cran()\n"),
+        (
+            "tests/testthat/test-a.R",
+            "test_that(\"runs\", expect_true(TRUE))\ntest_that(\"offline\", { skip_if_offline(); expect_true(TRUE) })\ntest_that(\"R wrapper\", { skip_if_no_net(); expect_true(TRUE) })\ntest_that(\"setup wrapper\", { skip_heavy(); expect_true(TRUE) })\ntest_that(\"text\", { if (!identical(Sys.getenv(\"NOT_CRAN\"), \"true\")) skip(\"slow\"); expect_true(TRUE) })\n",
+        ),
+    ]);
+    let s = summary(&t, "release");
+    assert_eq!(s["n_test_blocks"], 5);
+    assert_eq!(s["n_test_blocks_cran_skipped"], 4, "skip_if_offline, the R/ and setup wrappers, and the NOT_CRAN text");
+    assert_eq!(s["tests_gated_not_cran"], false, "one of two runners calls test_check without a NOT_CRAN condition");
 }
 
 #[test]
