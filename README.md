@@ -9,12 +9,18 @@ an archive.
 ## Usage
 
 ```
-rpkg-analyzer <package_dir>        # NDJSON to stdout
-rpkg-analyzer --datasets <dir>     # the dataset records only, nothing else
-rpkg-analyzer --version            # the build that would write them
-rpkg-analyzer --sexp  <file>       # debug: print the tree-sitter parse tree
-rpkg-analyzer --kinds <file>       # debug: node-kind histogram
+rpkg-analyzer <package_dir> --input-kind release|git   # NDJSON to stdout
+rpkg-analyzer --datasets <dir>                         # the dataset records only, nothing else
+rpkg-analyzer --version                                # the build that would write them
+rpkg-analyzer --explain <dir> --input-kind release|git # debug: per-file decisions
+rpkg-analyzer --sexp  <file>                           # debug: print the tree-sitter parse tree
+rpkg-analyzer --kinds <file>                           # debug: node-kind histogram
 ```
+
+`--input-kind` is required in the analysis mode and follows the directory. `release` means the
+directory is a built release (a CRAN tarball, or the github.com/cran mirror of one). `git`
+means it is a git branch that R CMD build has not filtered yet (a Bioconductor release branch).
+A missing flag, or any other value, exits with status 2, a usage line on stderr and no records.
 
 ## Output contract
 
@@ -28,6 +34,7 @@ One `summary` record per run, followed by intermediate records:
 | `function` | R or compiled function | `lang` (`r`/`c`/`cpp`/`rust`/`fortran`), `name`, `file`, `line`, `loc`; R nodes also `exported`, `n_params`, `cyclocomp` |
 | `call_edge` | one call-graph edge | `graph` (`r`/`native`/`c`/`rust`/`fortran`), `from`, `to` |
 | `dcf` | package version | every DESCRIPTION field verbatim (the catch-all) |
+| `release_notes` | package version, only when its NEWS has a section for it | `package_version`, `news_file`, `release_notes_source` (`news_md`, `news_rd`, `news_plain`), `release_notes` (at most 16,384 bytes, cut at a character boundary), `release_notes_truncated` |
 | `dataset` | object shipped under `data/`, `R/sysdata.rda`, or `inst/extdata` | `name`, `file`, `origin_dir`, `format`, `compression`, `class`, `kind`, `nrow`, `ncol`, `column_detail`, `columns[]`, `schema_fp`, `shape_fp`, `content_fp`, `row_sketch`, `confidence`; see [Dataset records](#dataset-records) |
 
 The summary record also carries `analyzer_version`, the build that wrote it. A consumer storing these results needs it to tell rows it has already collected from rows a newer build would describe differently, which is what makes a rescan decidable rather than a guess.
@@ -50,6 +57,46 @@ languages stays distinct. On data.table that is one connected structure of about
 The `dcf` record preserves the full parsed DESCRIPTION so any field can be
 promoted to a metric later without re-reading the source.
 
+## Input kind and what NULL means
+
+Every summary carries `input_kind`, the contract it was computed under. A row with no
+`input_kind` was written by 0.4.0 or earlier, or by a pipeline's R fallback, and keeps the
+older meaning.
+
+Release-content columns (every column except the seven below) describe what the release
+contains. On `release` input they read the tree as given. On `git` input they read the files
+R CMD build would keep: the tree after the 18 default exclude patterns of R 4.6.1's
+`tools:::get_exclude_patterns()`, every non-empty line of `.Rbuildignore` (split the way
+`readLines` splits, not trimmed, `#` lines used as patterns, compiled case-insensitively), and
+the structural exclusions of `tools:::.build_packages`. An excluded directory takes its
+contents. For these columns 0 means "not in this release", and NULL means the analyzer could
+not tell: the file could not be parsed, or on `git` input the `.Rbuildignore` exists and could
+not be read. In that last case every release-content column is NULL and only the `dcf` record
+follows the summary. A few detail columns are NULL when their parent says there is nothing to
+describe: `news_file` and `release_notes_source` (parent `news_present`), `changelog_file`,
+the `citation_*` columns (parent `has_citation`), the `rd_example_pages_*` breakdowns (parent
+`rd_example_pages`), `examples_coverage_fn` and its basis (an empty denominator), `n_test_units`,
+`test_unit`, `n_test_blocks`, `n_test_blocks_cran_skipped` and `tests_gated_not_cran` (parent
+`test_framework_primary`), and `vignette_eval_gated` (parent `has_vignettes`).
+
+Repository-only columns are `ci_present`, `ci_type`, `ci_matrix_breadth`, `ci_pr_gated`,
+`has_pkgdown`, `has_code_of_conduct` and `has_contributing_guide`. On `git` input they read the
+whole branch and are true or false. On `release` input a presence column is true when the
+release itself carries a matching file and NULL otherwise, never false, because a release
+cannot show what its repository keeps; `ci_type`, `ci_matrix_breadth` and `ci_pr_gated` are NULL
+unless `ci_present` is true.
+
+`build_ignored` names the release items a `git` branch leaves out of its build, as a JSON array
+in this order: `README.md`, `README.Rmd`, `README.qmd`, `NEWS.md`, `NEWS`, `tests`, `vignettes`,
+`vignettes/articles`, `_pkgdown.yml`, `pkgdown`, `docs`, `CODE_OF_CONDUCT.md`, `CONTRIBUTING.md`,
+`data-raw`, `.github`, `inst/NEWS.Rd`, `inst/CITATION`, `inst/REFERENCES.bib`, `man`. A file item
+is listed when it is in the tree and excluded; a directory item when it is excluded or every
+file under it is; `_pkgdown.yml` stands for any pkgdown config path, `CODE_OF_CONDUCT.md` and
+`CONTRIBUTING.md` for any root spelling below; `vignettes` is also listed when every vignette
+source in it is excluded, whatever else survives. It is NULL on `release` input and `[]` when
+nothing is left out. `build_ignore_bad_lines` counts `.Rbuildignore` lines that do not compile
+and are skipped; NULL on `release` input or without a `.Rbuildignore`.
+
 ## Dataset records
 
 One `dataset` record per object a package ships. The values are read straight out of R's serialization format (`.rda`, `.rds`, `.RData`) or out of delimited text, with no R runtime and no evaluation of package code, so a version pulled from an archive reads the same way a current release does.
@@ -66,7 +113,7 @@ A `.tsv` or a `.dat` under `data/` gets no record at all, for the same reason: `
 
 `inst/extdata` (or `extdata`, in an installed tree) is covered too, under the rules in [inst/extdata](#instextdata) below.
 
-`file` is the path relative to the package root. `title` is the title of the Rd help page whose alias matches the dataset name, when the package documents it, so a catalogue row can say what the data is rather than only what it is called.
+`file` is the path relative to the package root. `title` is the title of the Rd help page whose alias matches the dataset name, when the package documents it, so a catalogue row can say what the data is rather than only what it is called. For a `data/` dataset with such a page, `dataset_doc_format` is 1 when the page has a `\format` block and 0 when not, and `dataset_doc_source` is its `\source` as text (at most 4,096 bytes) or null when the page states none; with no page both are null, and so are `sysdata` and `extdata` records. On `git` input files the build leaves out are not read.
 
 ### How much of it was read
 
@@ -203,6 +250,8 @@ and its `_exported_` and `_internal_` splits; `npars_exported_mean/median`;
 
 `n_fns_src` (total) with `n_fns_c`, `n_fns_cpp`, `n_fns_fortran`, `n_fns_rust`,
 and `n_fns_per_file_src`. Counted with tree-sitter grammars for each language.
+Rust sources under `src/` count toward `has_src`, `loc_src` and `lang_breakdown`; vendored
+crates (`src/rust/vendor*/`) and cargo output (`target/` under `src/`) do not.
 
 ### Object systems
 
@@ -269,14 +318,102 @@ each compiled language internally) is covered without external tooling.
 
 ### Tests
 
-`n_test_cases` and `testing_frameworks`. Cases are counted for testthat
-(`test_that`/`describe`/`it`), unittest (`ok`/`ok_group`), tinytest (`expect_*`),
-RUnit (`test.*` functions / `check*`), and testit (`assert`). unitizer (by its
-`tests/unitizer/` directory), svUnit, quickcheck, and hedgehog are detected as
-frameworks (via layout or `Suggests`) but not case-counted, since they are
-expression- or property-based rather than discrete-case. Assertion libraries
-(assertthat, checkmate) and mocking libraries (mockery, mockr) are intentionally
-not treated as frameworks.
+`test_framework_primary` is the framework with the most test files among those the layout
+names: testthat (`tests/testthat/` holds a file), tinytest (`inst/tinytest/`,
+`tests/tinytest.R`, or `tinytest::` in a test file), RUnit (`inst/unitTests/`, or `RUnit::`,
+`library(RUnit)`, `runTestSuite` or `BiocGenerics:::testPackage` in a test file), testit,
+unitizer (`tests/unitizer/`), and scripts (`tests/*.R` with none of these). Ties go to that
+order. `helper*` and `setup*` files under `tests/testthat/` never name a framework. It is
+`none` only when `tests/`, `inst/tinytest/` and `inst/unitTests/` hold no file, and NULL when
+they hold files but none names a framework. `test_frameworks_used` lists every framework with a
+hit, `test_frameworks_declared` the ones named in Suggests. `n_test_units` counts the primary
+framework's unit, named in `test_unit`: `test_block` (testthat `test_that()` and `it()`),
+`expectation` (tinytest `expect_*()`, testit `assert()`), `test_function` (RUnit `test*`
+functions), `script_file` (`tests/*.R`). `n_rout_save` counts `tests/*.Rout.save`.
+
+For testthat, `n_test_blocks` counts blocks and `n_test_blocks_cran_skipped` those CRAN skips:
+a block calling `skip_on_cran()`, `skip_if_offline()` or a top-level function in a helper,
+setup file or `R/` that calls one of them; a block mentioning `NOT_CRAN`; a block inside an
+`if` whose condition mentions `NOT_CRAN`; every block after a top-level skip call. When every
+`test_check()` in `tests/*.R` sits inside a `NOT_CRAN` condition, every block is skipped and
+`tests_gated_not_cran` is true. Deeper wrappers are missed, so the count is a lower bound.
+
+`n_test_cases` and `testing_frameworks` keep their earlier rules: cases are counted for
+testthat (`test_that`/`describe`/`it`), unittest (`ok`/`ok_group`), tinytest (`expect_*`),
+RUnit (`test.*` functions / `check*`), and testit (`assert`), and frameworks are also taken
+from `Suggests`. Both are kept for rows written before 0.5.0 and will be removed in a later
+release.
+
+### Help pages and examples
+
+Help pages are `man/*.Rd` in any case, plus `man/unix/` and `man/windows/`; `man/macros` holds
+macro definitions and is not counted. `n_help_topics`, `n_help_topics_internal`
+(`\keyword{internal}`), `n_help_topics_data` (`\docType{data}`) and `n_help_topics_package`
+(`\docType{package}` or an alias `<Package>-package`). `rd_example_pages` counts pages with an
+`\examples` block, split into `rd_example_pages_run` (code outside `\dontrun`, `\donttest`,
+`\dontshow` and `\testonly`; `\dontdiff` code runs), `rd_example_pages_donttest_only`,
+`rd_example_pages_never_run` (code only in `\dontrun`, `\dontshow` or `\testonly`) and
+`rd_example_pages_empty` (comments only). `rd_example_pages_conditional` counts run pages behind
+roxygen's `@examplesIf` or an opening `if (` on `interactive()`, `requireNamespace()` or
+`Sys.getenv()`. `examples_coverage_fn` is the share of pages aliasing an export that have
+examples; with no plain export it uses pages that are not internal and do not document data,
+the package, a class or methods, and `examples_coverage_fn_basis` says which (`exports`,
+`not_internal`).
+
+### Citation file and references
+
+`has_citation` is `inst/CITATION` in the release. The file is decoded as UTF-8, or Latin-1 when
+DESCRIPTION declares it, parsed and never evaluated. `citation_read` is `literal`, `meta` (it
+reads DESCRIPTION fields through `meta$`), `needs_eval` (any other call, assignment or free
+symbol) or `parse_error`. `citation_n_entries`, `citation_bibtype` (JSON array, lowercase),
+`citation_kind` (`publication` or `software_only`), `citation_dois` (JSON array, normalised)
+and `citation_venue` (JSON array of `jss`, `rjournal`, `joss`, `other`; CRAN package and Zenodo
+DOIs are no venue). An empty DOI list claims "no DOI" only on `literal` and `meta` reads; a
+`needs_eval` read with none leaves both NULL. `has_rd_bibliography` is `inst/REFERENCES.bib` or
+`inst/REFERENCES.R` in the release.
+
+### README, NEWS and vignettes
+
+`has_readme` looks for a root README.md, README.markdown, README.Rmd, README.qmd, README or
+README.txt, in any case, and `readme_prose_length` reads the first one found. `news_file` is
+the first of inst/NEWS.Rd, NEWS.md, inst/NEWS.md, NEWS and inst/NEWS in the release, the order
+R's readers use; `news_present`, `news_up_to_date` and `news_structure_quality` read it (the
+last is NULL for NEWS.Rd). `changelog_file` is ChangeLog, CHANGELOG or CHANGES.
+`release_notes_source` says which reader found a section for the analysed version, whose text
+is the `release_notes` record.
+
+A vignette source sits directly under `vignettes/`: `.Rnw` and `.Snw` count on their own, other
+engines only with `\VignetteEngine{` in the text. `has_vignettes` and `num_vignettes` count them.
+A vignette is static when building it runs no R code (a `.Rmd.orig` beside it, no R chunk,
+every chunk `eval=FALSE`, a global `opts_chunk$set(eval = FALSE)` no chunk overrides, Quarto
+`execute: eval: false`, `\SweaveOpts{eval=FALSE}`), and gated when its `eval=` names
+`NOT_CRAN`, `Sys.getenv`, `identical`, `nzchar`, `requireNamespace` or `interactive`.
+`vignette_dynamic` is true when any vignette is not static and `vignette_eval_gated` counts the
+gated ones; both are NULL without vignettes.
+
+### Repository practices, license and authors
+
+`has_pkgdown` checks pkgdown 2.2.0's six config paths (`_pkgdown.yml`, `_pkgdown.yaml`, the same
+two under `pkgdown/` and under `inst/`). `has_code_of_conduct` and `has_contributing_guide` check
+the root and `.github/` for CODE_OF_CONDUCT.md, CODE_OF_CONDUCT, CODE_OF_CONDUCT.Rmd,
+CODE_OF_CONDUCT.rst, code_of_conduct.md, Code_of_conduct.md, CODE-OF-CONDUCT.md, CONDUCT.md and
+CONTRIBUTING.md, CONTRIBUTING, CONTRIBUTING.Rmd, CONTRIBUTING.rst, contributing.md,
+Contributing.md, CONTRIBUTING.MD, the same lists vcs-signals uses.
+
+`license_file_completeness`, for an MIT or BSD template license, is true when `YEAR:` and
+`COPYRIGHT HOLDER:` both carry real values, or when the file is a full license text with
+neither line.
+
+Each entry of `authors` is `{"given":...,"family":...,"roles":[...]}` followed, only when the
+version declares them, by `comment` (at most 120 characters, emails removed), `orcid` (bare,
+check digit verified) and `ror`. A free-text Author field is split on commas, semicolons,
+"and", "&" and "with contributions from", with bracketed roles and parenthesised notes kept
+whole, emails removed, and notes and a leading "... by" moved into `comment`.
+
+### Retired columns
+
+`has_website` and `copyright_holder_declared` are no longer emitted from 0.5.0. The first read
+arXiv, DOI and CRAN links as websites; the second was true for every legacy Author field.
 
 ### NAMESPACE intelligence
 
