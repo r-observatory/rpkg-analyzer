@@ -217,8 +217,10 @@ and `n_fns_per_file_src`. Counted with tree-sitter grammars for each language.
 ### Documentation and source signals
 
 `has_recognized_repo`, `repo_host`, `repo_url` (normalized to `host/owner/repo`),
-`has_website`, `help_pages_with_examples`, `examples_coverage`, `news_up_to_date`
-(latest NEWS version equals the package version).
+`help_pages_with_examples`, `examples_coverage`, `news_up_to_date`
+(latest NEWS version equals the package version). The raw `URL` field is emitted
+as `url`, so a consumer that wants a website flag derives it from that with its
+own rule rather than inheriting one baked in here.
 
 ### Languages
 

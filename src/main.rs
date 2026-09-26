@@ -278,7 +278,6 @@ struct Legal {
     spdx_valid: Option<bool>,
     osi_approved: Option<bool>,
     license_file_completeness: Option<bool>,
-    copyright_holder_declared: Option<bool>,
 }
 
 /// Split a DESCRIPTION License string into canonical tokens (port of .legal_tokenize).
@@ -371,19 +370,7 @@ fn metrics_legal(desc: &BTreeMap<String, String>, root: &Path, files: &[String])
         }
     };
 
-    let copyright_holder_declared = {
-        let authors_r = desc.get("Authors@R").map(|s| s.trim()).filter(|s| !s.is_empty());
-        if let Some(ar) = authors_r {
-            Some(regex::Regex::new(r#""cph"|'cph'"#).unwrap().is_match(ar))
-        } else {
-            desc.get("Author")
-                .map(|s| s.trim())
-                .filter(|s| !s.is_empty())
-                .map(|_| true)
-        }
-    };
-
-    Legal { license, spdx_valid, osi_approved, license_file_completeness, copyright_holder_declared }
+    Legal { license, spdx_valid, osi_approved, license_file_completeness }
 }
 
 // ---- portability ------------------------------------------------------------
@@ -3520,16 +3507,6 @@ fn main() {
     translations.sort();
     translations.dedup();
 
-    // Website: a pkgdown site or a declared URL on a non-forge host.
-    let forges = ["github.com", "gitlab.com", "codeberg.org", "bitbucket.org", "git.sr.ht"];
-    let url_website = desc.get("URL").map(|u| {
-        u.split([',', ' ', '\n'])
-            .map(str::trim)
-            .filter(|s| s.starts_with("http"))
-            .any(|s| !forges.iter().any(|d| s.contains(d)))
-    }).unwrap_or(false);
-    let has_website = practices.has_pkgdown == Some(true) || url_website;
-
     // Author role counts from Authors@R.
     let authors_r = desc.get("Authors@R").cloned().unwrap_or_default();
     let role_count = |role: &str| {
@@ -3568,7 +3545,6 @@ fn main() {
         "citation_dois": cit.as_ref().and_then(|c| c.dois.clone()),
         "citation_venue": cit.as_ref().and_then(|c| c.venues.clone()),
         "has_rd_bibliography": exists(&files, "inst/REFERENCES.bib") || exists(&files, "inst/REFERENCES.R"),
-        "copyright_holder_declared": legal.copyright_holder_declared,
         "min_r_version": port.min_r_version,
         "system_requirements_count": port.system_requirements_count,
         "cxx_standard_required": port.cxx_standard_required,
@@ -3753,7 +3729,6 @@ fn main() {
         "files_inst": files_inst,
         "files_vignettes": files_vignettes,
         "translations": translations,
-        "has_website": has_website,
         "desc_n_aut": desc_n_aut,
         "desc_n_cre": desc_n_cre,
         "desc_n_ctb": desc_n_ctb,
