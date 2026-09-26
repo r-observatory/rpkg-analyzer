@@ -5,11 +5,20 @@
 // which map one-to-one onto the current pipeline's structure.R / parse_dcf /
 // parse_namespace.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use tree_sitter::Parser;
 
+mod authors;
+mod citation;
+mod cli;
+mod news;
+mod rd_pages;
 mod rds;
+mod release_files;
+mod repo_practices;
+mod test_suite;
+mod vignettes;
 
 // ---- file walking -----------------------------------------------------------
 
@@ -79,6 +88,11 @@ fn read(root: &Path, rel: &str) -> Option<String> {
     std::fs::read_to_string(root.join(rel)).ok()
 }
 
+/// A file's text with any invalid UTF-8 replaced, so a Latin-1 byte cannot hide it.
+fn read_lossy(root: &Path, rel: &str) -> Option<String> {
+    std::fs::read(root.join(rel)).ok().map(|b| String::from_utf8_lossy(&b).into_owned())
+}
+
 /// Median of a slice (average of the two middle values for an even count).
 fn median_u64(v: &[u64]) -> Option<f64> {
     if v.is_empty() {
@@ -106,16 +120,24 @@ fn language_for_ext(path: &str) -> Option<tree_sitter::Language> {
     })
 }
 
+static VENDORED_SRC: std::sync::LazyLock<regex::Regex> =
+    std::sync::LazyLock::new(|| regex::Regex::new(r"^src/rust/vendor[^/]*/|^src/(?:[^/]+/)*target/").unwrap());
+
+/// Vendored crates and cargo build output, which are not the package's own code.
+fn is_vendored_src(path: &str) -> bool {
+    VENDORED_SRC.is_match(path)
+}
+
 /// the is_src: src/ files with a compiled-language extension only (structure.R).
 /// Excludes Makevars, configure, .in, etc.
 fn is_src_file(path: &str) -> bool {
-    if !path.starts_with("src/") {
+    if !path.starts_with("src/") || is_vendored_src(path) {
         return false;
     }
     let ext = path.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
     matches!(
         ext.as_str(),
-        "c" | "cc" | "cpp" | "cxx" | "h" | "hpp" | "hxx" | "f" | "f90" | "f95"
+        "c" | "cc" | "cpp" | "cxx" | "h" | "hpp" | "hxx" | "f" | "f90" | "f95" | "rs"
     )
 }
 
@@ -256,7 +278,6 @@ struct Legal {
     spdx_valid: Option<bool>,
     osi_approved: Option<bool>,
     license_file_completeness: Option<bool>,
-    copyright_holder_declared: Option<bool>,
 }
 
 /// Split a DESCRIPTION License string into canonical tokens (port of .legal_tokenize).
@@ -282,6 +303,31 @@ fn legal_tokenize(lic: &str) -> Vec<String> {
             })
         })
         .collect()
+}
+
+/// A value CRAN's template leaves unfilled: blank, a bare <...>, YEAR, COPYRIGHT HOLDER or "your name".
+fn is_license_placeholder(v: &str) -> bool {
+    let v = v.trim();
+    v.is_empty()
+        || (v.starts_with('<') && v.ends_with('>') && !v[1..v.len() - 1].contains('>'))
+        || v.eq_ignore_ascii_case("YEAR")
+        || v.eq_ignore_ascii_case("COPYRIGHT HOLDER")
+        || v.to_lowercase().contains("your name")
+}
+
+/// A filled MIT/BSD template (both lines, real values), or a full license text (neither line).
+fn license_template_complete(content: &str) -> bool {
+    let content = content.strip_prefix('\u{feff}').unwrap_or(content);
+    // Only spaces and tabs after the colon, so an empty value never takes the next line.
+    let year_re = regex::Regex::new(r"(?m)^\s*YEAR:[ \t]*(.*)$").unwrap();
+    let holder_re = regex::Regex::new(r"(?m)^\s*COPYRIGHT HOLDER:[ \t]*(.*)$").unwrap();
+    let year = year_re.captures(content).map(|c| c[1].to_string());
+    let holder = holder_re.captures(content).map(|c| c[1].to_string());
+    match (year, holder) {
+        (Some(y), Some(h)) => !is_license_placeholder(&y) && !is_license_placeholder(&h),
+        (None, None) => !content.trim().is_empty(),
+        _ => false,
+    }
 }
 
 fn metrics_legal(desc: &BTreeMap<String, String>, root: &Path, files: &[String]) -> Legal {
@@ -312,13 +358,11 @@ fn metrics_legal(desc: &BTreeMap<String, String>, root: &Path, files: &[String])
         match path {
             None => Some(false),
             Some(p) => {
-                let content = read(root, p).unwrap_or_default();
+                let content = read_lossy(root, p).unwrap_or_default();
                 if content.trim().is_empty() {
                     Some(false)
                 } else if tokens.iter().any(|t| TEMPLATE_TOKENS.contains(&t.as_str())) {
-                    let year = regex::Regex::new(r"\bYEAR\b").unwrap().is_match(&content);
-                    let ch = regex::Regex::new(r"\bCOPYRIGHT HOLDER\b").unwrap().is_match(&content);
-                    Some(!(year || ch))
+                    Some(license_template_complete(&content))
                 } else {
                     Some(true)
                 }
@@ -326,19 +370,7 @@ fn metrics_legal(desc: &BTreeMap<String, String>, root: &Path, files: &[String])
         }
     };
 
-    let copyright_holder_declared = {
-        let authors_r = desc.get("Authors@R").map(|s| s.trim()).filter(|s| !s.is_empty());
-        if let Some(ar) = authors_r {
-            Some(regex::Regex::new(r#""cph"|'cph'"#).unwrap().is_match(ar))
-        } else {
-            desc.get("Author")
-                .map(|s| s.trim())
-                .filter(|s| !s.is_empty())
-                .map(|_| true)
-        }
-    };
-
-    Legal { license, spdx_valid, osi_approved, license_file_completeness, copyright_holder_declared }
+    Legal { license, spdx_valid, osi_approved, license_file_completeness }
 }
 
 // ---- portability ------------------------------------------------------------
@@ -349,8 +381,6 @@ struct Port {
     nonportable_compiler_flags: i64,
     nonportable_compiler_flags_json: Vec<String>,
     min_r_version: Option<String>,
-    has_vignettes: bool,
-    vignette_dynamic: Option<bool>,
 }
 
 fn find_files<'a>(files: &'a [String], pat: &str) -> Vec<&'a str> {
@@ -419,52 +449,12 @@ fn metrics_portability(desc: &BTreeMap<String, String>, root: &Path, files: &[St
             re.captures(dep).map(|c| c[1].to_string())
         });
 
-    // vignettes
-    let vig_files = find_files(files, r"^vignettes/.*\.[Rr](md|nw)$");
-    let has_vignettes = !vig_files.is_empty();
-    let vignette_dynamic = if !has_vignettes {
-        None
-    } else {
-        let rmd_hdr = regex::Regex::new(r"```\{r[^}]*\}").unwrap();
-        let rnw_hdr = regex::Regex::new(r"<<[^>]*>>=").unwrap();
-        let eval_off = fancy_regex::Regex::new(r"eval\s*=\s*(FALSE|F)(?=[,}\s]|$)").unwrap();
-        let mut found_any = false;
-        let mut found_active = false;
-        for vf in &vig_files {
-            let Some(content) = read(root, vf) else { continue };
-            if content.is_empty() {
-                continue;
-            }
-            let headers: Vec<&str> = if regex::Regex::new(r"\.[Rr]md$").unwrap().is_match(vf) {
-                rmd_hdr.find_iter(&content).map(|m| m.as_str()).collect()
-            } else {
-                rnw_hdr.find_iter(&content).map(|m| m.as_str()).collect()
-            };
-            if headers.is_empty() {
-                continue;
-            }
-            found_any = true;
-            for h in headers {
-                if !eval_off.is_match(h).unwrap_or(false) {
-                    found_active = true;
-                    break;
-                }
-            }
-            if found_active {
-                break;
-            }
-        }
-        Some(if !found_any { true } else { found_active })
-    };
-
     Port {
         system_requirements_count,
         cxx_standard_required,
         nonportable_compiler_flags,
         nonportable_compiler_flags_json: found_flags,
         min_r_version,
-        has_vignettes,
-        vignette_dynamic,
     }
 }
 
@@ -544,10 +534,6 @@ struct Tests {
     test_isolation_libs: Vec<String>,
     exported_fn_test_linkage: Option<f64>,
     stochastic_seed_discipline: Option<f64>,
-    ci_present: bool,
-    ci_type: Vec<String>,
-    ci_matrix_breadth: i64,
-    ci_pr_gated: bool,
 }
 
 fn metrics_tests(
@@ -633,29 +619,6 @@ fn metrics_tests(
         Some(seeded as f64 / stoch_files.len() as f64)
     };
 
-    let ci_yml = find_files(files, r"^\.github/workflows/.*\.ya?ml$");
-    let has_travis = exists(files, ".travis.yml");
-    let has_appveyor = exists(files, "appveyor.yml");
-    let has_circleci = !find_files(files, r"^\.circleci/").is_empty();
-    let ci_present = !ci_yml.is_empty() || has_travis || has_appveyor || has_circleci;
-    let mut ci_type = Vec::new();
-    if !ci_yml.is_empty() {
-        ci_type.push("github-actions".to_string());
-    }
-    if has_travis {
-        ci_type.push("travis".to_string());
-    }
-    if has_appveyor {
-        ci_type.push("appveyor".to_string());
-    }
-    if has_circleci {
-        ci_type.push("circleci".to_string());
-    }
-    let ci_matrix_breadth = gha_matrix_breadth(root, &ci_yml);
-    let ci_pr_gated = ci_yml
-        .iter()
-        .any(|f| read(root, f).map(|c| c.contains("pull_request")).unwrap_or(false));
-
     Tests {
         has_tests,
         test_to_code_ratio,
@@ -664,10 +627,6 @@ fn metrics_tests(
         test_isolation_libs,
         exported_fn_test_linkage,
         stochastic_seed_discipline,
-        ci_present,
-        ci_type,
-        ci_matrix_breadth,
-        ci_pr_gated,
     }
 }
 
@@ -823,7 +782,6 @@ struct Docs {
     roxygen_doc_coverage: Option<f64>,
     has_readme: bool,
     readme_prose_length: Option<i64>,
-    has_pkgdown: bool,
     news_present: bool,
     news_structure_quality: Option<f64>,
 }
@@ -856,6 +814,32 @@ fn rd_brace_content(text: &str, after_open: usize) -> Option<(String, usize)> {
         i += 1;
     }
     None
+}
+
+/// Text with Rd `%` comments removed; an escaped `\%` stays.
+fn strip_rd_comments(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for line in text.split_inclusive('\n') {
+        let b = line.as_bytes();
+        let mut cut = line.len();
+        let mut j = 0;
+        while j < b.len() {
+            if b[j] == b'\\' {
+                j += 2;
+                continue;
+            }
+            if b[j] == b'%' {
+                cut = j;
+                break;
+            }
+            j += 1;
+        }
+        out.push_str(&line[..cut]);
+        if cut < line.len() && line.ends_with('\n') {
+            out.push('\n');
+        }
+    }
+    out
 }
 
 /// First \cmd{...} block in text. Port of docs.R's `.fb`.
@@ -986,13 +970,24 @@ fn version_ge(a: &[u64], b: &[u64]) -> bool {
     true
 }
 
+/// README names in the order they are tried, matched case-insensitively at the root.
+const README_NAMES: [&str; 6] = ["README.md", "README.markdown", "README.Rmd", "README.qmd", "README", "README.txt"];
+
+fn readme_file(files: &[String]) -> Option<&str> {
+    README_NAMES
+        .iter()
+        .find_map(|n| files.iter().find(|f| !f.contains('/') && f.eq_ignore_ascii_case(n)))
+        .map(String::as_str)
+}
+
 fn metrics_docs(
     _desc: &BTreeMap<String, String>,
     root: &Path,
     files: &[String],
     exports: &[String],
+    news_file: Option<&str>,
 ) -> Docs {
-    let rd_files = find_files(files, r"^man/.*\.Rd$");
+    let rd_files = rd_pages::rd_page_files(files);
     let n_rd = rd_files.len();
 
     let exports_filtered: Vec<&String> =
@@ -1123,18 +1118,12 @@ fn metrics_docs(
     };
 
     // ---- 6. has_readme ----------------------------------------------------------
-    let has_readme = exists(files, "README.md") || exists(files, "README.Rmd");
+    let readme = readme_file(files);
+    let has_readme = readme.is_some();
 
     // ---- 7. readme_prose_length --------------------------------------------------
     let readme_prose_length = {
-        let rpath = if exists(files, "README.md") {
-            Some("README.md")
-        } else if exists(files, "README.Rmd") {
-            Some("README.Rmd")
-        } else {
-            None
-        };
-        rpath.map(|p| {
+        readme.map(|p| {
             let text = read(root, p).unwrap_or_default();
             if text.is_empty() {
                 0i64
@@ -1152,21 +1141,13 @@ fn metrics_docs(
         })
     };
 
-    // ---- 8. has_pkgdown -----------------------------------------------------------
-    let has_pkgdown = exists(files, "_pkgdown.yml") || exists(files, "pkgdown/_pkgdown.yml");
-
     // ---- 9. news_present ------------------------------------------------------------
-    let news_present = exists(files, "NEWS") || exists(files, "NEWS.md");
+    let news_present = news_file.is_some();
 
     // ---- 10. news_structure_quality ---------------------------------------------------
     let news_structure_quality = {
-        let npath = if exists(files, "NEWS.md") {
-            Some("NEWS.md")
-        } else if exists(files, "NEWS") {
-            Some("NEWS")
-        } else {
-            None
-        };
+        // Its Markdown and bullet heuristics say nothing about Rd.
+        let npath = news_file.filter(|p| *p != "inst/NEWS.Rd");
         npath.map(|p| {
             let text = read(root, p).unwrap_or_default();
             if text.trim().is_empty() {
@@ -1227,7 +1208,6 @@ fn metrics_docs(
         roxygen_doc_coverage,
         has_readme,
         readme_prose_length,
-        has_pkgdown,
         news_present,
         news_structure_quality,
     }
@@ -1240,8 +1220,6 @@ struct Health {
     global_state_write_density: Option<f64>,
     deprecated_idiom_density: Option<f64>,
     debug_artifact_density: Option<f64>,
-    has_code_of_conduct: bool,
-    has_contributing_guide: bool,
 }
 
 /// Strip a single-line comment (rough: ignores '#' inside strings), matching
@@ -1454,19 +1432,11 @@ fn metrics_health(_desc: &BTreeMap<String, String>, root: &Path, files: &[String
         cnt as f64 / kloc_r
     });
 
-    // ---- community health files ----
-    let has_code_of_conduct =
-        exists(files, "CODE_OF_CONDUCT.md") || exists(files, ".github/CODE_OF_CONDUCT.md");
-    let has_contributing_guide =
-        exists(files, "CONTRIBUTING.md") || exists(files, ".github/CONTRIBUTING.md");
-
     Health {
         on_exit_coverage_rate,
         global_state_write_density,
         deprecated_idiom_density,
         debug_artifact_density,
-        has_code_of_conduct,
-        has_contributing_guide,
     }
 }
 
@@ -1475,13 +1445,17 @@ struct Person {
     given: Option<String>,
     family: Option<String>,
     roles: Vec<String>,
+    comment: Option<String>,
+    orcid: Option<String>,
+    ror: Option<String>,
 }
 
 struct Meta {
     maintainer: Option<String>,
     maintainer_email: Option<String>,
     n_authors: Option<i64>,
-    /// Pre-serialized JSON array of {given,family,roles} objects, matching the
+    /// Pre-serialized JSON array of {given,family,roles} objects, each followed by
+    /// comment, orcid and ror keys only when declared, matching the
     /// `as.character(jsonlite::toJSON(parsed, auto_unbox = TRUE))`. we store this
     /// as a character scalar containing JSON text (double-encoded when embedded in
     /// the outer summary object), so this is a String, not a Vec<String>.
@@ -1584,82 +1558,150 @@ fn meta_parse_person(inner: &str) -> Person {
         }
     }
 
+    let named_c_re = regex::Regex::new(r"[A-Za-z_.][A-Za-z0-9_.]*\s*=\s*c\([^)]*\)").unwrap();
+    let named_val_re = regex::Regex::new(r#"[A-Za-z_.][A-Za-z0-9_.]*\s*=\s*(?:"[^"]*"|'[^']*')"#).unwrap();
+
+    // comment = c(ORCID = "...", ROR = "...", "free text"), or comment = "free text". A
+    // parenthesis inside a quoted part does not end the c(...).
+    let comment_c_re = regex::Regex::new(r#"comment\s*=\s*c\(((?:"[^"]*"|'[^']*'|[^)"'])*)\)"#).unwrap();
+    let comment_s_re = regex::Regex::new(r#"comment\s*=\s*(?:"([^"]*)"|'([^']*)')"#).unwrap();
+    let (mut orcid, mut ror, mut free) = (None, None, Vec::new());
+    let mut comment_text = String::new();
+    if let Some(c) = comment_c_re.captures(inner) {
+        let body = c.get(1).map(|m| m.as_str()).unwrap_or("");
+        // A part's name may be quoted: c('ORCID' = "...") reads as c(ORCID = "...").
+        let parts = authors::comment_parts(body);
+        let is_key = |name: &Option<String>, key: &str| name.as_deref().is_some_and(|n| n.eq_ignore_ascii_case(key));
+        orcid = parts.iter().filter(|(n, _)| is_key(n, "ORCID")).find_map(|(_, v)| authors::orcid_checked(v));
+        ror = parts.iter().filter(|(n, _)| is_key(n, "ROR")).find_map(|(_, v)| authors::ror_checked(v));
+        // Other named parts keep their value without the name, as CRAN keeps them.
+        free = parts
+            .into_iter()
+            .filter(|(n, _)| !is_key(n, "ORCID") && !is_key(n, "ROR"))
+            .map(|(_, v)| v)
+            .collect();
+        comment_text = body.to_string();
+    } else if let Some(c) = comment_s_re.captures(inner) {
+        let v = c.get(1).or_else(|| c.get(2)).map(|m| m.as_str()).unwrap_or("");
+        free = vec![v.to_string()];
+        comment_text = v.to_string();
+    }
+    if orcid.is_none() {
+        orcid = authors::orcid_in_text(&comment_text);
+    }
+    // A part that is only the kept ORCID is the identifier; any other iD stays in the comment.
+    free.retain(|f| orcid.is_none() || authors::orcid_checked(f) != orcid);
+
     if given.is_none() || family.is_none() {
-        let named_c_re = regex::Regex::new(r"[A-Za-z_.][A-Za-z0-9_.]*\s*=\s*c\([^)]*\)").unwrap();
-        let named_val_re =
-            regex::Regex::new(r#"[A-Za-z_.][A-Za-z0-9_.]*\s*=\s*(?:"[^"]*"|'[^']*')"#).unwrap();
         let cleaned = named_c_re.replace_all(inner, "");
         let cleaned = named_val_re.replace_all(&cleaned, "");
-        let pos_strs: Vec<String> =
-            extract_quoted(&cleaned).into_iter().filter(|s| !s.is_empty()).collect();
-        if given.is_none() && !pos_strs.is_empty() {
-            given = Some(pos_strs[0].clone());
+        // Empty slots keep their place; an email or @handle is never a name.
+        let pos_strs: Vec<String> = extract_quoted(&cleaned);
+        let usable = |s: &&String| !s.is_empty() && !authors::is_email_like(s);
+        if given.is_none() {
+            given = pos_strs.first().filter(usable).cloned();
         }
-        if family.is_none() && pos_strs.len() >= 2 {
-            family = Some(pos_strs[1].clone());
+        if family.is_none() {
+            family = pos_strs.get(1).filter(usable).cloned();
         }
     }
 
-    Person { given, family, roles }
+    Person { given, family, roles, comment: authors::clean_comment(&free), orcid, ror }
 }
 
-/// Parse the free-text Author field into person entries: split on commas/"and"
-/// (protecting commas inside `[roles]`), strip email, pull `[roles]`, then split
-/// remaining words into given/family (port of .meta_parse_author_text).
+/// The free-text Author field as persons: split on , ; "and" "&" "with contributions from", keeping
+/// [roles] and (notes) whole, dropping emails, keeping ORCIDs, and moving notes and "... by" into comments.
 fn meta_parse_author_text(text: &str) -> Vec<Person> {
     let t = text.trim();
     if t.is_empty() {
         return Vec::new();
     }
-
-    // Protect commas inside [...] blocks before splitting on comma/and.
-    let bracket_re = regex::Regex::new(r"\[[^\]]+\]").unwrap();
-    let mut protected = String::with_capacity(t.len());
-    let mut last = 0usize;
-    for m in bracket_re.find_iter(t) {
-        protected.push_str(&t[last..m.start()]);
-        protected.push_str(&m.as_str().replace(',', "\u{1}"));
-        last = m.end();
+    // Some Author fields hold person() calls; those read as Authors@R.
+    if regex::Regex::new(r"\bperson\s*\(").unwrap().is_match(t) {
+        let persons: Vec<Person> = meta_person_inners(t).iter().map(|inner| meta_parse_person(inner)).collect();
+        // Prose such as "person(s)" parses to no name, so that text is split as prose instead.
+        if persons.iter().any(|p| p.given.is_some() || p.family.is_some()) {
+            return persons;
+        }
     }
-    protected.push_str(&t[last..]);
 
-    let split_re = regex::Regex::new(r"\s*,\s*|\s+and\s+").unwrap();
-    let parts: Vec<String> = split_re
-        .split(&protected)
-        .map(|p| p.trim().replace('\u{1}', ","))
-        .filter(|p| !p.is_empty())
-        .collect();
+    // ORCIDs come out first so the split cannot cut them; each leaves a marker.
+    let orcid_re = regex::Regex::new(
+        r"(?i)<\s*https?://orcid\.org/([0-9X-]{16,19})\s*>|\(\s*ORCID:?\s*(?:<?\s*https?://orcid\.org/)?([0-9X-]{16,19})\s*>?\s*\)",
+    )
+    .unwrap();
+    let mut ids: Vec<Option<String>> = Vec::new();
+    let marked = orcid_re
+        .replace_all(t, |c: &regex::Captures| {
+            let raw = c.get(1).or_else(|| c.get(2)).map(|m| m.as_str()).unwrap_or("");
+            ids.push(authors::orcid_checked(raw));
+            format!(" \u{2}{}\u{2} ", ids.len() - 1)
+        })
+        .into_owned();
+    // Separators inside [...] and (...) belong to one entry.
+    let group_re = regex::Regex::new(r"\[[^\]]*\]|\([^)]*\)").unwrap();
+    let mut groups: Vec<String> = Vec::new();
+    let protected = group_re
+        .replace_all(&marked, |c: &regex::Captures| {
+            groups.push(c[0].to_string());
+            format!("\u{3}{}\u{3}", groups.len() - 1)
+        })
+        .into_owned();
 
+    let split_re = regex::Regex::new(r"(?i)\s*[,;]\s*|\s+and\s+|\s+&\s+|\s+with\s+contributions\s+from\s+").unwrap();
+    let restore_re = regex::Regex::new(r"\u{3}(\d+)\u{3}").unwrap();
+    let marker_re = regex::Regex::new(r"\u{2}(\d+)\u{2}").unwrap();
+    let lead_and_re = regex::Regex::new(r"(?i)^(?:and|&)\s+").unwrap();
     let email_re = regex::Regex::new(r"\s*<[^>]*>").unwrap();
+    let rd_email_re = regex::Regex::new(r"\\email\{[^}]*\}").unwrap();
     let role_re = regex::Regex::new(r"\[([^\]]+)\]").unwrap();
     let bracket_strip_re = regex::Regex::new(r"\s*\[[^\]]*\]").unwrap();
+    let paren_re = regex::Regex::new(r"\(([^)]*)\)").unwrap();
+    let label_re = regex::Regex::new(r"(?i)^(?:authors?|contributors?|maintainer)\s*:\s*").unwrap();
+    let preamble_re = regex::Regex::new(r"(?i)^(.+?\bby)\s+(\S.*)$").unwrap();
     let ws_re = regex::Regex::new(r"\s+").unwrap();
 
-    parts
-        .iter()
-        .map(|raw_entry| {
-            let mut entry = email_re.replace(raw_entry, "").into_owned();
+    split_re
+        .split(&protected)
+        .filter_map(|raw| {
+            let part = restore_re.replace_all(raw, |c: &regex::Captures| groups[c[1].parse::<usize>().unwrap()].clone());
+            let mut entry = lead_and_re.replace(part.trim(), "").into_owned();
+            let orcid = marker_re
+                .captures_iter(&entry)
+                .find_map(|c| ids.get(c[1].parse::<usize>().unwrap()).cloned().flatten());
+            entry = marker_re.replace_all(&entry, " ").into_owned();
+            entry = email_re.replace_all(&entry, "").into_owned();
+            entry = rd_email_re.replace_all(&entry, "").into_owned();
             let mut roles: Vec<String> = Vec::new();
             if let Some(c) = role_re.captures(&entry) {
-                let role_str = c.get(1).unwrap().as_str().to_string();
-                roles = role_str
-                    .split(',')
-                    .map(|s| s.trim().to_string())
-                    .filter(|s| !s.is_empty())
-                    .collect();
-                entry = bracket_strip_re.replace(&entry, "").trim().to_string();
+                roles = c[1].split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
+                entry = bracket_strip_re.replace_all(&entry, "").into_owned();
             }
-            let name_parts: Vec<&str> =
-                ws_re.split(entry.trim()).filter(|s| !s.is_empty()).collect();
-            let n = name_parts.len();
-            let (given, family) = if n == 0 {
-                (None, None)
-            } else if n == 1 {
-                (None, Some(name_parts[0].to_string()))
+            let mut notes: Vec<String> =
+                paren_re.captures_iter(&entry).map(|c| c[1].trim().to_string()).filter(|s| !s.is_empty()).collect();
+            entry = paren_re.replace_all(&entry, " ").into_owned();
+            entry = label_re.replace(entry.trim(), "").into_owned();
+            if let Some(c) = preamble_re.captures(entry.trim()) {
+                notes.insert(0, c[1].to_string());
+                entry = c[2].to_string();
+            }
+            // Bare emails and stray brackets are never part of a name.
+            let words: Vec<String> = ws_re
+                .split(entry.trim())
+                .filter(|w| !w.is_empty() && !authors::is_email_like(w))
+                .map(|w| w.trim_matches(|c| "()<>[]".contains(c)).to_string())
+                .filter(|w| !w.is_empty())
+                .collect();
+            if words.is_empty() {
+                return None;
+            }
+            let n = words.len();
+            let (given, family) = if n == 1 {
+                (None, Some(words[0].clone()))
             } else {
-                (Some(name_parts[..n - 1].join(" ")), Some(name_parts[n - 1].to_string()))
+                (Some(words[..n - 1].join(" ")), Some(words[n - 1].clone()))
             };
-            Person { given, family, roles }
+            Some(Person { given, family, roles, comment: authors::clean_comment(&notes), orcid, ror: None })
         })
         .collect()
 }
@@ -1672,9 +1714,8 @@ fn json_str_or_null(v: &Option<String>) -> String {
     }
 }
 
-/// Compact JSON array of person objects, field order given/family/roles, matching
-/// jsonlite::toJSON(parsed, auto_unbox = TRUE) byte-for-byte (roles always an
-/// array via I(); given/family unboxed strings or null).
+/// Compact JSON array of persons as jsonlite::toJSON(auto_unbox = TRUE) writes them: given, family,
+/// roles, then comment, orcid and ror only when declared, so given and family stay adjacent.
 fn persons_to_json(persons: &[Person]) -> String {
     let items: Vec<String> = persons
         .iter()
@@ -1682,7 +1723,14 @@ fn persons_to_json(persons: &[Person]) -> String {
             let given = json_str_or_null(&p.given);
             let family = json_str_or_null(&p.family);
             let roles = serde_json::to_string(&p.roles).unwrap();
-            format!("{{\"given\":{given},\"family\":{family},\"roles\":{roles}}}")
+            let mut item = format!("{{\"given\":{given},\"family\":{family},\"roles\":{roles}");
+            for (key, value) in [("comment", &p.comment), ("orcid", &p.orcid), ("ror", &p.ror)] {
+                if let Some(v) = value {
+                    item.push_str(&format!(",\"{key}\":{}", serde_json::to_string(v).unwrap()));
+                }
+            }
+            item.push('}');
+            item
         })
         .collect();
     format!("[{}]", items.join(","))
@@ -2077,11 +2125,11 @@ fn detect_repo(fields: &[Option<String>]) -> Option<(String, String)> {
     None
 }
 
-fn metrics_extra(desc: &BTreeMap<String, String>, root: &Path, files: &[String]) -> Extra {
+fn metrics_extra(desc: &BTreeMap<String, String>, root: &Path, files: &[String], news_file: Option<&str>) -> Extra {
     let repo = detect_repo(&[desc.get("URL").cloned(), desc.get("BugReports").cloned()]);
 
     // Rd help pages with an \examples section.
-    let rd_files = find_files(files, r"^man/.*\.Rd$");
+    let rd_files = rd_pages::rd_page_files(files);
     let mut help_pages_with_examples = 0i64;
     for f in &rd_files {
         if rd_has_block(&read(root, f).unwrap_or_default(), "examples") {
@@ -2092,9 +2140,8 @@ fn metrics_extra(desc: &BTreeMap<String, String>, root: &Path, files: &[String])
         (!rd_files.is_empty()).then(|| help_pages_with_examples as f64 / rd_files.len() as f64);
 
     // NEWS synced to version: the first version token in NEWS equals the package Version.
-    let news_up_to_date = ["NEWS.md", "NEWS", "inst/NEWS.md", "inst/NEWS"]
-        .iter()
-        .find_map(|p| read(root, p))
+    let news_up_to_date = news_file
+        .and_then(|p| read(root, p))
         .map(|news| {
             let ver_re = regex::Regex::new(r"\d+\.\d+(?:[.-]\d+)*").unwrap();
             let latest = ver_re.find(&news).map(|m| m.as_str().to_string());
@@ -2265,7 +2312,7 @@ fn count_src_functions(root: &Path, files: &[String]) -> SrcFns {
     let mut parser = Parser::new();
     let (mut c, mut cpp, mut fortran, mut rust, mut nf) = (0i64, 0i64, 0i64, 0i64, 0i64);
     for f in files {
-        if !f.starts_with("src/") {
+        if !f.starts_with("src/") || is_vendored_src(f) {
             continue;
         }
         let Some(lang) = language_for_ext(f) else { continue };
@@ -2567,7 +2614,7 @@ fn build_src_graph(
     let mut calls: Vec<Vec<String>> = Vec::new();
     let mut nodes: Vec<SrcFn> = Vec::new();
     for f in files {
-        if !f.starts_with("src/") {
+        if !f.starts_with("src/") || (lang == SrcLang::Rust && is_vendored_src(f)) {
             continue;
         }
         let ext = f.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
@@ -3030,58 +3077,113 @@ fn graph_stats(n: usize, edges: &[(usize, usize)]) -> Network {
 /// data a newer build would describe differently.
 const ANALYZER_VERSION: &str = env!("CARGO_PKG_VERSION");
 
-fn main() {
-    let dir = std::env::args().nth(1).expect("usage: rpkg-analyzer <package_dir>");
-
-    if dir == "--version" || dir == "-V" {
-        println!("rpkg-analyzer {ANALYZER_VERSION}");
+/// Debug output: the parse tree of one file, or a histogram of its node kinds.
+fn print_parse_tree(f: &str, histogram: bool) {
+    let mut parser = Parser::new();
+    parser
+        .set_language(&tree_sitter_r::LANGUAGE.into())
+        .expect("load tree-sitter-r");
+    let src = std::fs::read_to_string(f).expect("read");
+    if let Some(lang) = language_for_ext(f) {
+        parser.set_language(&lang).expect("load grammar");
+    }
+    let tree = parser.parse(&src, None).expect("parse");
+    if !histogram {
+        println!("{}", tree.root_node().to_sexp());
         return;
     }
+    let mut hist: BTreeMap<String, i64> = BTreeMap::new();
+    let mut st = vec![tree.root_node()];
+    while let Some(x) = st.pop() {
+        *hist.entry(x.kind().to_string()).or_insert(0) += 1;
+        let mut c = x.walk();
+        for ch in x.children(&mut c) {
+            st.push(ch);
+        }
+    }
+    for (k, v) in hist {
+        println!("{v}\t{k}");
+    }
+}
+
+/// Debug output: the per-file decisions behind the summary (release boundary, help
+/// pages, vignettes), one record per file.
+fn explain(dir: &str, kind: cli::InputKind) {
+    let root = PathBuf::from(dir);
+    let tree_files = list_files(&root);
+    let desc = read(&root, "DESCRIPTION").map(|t| parse_dcf(&t)).unwrap_or_default();
+    let package = desc.get("Package").map(|s| s.trim().to_string()).unwrap_or_default();
+    let release = release_files::ReleaseList::for_input(&root, &tree_files, &package, kind);
+    let files = release.files(&tree_files);
+    let known = release.is_known();
+    for f in &tree_files {
+        let kept = known.then(|| files.contains(f));
+        println!("{}", serde_json::json!({"rec": "release_file", "path": f, "kept": kept}));
+    }
+    for p in rd_pages::page_facts(&root, &files, &package) {
+        println!(
+            "{}",
+            serde_json::json!({
+                "rec": "rd_page", "file": p.file,
+                "examples": p.examples.as_ref().map(|e| e.class.as_str()),
+                "conditional": p.examples.as_ref().map(|e| e.conditional),
+                "internal": p.internal, "doc_type": p.doc_type, "package_overview": p.package_overview,
+            })
+        );
+    }
+    for v in vignettes::vignette_sources(&root, &files) {
+        let run = read_lossy(&root, &v).map(|t| {
+            let orig = format!("{v}.orig");
+            vignettes::classify(&v, &t, files.contains(&orig)).as_str()
+        });
+        println!("{}", serde_json::json!({"rec": "vignette", "file": v, "run": run}));
+    }
+}
+
+fn main() {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let mode = match cli::parse_args(&args) {
+        Ok(mode) => mode,
+        Err(usage) => {
+            eprintln!("{usage}");
+            std::process::exit(2);
+        }
+    };
+    let (dir, kind) = match mode {
+        cli::Mode::Version => {
+            println!("rpkg-analyzer {ANALYZER_VERSION}");
+            return;
+        }
+        // The dataset records only, read from the tree as given.
+        cli::Mode::Datasets(f) => {
+            for rec in rds::scan_package(Path::new(&f), &BTreeSet::new()) {
+                println!("{rec}");
+            }
+            return;
+        }
+        cli::Mode::Sexp(f) => return print_parse_tree(&f, false),
+        cli::Mode::Kinds(f) => return print_parse_tree(&f, true),
+        cli::Mode::Explain { dir, kind } => return explain(&dir, kind),
+        cli::Mode::Analyze { dir, kind } => (dir, kind),
+    };
 
     let mut parser = Parser::new();
     parser
         .set_language(&tree_sitter_r::LANGUAGE.into())
         .expect("load tree-sitter-r");
 
-    // --datasets <package_dir>: emit one `dataset` record per shipped dataset,
-    // read straight from R serialization with no R runtime.
-    if dir == "--datasets" {
-        let f = std::env::args().nth(2).expect("usage: rpkg-analyzer --datasets <package_dir>");
-        for rec in rds::scan_package(Path::new(&f)) {
-            println!("{rec}");
-        }
-        return;
-    }
-
-    // Debug: --sexp <file.R> prints the parse tree, for learning node kinds.
-    if dir == "--sexp" || dir == "--kinds" {
-        let f = std::env::args().nth(2).expect("<file>");
-        let src = std::fs::read_to_string(&f).expect("read");
-        if let Some(lang) = language_for_ext(&f) {
-            parser.set_language(&lang).expect("load grammar");
-        }
-        let tree = parser.parse(&src, None).expect("parse");
-        if dir == "--sexp" {
-            println!("{}", tree.root_node().to_sexp());
-        } else {
-            let mut hist: BTreeMap<String, i64> = BTreeMap::new();
-            let mut st = vec![tree.root_node()];
-            while let Some(x) = st.pop() {
-                *hist.entry(x.kind().to_string()).or_insert(0) += 1;
-                let mut c = x.walk();
-                for ch in x.children(&mut c) {
-                    st.push(ch);
-                }
-            }
-            for (k, v) in hist {
-                println!("{v}\t{k}");
-            }
-        }
-        return;
-    }
-
     let root = PathBuf::from(&dir);
-    let files = list_files(&root);
+    let tree_files = list_files(&root);
+    let desc = read(&root, "DESCRIPTION").map(|t| parse_dcf(&t)).unwrap_or_default();
+    let release = release_files::ReleaseList::for_input(
+        &root,
+        &tree_files,
+        desc.get("Package").map(|s| s.trim()).unwrap_or(""),
+        kind,
+    );
+    let files = release.files(&tree_files);
+    let excluded: BTreeSet<String> = release.excluded_files();
+    let content_known = release.is_known();
 
     // --- structure ---
     let n_files = files.len();
@@ -3152,7 +3254,6 @@ fn main() {
     }
 
     // --- DESCRIPTION ---
-    let desc = read(&root, "DESCRIPTION").map(|t| parse_dcf(&t)).unwrap_or_default();
     let get = |k: &str| desc.get(k).cloned().unwrap_or_default();
     let mut deps: Vec<String> = Vec::new();
     // the meta.R rule combines c(Imports, Depends) in that order.
@@ -3281,7 +3382,8 @@ fn main() {
     // Dataset object names: data/datalist is authoritative (a line is either
     // `name` or `file: obj1 obj2`); otherwise fall back to file stems. A single
     // .rda without a datalist can still hold several objects we cannot see here.
-    let datasets: Vec<String> = if let Some(dl) = read(&root, "data/datalist") {
+    let datalist = exists(&files, "data/datalist").then(|| read(&root, "data/datalist")).flatten();
+    let datasets: Vec<String> = if let Some(dl) = datalist {
         let mut names = Vec::new();
         for line in dl.lines() {
             let line = line.trim();
@@ -3308,7 +3410,9 @@ fn main() {
     let version = get("Version");
 
     // --- NAMESPACE ---
-    let ns = read(&root, "NAMESPACE")
+    let ns = exists(&files, "NAMESPACE")
+        .then(|| read(&root, "NAMESPACE"))
+        .flatten()
         .map(|t| parse_namespace(&t, &mut parser))
         .unwrap_or_default();
     let has_ns = exists(&files, "NAMESPACE");
@@ -3323,7 +3427,12 @@ fn main() {
         fn_stats.iter().filter(|f| f.exported).map(|f| f.n_params).collect();
     let n_fns_r = fn_stats.len();
     let n_fns_r_exported = fn_stats.iter().filter(|f| f.exported).count();
-    let ex = metrics_extra(&desc, &root, &files);
+    let news_file = news::news_file(&files);
+    let release_notes = news_file.and_then(|p| {
+        let text = read_lossy(&root, p)?;
+        news::release_notes(p, &text, &version, &package)
+    });
+    let ex = metrics_extra(&desc, &root, &files, news_file);
     let (net, r_edges) = metrics_network(&fn_stats);
     let ws = metrics_whitespace(&root, &files);
     let src_fns = count_src_functions(&root, &files);
@@ -3343,7 +3452,7 @@ fn main() {
     let int_locs: Vec<i64> = fn_stats.iter().filter(|f| !f.exported).map(|f| f.loc as i64).collect();
 
     // Documentation lines per help page (Rd file LOC).
-    let rd_locs: Vec<i64> = find_files(&files, r"^man/.*\.Rd$")
+    let rd_locs: Vec<i64> = rd_pages::rd_page_files(&files)
         .iter()
         .filter_map(|f| read(&root, f).map(|c| loc(&c) as i64))
         .collect();
@@ -3379,10 +3488,22 @@ fn main() {
     let legal = metrics_legal(&desc, &root, &files);
     let port = metrics_portability(&desc, &root, &files);
     let tests = metrics_tests(&desc, &root, &files, &ns.exports);
-    let docs = metrics_docs(&desc, &root, &files, &ns.exports);
+    let suite = test_suite::test_suite(&root, &files, &dep_names(&get("Suggests")));
+    let blocks = suite.blocks.as_ref();
+    let docs = metrics_docs(&desc, &root, &files, &ns.exports, news_file);
+    let rd = rd_pages::page_facts(&root, &files, &package);
+    let exc = rd_pages::example_counts(&rd);
+    let topics = rd_pages::topic_counts(&rd, &ns.exports);
+    // With no example pages there is nothing to break down, so the buckets stay NULL.
+    let bucket = |v: i64| (exc.pages > 0).then_some(v);
     let health = metrics_health(&desc, &root, &files);
     let meta = metrics_meta(&desc, &root, &files);
     let security = metrics_security(&desc, &root, &files);
+    let practices = repo_practices::metrics_repo_practices(&root, &tree_files, kind);
+    let cit = exists(&files, "inst/CITATION").then(|| match std::fs::read(root.join("inst/CITATION")) {
+        Ok(bytes) => citation::read_citation(&bytes, &desc),
+        Err(_) => citation::Citation::parse_error(),
+    });
 
     // --- additional static signals ---
     // OpenMP: SystemRequirements, Makevars -fopenmp, or a src #pragma omp / _OPENMP.
@@ -3399,7 +3520,7 @@ fn main() {
                 .unwrap_or(false)
         });
 
-    let num_vignettes = find_files(&files, r"^vignettes/.*\.[Rr](md|nw)$").len();
+    let vig = vignettes::vignette_facts(&root, &files);
     let num_demos = find_files(&files, r"^demo/.*\.[Rr]$").len();
     let count_prefix = |p: &str| files.iter().filter(|f| f.starts_with(p)).count();
     let files_r = count_prefix("R/");
@@ -3421,16 +3542,6 @@ fn main() {
     translations.sort();
     translations.dedup();
 
-    // Website: a pkgdown site or a declared URL on a non-forge host.
-    let forges = ["github.com", "gitlab.com", "codeberg.org", "bitbucket.org", "git.sr.ht"];
-    let url_website = desc.get("URL").map(|u| {
-        u.split([',', ' ', '\n'])
-            .map(str::trim)
-            .filter(|s| s.starts_with("http"))
-            .any(|s| !forges.iter().any(|d| s.contains(d)))
-    }).unwrap_or(false);
-    let has_website = docs.has_pkgdown || url_website;
-
     // Author role counts from Authors@R.
     let authors_r = desc.get("Authors@R").cloned().unwrap_or_default();
     let role_count = |role: &str| {
@@ -3450,24 +3561,33 @@ fn main() {
     );
 
     // --- emit NDJSON ---
-    let summary = serde_json::json!({
+    let mut summary = serde_json::json!({
         "rec": "summary",
         "analyzer_version": ANALYZER_VERSION,
-        "extdata": rds::extdata_inventory(&root),
+        "input_kind": kind.as_str(),
+        "extdata": rds::extdata_inventory(&root, &excluded),
         "package": package,
         "version": version,
         "license": legal.license,
         "spdx_valid": legal.spdx_valid,
         "osi_approved": legal.osi_approved,
         "license_file_completeness": legal.license_file_completeness,
-        "copyright_holder_declared": legal.copyright_holder_declared,
+        "has_citation": cit.is_some(),
+        "citation_read": cit.as_ref().map(|c| c.read),
+        "citation_kind": cit.as_ref().and_then(|c| c.kind),
+        "citation_n_entries": cit.as_ref().and_then(|c| c.n_entries),
+        "citation_bibtype": cit.as_ref().and_then(|c| c.bibtypes.clone()),
+        "citation_dois": cit.as_ref().and_then(|c| c.dois.clone()),
+        "citation_venue": cit.as_ref().and_then(|c| c.venues.clone()),
+        "has_rd_bibliography": exists(&files, "inst/REFERENCES.bib") || exists(&files, "inst/REFERENCES.R"),
         "min_r_version": port.min_r_version,
         "system_requirements_count": port.system_requirements_count,
         "cxx_standard_required": port.cxx_standard_required,
         "nonportable_compiler_flags": port.nonportable_compiler_flags,
         "nonportable_compiler_flags_json": port.nonportable_compiler_flags_json,
-        "has_vignettes": port.has_vignettes,
-        "vignette_dynamic": port.vignette_dynamic,
+        "has_vignettes": !vig.sources.is_empty(),
+        "vignette_dynamic": vig.dynamic,
+        "vignette_eval_gated": vig.eval_gated,
         "has_tests": tests.has_tests,
         "test_to_code_ratio": tests.test_to_code_ratio,
         "testthat_edition": tests.testthat_edition,
@@ -3475,26 +3595,50 @@ fn main() {
         "test_isolation_libs": tests.test_isolation_libs,
         "exported_fn_test_linkage": tests.exported_fn_test_linkage,
         "stochastic_seed_discipline": tests.stochastic_seed_discipline,
-        "ci_present": tests.ci_present,
-        "ci_type": tests.ci_type,
-        "ci_matrix_breadth": tests.ci_matrix_breadth,
-        "ci_pr_gated": tests.ci_pr_gated,
+        "test_framework_primary": suite.primary,
+        "test_frameworks_used": suite.used,
+        "test_frameworks_declared": suite.declared,
+        "n_test_units": suite.n_units,
+        "test_unit": suite.unit,
+        "n_rout_save": suite.n_rout_save,
+        "n_test_blocks": blocks.map(|b| b.total),
+        "n_test_blocks_cran_skipped": blocks.map(|b| b.skipped),
+        "tests_gated_not_cran": blocks.map(|b| b.gated),
+        "ci_present": practices.ci_present,
+        "ci_type": practices.ci_type,
+        "ci_matrix_breadth": practices.ci_matrix_breadth,
+        "ci_pr_gated": practices.ci_pr_gated,
         "dontrun_example_ratio": docs.dontrun_example_ratio,
+        "n_help_topics": topics.pages,
+        "n_help_topics_internal": topics.internal,
+        "n_help_topics_data": topics.data,
+        "n_help_topics_package": topics.package,
+        "examples_coverage_fn": topics.examples_coverage_fn,
+        "examples_coverage_fn_basis": topics.basis,
+        "rd_example_pages": exc.pages,
+        "rd_example_pages_run": bucket(exc.run),
+        "rd_example_pages_donttest_only": bucket(exc.donttest_only),
+        "rd_example_pages_never_run": bucket(exc.never_run),
+        "rd_example_pages_empty": bucket(exc.empty),
+        "rd_example_pages_conditional": bucket(exc.conditional),
         "undocumented_params_rate": docs.undocumented_params_rate,
         "value_doc_rate": docs.value_doc_rate,
         "references_coverage": docs.references_coverage,
         "roxygen_doc_coverage": docs.roxygen_doc_coverage,
         "has_readme": docs.has_readme,
         "readme_prose_length": docs.readme_prose_length,
-        "has_pkgdown": docs.has_pkgdown,
+        "has_pkgdown": practices.has_pkgdown,
         "news_present": docs.news_present,
         "news_structure_quality": docs.news_structure_quality,
+        "news_file": news_file,
+        "release_notes_source": release_notes.as_ref().map(|n| n.source),
+        "changelog_file": news::changelog_file(&files),
         "on_exit_coverage_rate": health.on_exit_coverage_rate,
         "global_state_write_density": health.global_state_write_density,
         "deprecated_idiom_density": health.deprecated_idiom_density,
         "debug_artifact_density": health.debug_artifact_density,
-        "has_code_of_conduct": health.has_code_of_conduct,
-        "has_contributing_guide": health.has_contributing_guide,
+        "has_code_of_conduct": practices.has_code_of_conduct,
+        "has_contributing_guide": practices.has_contributing_guide,
         "maintainer": meta.maintainer,
         "maintainer_email": meta.maintainer_email,
         "n_authors": meta.n_authors,
@@ -3612,7 +3756,7 @@ fn main() {
         "rel_space_tests": ws.rel_space_tests,
         "indentation": ws.indentation,
         "uses_openmp": uses_openmp,
-        "num_vignettes": num_vignettes,
+        "num_vignettes": vig.sources.len(),
         "num_demos": num_demos,
         "files_r": files_r,
         "files_src": files_src,
@@ -3620,7 +3764,6 @@ fn main() {
         "files_inst": files_inst,
         "files_vignettes": files_vignettes,
         "translations": translations,
-        "has_website": has_website,
         "desc_n_aut": desc_n_aut,
         "desc_n_cre": desc_n_cre,
         "desc_n_ctb": desc_n_ctb,
@@ -3660,49 +3803,74 @@ fn main() {
         "import_from": ns.import_from,
         "imports_whole": ns.imports_whole,
         "use_dyn_lib": ns.use_dyn_lib,
+        "build_ignore_bad_lines": release.bad_lines(),
+        "build_ignored": match &release {
+            release_files::ReleaseList::Filtered(f) => Some(release_files::build_ignored_items(
+                &tree_files,
+                f,
+                &vignettes::vignette_sources(&root, &tree_files),
+            )),
+            _ => None,
+        },
     });
+    if !content_known {
+        release_files::null_release_content(&mut summary);
+    }
     println!("{summary}");
-    for d in &deps {
-        println!("{}", serde_json::json!({"rec": "dependency", "package": d}));
-    }
-    for e in &ns.exports {
-        println!("{}", serde_json::json!({"rec": "export", "symbol": e}));
-    }
-    for fnst in &fn_stats {
-        println!(
-            "{}",
-            serde_json::json!({
-                "rec": "function", "lang": "r", "name": fnst.name, "exported": fnst.exported,
-                "file": fnst.file, "line": fnst.line, "loc": fnst.loc,
-                "n_params": fnst.n_params, "cyclocomp": fnst.cyclocomp,
-            })
-        );
-    }
-    // Compiled function nodes, so C/C++/Rust/Fortran endpoints in the unified
-    // graph carry the same file/line/loc metadata as the R nodes.
-    for sf in c_nodes.iter().chain(&rust_nodes).chain(&fortran_nodes) {
-        println!(
-            "{}",
-            serde_json::json!({
-                "rec": "function", "lang": sf.lang, "name": sf.name,
-                "file": sf.file, "line": sf.line, "loc": sf.loc,
-            })
-        );
-    }
-    // Call-graph edges: the raw structure behind the network stats. Nodes are the
-    // `function` records above (R) or compiled function names.
-    for (graph, edges) in [
-        ("r", &r_edges),
-        ("native", &ng.edges),
-        ("c", &c_edges),
-        ("rust", &rust_edges),
-        ("fortran", &fortran_edges),
-    ] {
-        for (from, to) in edges {
+    // Detail records describe release contents, which an unknown file list cannot give.
+    if content_known {
+        if let (Some(p), Some(n)) = (news_file, &release_notes) {
             println!(
                 "{}",
-                serde_json::json!({"rec": "call_edge", "graph": graph, "from": from, "to": to})
+                serde_json::json!({
+                    "rec": "release_notes", "package_version": version, "news_file": p,
+                    "release_notes_source": n.source, "release_notes": n.text,
+                    "release_notes_truncated": n.truncated,
+                })
             );
+        }
+        for d in &deps {
+            println!("{}", serde_json::json!({"rec": "dependency", "package": d}));
+        }
+        for e in &ns.exports {
+            println!("{}", serde_json::json!({"rec": "export", "symbol": e}));
+        }
+        for fnst in &fn_stats {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "rec": "function", "lang": "r", "name": fnst.name, "exported": fnst.exported,
+                    "file": fnst.file, "line": fnst.line, "loc": fnst.loc,
+                    "n_params": fnst.n_params, "cyclocomp": fnst.cyclocomp,
+                })
+            );
+        }
+        // Compiled function nodes, so C/C++/Rust/Fortran endpoints in the unified
+        // graph carry the same file/line/loc metadata as the R nodes.
+        for sf in c_nodes.iter().chain(&rust_nodes).chain(&fortran_nodes) {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "rec": "function", "lang": sf.lang, "name": sf.name,
+                    "file": sf.file, "line": sf.line, "loc": sf.loc,
+                })
+            );
+        }
+        // Call-graph edges: the raw structure behind the network stats. Nodes are the
+        // `function` records above (R) or compiled function names.
+        for (graph, edges) in [
+            ("r", &r_edges),
+            ("native", &ng.edges),
+            ("c", &c_edges),
+            ("rust", &rust_edges),
+            ("fortran", &fortran_edges),
+        ] {
+            for (from, to) in edges {
+                println!(
+                    "{}",
+                    serde_json::json!({"rec": "call_edge", "graph": graph, "from": from, "to": to})
+                );
+            }
         }
     }
     // Full parsed DESCRIPTION as a raw intermediate: every field is preserved,
@@ -3714,10 +3882,12 @@ fn main() {
     }
     println!("{}", serde_json::Value::Object(dcf));
 
-    // Datasets shipped under data/ and R/sysdata.rda, read from R serialization
-    // with no R runtime.
-    for rec in rds::scan_package(&root) {
-        println!("{rec}");
+    // Datasets under data/ and R/sysdata.rda, read from R serialization with no R
+    // runtime.
+    if content_known {
+        for rec in rds::scan_package(&root, &excluded) {
+            println!("{rec}");
+        }
     }
 }
 
@@ -3727,20 +3897,264 @@ fn main() {
 mod tests {
     use super::*;
 
+    /// Rule J: a name the viewer treats as junk.
+    fn is_junk(p: &Person) -> bool {
+        let g = p.given.as_deref().unwrap_or("");
+        let f = p.family.as_deref().unwrap_or("");
+        let lead = g.trim().to_lowercase();
+        lead.starts_with("and ") || lead.starts_with("& ") || [g, f].iter().any(|s| s.contains(['(', ')', '<', ']', '@']))
+    }
+
+    fn names(ps: &[Person]) -> Vec<(Option<&str>, Option<&str>)> {
+        ps.iter().map(|p| (p.given.as_deref(), p.family.as_deref())).collect()
+    }
+
+    #[test]
+    fn authors_r_keeps_orcid_ror_and_a_short_comment() {
+        let p = meta_parse_person(
+            r#""Ann", "Lee", role = c("aut", "cre"), email = "ann@x.org", comment = c(ORCID = "0000-0002-1825-0097", "Wrote the parser <ann@x.org>")"#,
+        );
+        assert_eq!((p.given.as_deref(), p.family.as_deref()), (Some("Ann"), Some("Lee")));
+        assert_eq!(p.orcid.as_deref(), Some("0000-0002-1825-0097"));
+        assert_eq!(p.comment.as_deref(), Some("Wrote the parser"));
+        let org = meta_parse_person(r#""ACME Foundation", role = "fnd", comment = c(ROR = "https://ror.org/05dxps055")"#);
+        assert_eq!(org.ror.as_deref(), Some("05dxps055"));
+        assert_eq!(org.comment, None);
+        let bad = meta_parse_person(r#""Bo", "Chen", comment = c(ORCID = "0000-0002-1825-0098")"#);
+        assert_eq!(bad.orcid, None, "a failed check digit is dropped");
+        let url = meta_parse_person(r#""Cy", "Dunn", comment = "https://orcid.org/0000-0001-5109-3700""#);
+        assert_eq!(url.orcid.as_deref(), Some("0000-0001-5109-3700"));
+        assert_eq!(url.comment, None, "an ORCID URL is the identifier, not a comment");
+    }
+
+    #[test]
+    fn a_quoted_part_name_or_a_parenthesis_keeps_the_orcid() {
+        let single = meta_parse_person(r#""Zuguang", "Gu", role = c("aut", "cre"), comment = c('ORCID'="0000-0002-7395-8709")"#);
+        assert_eq!(single.orcid.as_deref(), Some("0000-0002-7395-8709"));
+        assert_eq!(single.comment, None, "the name of a part is not a comment");
+        let double = meta_parse_person(r#""Ann", "Lee", comment = c("ORCID" = "0000-0002-1825-0097", "Wrote the parser")"#);
+        assert_eq!(double.orcid.as_deref(), Some("0000-0002-1825-0097"));
+        assert_eq!(double.comment.as_deref(), Some("Wrote the parser"));
+        let paren = meta_parse_person(r#""Ann", "Lee", comment = c("Wrote f() and g()", ORCID = "0000-0002-1825-0097")"#);
+        assert_eq!(paren.orcid.as_deref(), Some("0000-0002-1825-0097"));
+        assert_eq!(paren.comment.as_deref(), Some("Wrote f() and g()"));
+        let ror = meta_parse_person(r#""ACME", role = "fnd", comment = c("ROR" = "05dxps055")"#);
+        assert_eq!(ror.ror.as_deref(), Some("05dxps055"));
+    }
+
+    #[test]
+    fn the_rest_of_the_comment_is_kept() {
+        let turkish = meta_parse_person(r#""Ayse", "Kaya", comment = c("İTÜ, orcid.org/")"#);
+        assert_eq!((turkish.given.as_deref(), turkish.family.as_deref()), (Some("Ayse"), Some("Kaya")));
+        assert_eq!(turkish.orcid, None);
+        assert_eq!(turkish.comment.as_deref(), Some("İTÜ, orcid.org/"));
+        let mixed = meta_parse_person(r#""Ann", "Lee", comment = "Univ of X, https://orcid.org/0000-0002-1825-0097""#);
+        assert_eq!(mixed.orcid.as_deref(), Some("0000-0002-1825-0097"));
+        assert_eq!(mixed.comment.as_deref(), Some("Univ of X, https://orcid.org/0000-0002-1825-0097"));
+        let named = meta_parse_person(
+            r#""Ann", "Lee", comment = c(affiliation = "Univ (X)", 'github' = "annlee", ORCID = "0000-0002-1825-0097", "Wrote it")"#,
+        );
+        assert_eq!(named.orcid.as_deref(), Some("0000-0002-1825-0097"));
+        assert_eq!(named.comment.as_deref(), Some("Univ (X); annlee; Wrote it"));
+        let org = meta_parse_person(r#""ACME", role = "fnd", comment = c(ror = "05dxps055", project = "Edicitnet", grant_agreement = "776665")"#);
+        assert_eq!(org.ror.as_deref(), Some("05dxps055"));
+        assert_eq!(org.comment.as_deref(), Some("Edicitnet; 776665"));
+    }
+
+    #[test]
+    fn an_id_part_is_dropped_only_when_it_is_the_kept_orcid() {
+        assert!(authors::orcid_checked("0000-0001-8715-4771").is_some());
+        let bare = meta_parse_person(r#""Ingo", "Rohlfing", comment = c("0000-0001-8715-4771")"#);
+        assert_eq!(bare.orcid, None, "an unnamed iD is not declared as an ORCID");
+        assert_eq!(bare.comment.as_deref(), Some("0000-0001-8715-4771"));
+        let other = meta_parse_person(r#""Ann", "Lee", comment = c(ORCID = "0000-0002-1825-0097", "0000-0001-5109-3700")"#);
+        assert_eq!(other.orcid.as_deref(), Some("0000-0002-1825-0097"));
+        assert_eq!(other.comment.as_deref(), Some("0000-0001-5109-3700"));
+        let same = meta_parse_person(
+            r#""Ann", "Lee", comment = c(ORCID = "0000-0002-1825-0097", "https://orcid.org/0000-0002-1825-0097")"#,
+        );
+        assert_eq!(same.comment, None);
+    }
+
+    #[test]
+    fn positional_slots_keep_their_place_and_never_hold_an_email() {
+        let p = meta_parse_person(r#""", "Smith", role = "aut""#);
+        assert_eq!((p.given.as_deref(), p.family.as_deref()), (None, Some("Smith")));
+        let e = meta_parse_person(r#""ann@x.org", "Lee""#);
+        assert_eq!((e.given.as_deref(), e.family.as_deref()), (None, Some("Lee")));
+        let h = meta_parse_person(r#""Ann", "@annlee""#);
+        assert_eq!((h.given.as_deref(), h.family.as_deref()), (Some("Ann"), None));
+    }
+
+    #[test]
+    fn legacy_author_text_splits_into_clean_names() {
+        let cases: Vec<(&str, Vec<(Option<&str>, Option<&str>)>)> = vec![
+            ("Ann Lee <ann@x.org>, Bob Gray <bob@y.org>", vec![(Some("Ann"), Some("Lee")), (Some("Bob"), Some("Gray"))]),
+            ("Ann Lee, and Bob Gray", vec![(Some("Ann"), Some("Lee")), (Some("Bob"), Some("Gray"))]),
+            ("Tarn Duong & Matt Wand", vec![(Some("Tarn"), Some("Duong")), (Some("Matt"), Some("Wand"))]),
+            ("Ann Lee; Bob Gray", vec![(Some("Ann"), Some("Lee")), (Some("Bob"), Some("Gray"))]),
+            (
+                "Stefan Wilhelm with contributions from Manjunath B G <bgmanjunath@gmail.com>",
+                vec![(Some("Stefan"), Some("Wilhelm")), (Some("Manjunath B"), Some("G"))],
+            ),
+            ("Ann Lee (University of X, Y) and Bob Gray", vec![(Some("Ann"), Some("Lee")), (Some("Bob"), Some("Gray"))]),
+            ("Francois Brun (ACTA) \\email{francois.brun@acta.asso.fr}", vec![(Some("Francois"), Some("Brun"))]),
+            ("James Browne (jbrowne6@jhu.edu)", vec![(Some("James"), Some("Browne"))]),
+            (
+                "Original S code by Richard A. Becker and Allan R. Wilks; R port by Ray Brownrigg",
+                vec![(Some("Richard A."), Some("Becker")), (Some("Allan R."), Some("Wilks")), (Some("Ray"), Some("Brownrigg"))],
+            ),
+        ];
+        for (text, want) in cases {
+            let ps = meta_parse_author_text(text);
+            assert_eq!(names(&ps), want, "{text}");
+            assert!(ps.iter().all(|p| !is_junk(p)), "no junk-looking name from {text}");
+        }
+    }
+
+    #[test]
+    fn legacy_notes_and_orcids_are_kept_beside_the_name() {
+        let ps = meta_parse_author_text(
+            "Ann Lee (University of X) <https://orcid.org/0000-0002-1825-0097>, Bob Gray (ORCID 0000-0001-5109-3700), R port by Cy Dunn",
+        );
+        assert_eq!(ps[0].comment.as_deref(), Some("University of X"));
+        assert_eq!(ps[0].orcid.as_deref(), Some("0000-0002-1825-0097"));
+        assert_eq!(ps[1].orcid.as_deref(), Some("0000-0001-5109-3700"));
+        assert_eq!(ps[1].comment, None);
+        assert_eq!(ps[2].comment.as_deref(), Some("R port by"));
+        let as_r = meta_parse_author_text(r#"c(person("Ann", "Lee", role = "aut"), person("Bob", "Gray"))"#);
+        assert_eq!(names(&as_r), vec![(Some("Ann"), Some("Lee")), (Some("Bob"), Some("Gray"))]);
+    }
+
+    #[test]
+    fn person_s_in_prose_is_not_a_person_call() {
+        let prose = meta_parse_author_text("Ann Lee and other person(s)");
+        assert_eq!(names(&prose), vec![(Some("Ann"), Some("Lee")), (Some("other"), Some("person"))]);
+        let noted = meta_parse_author_text("Ann Lee (a person (s) who wrote it), Bob Gray");
+        assert_eq!(noted.len(), 2);
+        assert_eq!(names(&noted)[1], (Some("Bob"), Some("Gray")));
+    }
+
+    #[test]
+    fn optional_keys_follow_roles_in_a_fixed_order() {
+        let p = Person {
+            given: Some("Ann".into()),
+            family: Some("Lee".into()),
+            roles: vec!["aut".into()],
+            comment: Some("x".into()),
+            orcid: Some("0000-0002-1825-0097".into()),
+            ror: Some("05dxps055".into()),
+        };
+        assert_eq!(
+            persons_to_json(&[p]),
+            r#"[{"given":"Ann","family":"Lee","roles":["aut"],"comment":"x","orcid":"0000-0002-1825-0097","ror":"05dxps055"}]"#
+        );
+        let bare = Person { given: None, family: Some("Lee".into()), roles: vec![], comment: None, orcid: None, ror: None };
+        assert_eq!(persons_to_json(&[bare]), r#"[{"given":null,"family":"Lee","roles":[]}]"#);
+    }
+
+    #[test]
+    fn rust_sources_count_and_vendored_crates_do_not() {
+        assert!(is_src_file("src/rust/src/lib.rs"));
+        assert!(is_src_file("src/init.c"));
+        assert!(!is_src_file("src/rust/vendor/cfg-if/src/lib.rs"));
+        assert!(!is_src_file("src/rust/vendor-patched/x/src/lib.rs"));
+        assert!(!is_src_file("src/rust/target/release/build/x.rs"));
+        assert!(!is_src_file("src/Makevars"));
+    }
+
+    #[test]
+    fn a_filled_template_or_a_full_text_is_complete() {
+        assert!(license_template_complete("YEAR: 2024\nCOPYRIGHT HOLDER: Ann Lee\n"));
+        assert!(license_template_complete("YEAR: 2024\r\nCOPYRIGHT HOLDER: fixpkg authors\r\n"));
+        assert!(license_template_complete("MIT License\n\nCopyright (c) 2024 Ann Lee\n\nPermission is hereby granted"));
+        assert!(!license_template_complete("YEAR: <year>\nCOPYRIGHT HOLDER: Ann Lee\n"));
+        assert!(!license_template_complete("YEAR: 2024\nCOPYRIGHT HOLDER: <Your Name>\n"));
+        assert!(!license_template_complete("YEAR: 2024\nCOPYRIGHT HOLDER: your name\n"));
+        assert!(!license_template_complete("YEAR: YEAR\nCOPYRIGHT HOLDER: COPYRIGHT HOLDER\n"));
+        assert!(!license_template_complete("YEAR: 2024\nCOPYRIGHT HOLDER:\n"));
+        assert!(!license_template_complete("YEAR: 2024\n"), "one line alone is not complete");
+        assert!(!license_template_complete("  \n"));
+    }
+
+    // R 4.6.1's share/licenses/MIT byte for byte, as a package would copy it unfilled.
+    const R_MIT_TEMPLATE: &str = concat!(
+        "Based on <http://opensource.org/licenses/MIT>\n",
+        "\n",
+        "This is a template.  Provide completed entries of the form\n",
+        "\n",
+        "YEAR:\n",
+        "COPYRIGHT HOLDER: \n",
+        "\n",
+        "(separated by empty lines) as file LICENSE, and specify\n",
+        "\n",
+        "License: MIT + file LICENSE\n",
+        "\n",
+        "in file DESCRIPTION.\n",
+        "\n",
+        "************************************************************************\n",
+        "\n",
+        "Copyright (c) <YEAR>, <COPYRIGHT HOLDER>\n",
+        "\n",
+        "Permission is hereby granted, free of charge, to any person obtaining\n",
+        "a copy of this software and associated documentation files (the\n",
+        "\"Software\"), to deal in the Software without restriction, including\n",
+        "without limitation the rights to use, copy, modify, merge, publish,\n",
+        "distribute, sublicense, and/or sell copies of the Software, and to\n",
+        "permit persons to whom the Software is furnished to do so, subject to\n",
+        "the following conditions:\n",
+        "\n",
+        "The above copyright notice and this permission notice shall be\n",
+        "included in all copies or substantial portions of the Software.\n",
+        "\n",
+        "THE SOFTWARE IS PROVIDED \"AS IS\", WITHOUT WARRANTY OF ANY KIND,\n",
+        "EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF\n",
+        "MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND\n",
+        "NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE\n",
+        "LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION\n",
+        "OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION\n",
+        "WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.\n",
+    );
+
+    #[test]
+    fn an_empty_value_does_not_take_the_next_line() {
+        assert!(!license_template_complete("YEAR:\nCOPYRIGHT HOLDER: Ann Lee\n"));
+        assert!(!license_template_complete("YEAR:\r\nCOPYRIGHT HOLDER: Ann Lee\r\n"));
+        assert!(!license_template_complete("YEAR: 2024\nCOPYRIGHT HOLDER: \n\n(separated by empty lines) as file LICENSE\n"));
+        assert!(!license_template_complete("YEAR:\nCOPYRIGHT HOLDER: \nORGANIZATION:\n\n(separated by empty lines)\n"));
+        assert!(!license_template_complete(R_MIT_TEMPLATE), "an unfilled copy of R's template");
+        assert!(license_template_complete("YEAR:\t2024\nCOPYRIGHT HOLDER:\tAnn Lee\n"));
+        assert!(license_template_complete("  YEAR: 2024\n  COPYRIGHT HOLDER: Ann Lee\n"));
+    }
+
+    #[test]
+    fn only_a_whole_bracketed_value_is_a_placeholder() {
+        assert!(!is_license_placeholder("<Ann Lee> <ann@x.org>"));
+        assert!(license_template_complete("YEAR: 2024\nCOPYRIGHT HOLDER: <Ann Lee> <ann@x.org>\n"));
+        assert!(is_license_placeholder("<Your Name>"));
+        assert!(is_license_placeholder("<>"));
+        assert!(is_license_placeholder("<<name>"));
+        assert!(!is_license_placeholder("<"));
+    }
+
+    #[test]
+    fn a_byte_order_mark_does_not_hide_the_year_line() {
+        assert!(license_template_complete("\u{feff}YEAR: 2024\nCOPYRIGHT HOLDER: Ann Lee\n"));
+        assert!(license_template_complete("\u{feff}YEAR: 2024\r\nCOPYRIGHT HOLDER: Ann Lee\r\n"));
+        assert!(!license_template_complete("\u{feff}YEAR: <year>\nCOPYRIGHT HOLDER: Ann Lee\n"));
+        assert!(!license_template_complete("\u{feff}\n"), "a mark alone is an empty file");
+    }
+
     fn version_parts(v: &str) -> Vec<u64> {
         v.split('.')
             .map(|p| p.parse::<u64>().expect("version component is a number"))
             .collect()
     }
 
-    /// The summary record carries `analyzer_version`, and the pipelines decide
-    /// from it whether the rows they already hold were written by a build that
-    /// reads datasets the way this one does. The last release of the narrower reader
-    /// was 0.3.2, so a tree that still calls itself 0.3.2 is indistinguishable
-    /// from that release and no rescan downstream can ever fire. Any build
-    /// carrying the wider reader has to announce a version past it.
+    /// 0.4.0 was the last release under the old column contract, so this build must
+    /// report 0.5.0 or later or a pipeline cannot tell the two kinds of row apart.
     #[test]
-    fn analyzer_version_is_past_the_last_narrow_reader_release() {
+    fn analyzer_version_is_past_the_last_release_under_the_old_column_contract() {
         let parts = version_parts(ANALYZER_VERSION);
         assert!(
             parts.len() >= 3,
@@ -3748,9 +4162,9 @@ mod tests {
              component-wise against a released tag"
         );
         assert!(
-            version_ge(&parts, &[0, 4, 0]),
-            "ANALYZER_VERSION is {ANALYZER_VERSION}, at or below the 0.3.2 release that \
-             shipped the narrower dataset reader"
+            version_ge(&parts, &[0, 5, 0]),
+            "ANALYZER_VERSION is {ANALYZER_VERSION}, at or below 0.4.0, the last release \
+             under the old column contract"
         );
     }
 }

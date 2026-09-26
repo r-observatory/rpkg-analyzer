@@ -11,7 +11,7 @@
 // than crash. Exposed behind the --datasets flag.
 
 use serde_json::{json, Value};
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 use std::path::Path;
 
 const SYMSXP: u8 = 1;
@@ -4447,10 +4447,10 @@ fn read_text_free(path: &Path) -> Option<(Vec<Node>, Vec<String>, usize, &'stati
 
 /// Emit one `dataset` record per dataset shipped under `root`'s data/ directory
 /// and R/sysdata.rda. Never panics on a bad file; it degrades with a note.
-pub fn scan_package(root: &Path) -> Vec<Value> {
+pub fn scan_package(root: &Path, excluded: &BTreeSet<String>) -> Vec<Value> {
     let mut out = Vec::new();
     let mut targets: Vec<(std::path::PathBuf, bool)> = Vec::new();
-    let titles = rd_titles(root);
+    let docs = rd_dataset_docs(root, excluded);
     if let Ok(rd) = std::fs::read_dir(root.join("data")) {
         let mut paths: Vec<_> = rd.flatten().map(|e| e.path()).collect();
         paths.sort();
@@ -4463,6 +4463,10 @@ pub fn scan_package(root: &Path) -> Vec<Value> {
             Default::default();
         for p in paths {
             let fname = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            // A file the build leaves out is not in the release, so data() never sees it.
+            if excluded.contains(&rel_path(root, &p)) {
+                continue;
+            }
             let Some(rank) = data_ext_rank(fname) else { continue };
             let name = dataset_name(fname);
             match best.get(&name) {
@@ -4477,7 +4481,7 @@ pub fn scan_package(root: &Path) -> Vec<Value> {
         }
     }
     let sys = root.join("R").join("sysdata.rda");
-    if sys.exists() {
+    if sys.exists() && !excluded.contains("R/sysdata.rda") {
         targets.push((sys, true));
     }
     let n_loadable = targets.len();
@@ -4493,7 +4497,7 @@ pub fn scan_package(root: &Path) -> Vec<Value> {
         let src = root.join("inst").join("extdata");
         if src.is_dir() { src } else { root.join("extdata") }
     };
-    walk_extdata(&ext_root, EXTDATA_DEPTH, &mut extra);
+    walk_extdata(root, excluded, &ext_root, EXTDATA_DEPTH, &mut extra);
     for p in extra {
         targets.push((p, false));
     }
@@ -4604,9 +4608,14 @@ pub fn scan_package(root: &Path) -> Vec<Value> {
         }
         for r in out[before..].iter_mut() {
             r["origin_dir"] = json!(origin_dir);
-            if let Some(t) = r.get("name").and_then(|n| n.as_str()).and_then(|n| titles.get(n)) {
+            let doc = r.get("name").and_then(|n| n.as_str()).and_then(|n| docs.get(n));
+            if let Some(t) = doc.and_then(|d| d.title.as_ref()) {
                 r["title"] = json!(t);
             }
+            // Only a dataset data() can load has a help page to speak of.
+            let loadable = origin_dir == "data";
+            r["dataset_doc_source"] = json!(doc.filter(|_| loadable).and_then(|d| d.source.clone()));
+            r["dataset_doc_format"] = json!(doc.filter(|_| loadable).map(|d| d.has_format as i64));
         }
     }
     out
@@ -4623,7 +4632,7 @@ pub fn scan_package(root: &Path) -> Vec<Value> {
 /// `read` counts the files that also produced a dataset record, `unread` the
 /// rest. It rides the summary record, which reaches the database without any
 /// change to the pipeline, so this survives even if the per-file records do not.
-pub fn extdata_inventory(root: &Path) -> Value {
+pub fn extdata_inventory(root: &Path, excluded: &BTreeSet<String>) -> Value {
     let ext_root = {
         let src = root.join("inst").join("extdata");
         if src.is_dir() { src } else { root.join("extdata") }
@@ -4632,7 +4641,11 @@ pub fn extdata_inventory(root: &Path) -> Value {
         return Value::Null;
     }
     let mut files = Vec::new();
-    walk_extdata(&ext_root, EXTDATA_DEPTH, &mut files);
+    walk_extdata(root, excluded, &ext_root, EXTDATA_DEPTH, &mut files);
+    // A directory whose every file, at any depth, is left out is not in the release.
+    if files.is_empty() && holds_only_left_out_files(root, excluded, &ext_root) {
+        return Value::Null;
+    }
     // Size per extension, not just per directory. A file we read carries its own
     // byte count on its record the way one under data/ does; a file we do not
     // read has no record to carry anything, and one total for the directory
@@ -4698,15 +4711,26 @@ fn extdata_is_readable(lower: &str) -> bool {
             .any(|e| lower.contains(e))
 }
 
-/// The title of each dataset's help page, keyed by the name it documents.
-///
-/// A catalogue that lists a hundred names and says nothing about any of them
-/// is a poor catalogue, and the package has already written the sentence: an
-/// Rd page for a dataset carries a title and an alias naming what it documents.
-fn rd_titles(root: &Path) -> std::collections::HashMap<String, String> {
+/// What a dataset's help page says about it: title, \source and whether \format is
+/// there, keyed by every alias the page documents.
+pub(crate) struct RdDatasetDoc {
+    pub title: Option<String>,
+    pub source: Option<String>,
+    pub has_format: bool,
+}
+
+/// \source text is capped here, at a character boundary.
+const RD_SOURCE_CAP: usize = 4096;
+
+fn rd_dataset_docs(root: &Path, excluded: &BTreeSet<String>) -> std::collections::HashMap<String, RdDatasetDoc> {
     let mut out = std::collections::HashMap::new();
     let Ok(rd) = std::fs::read_dir(root.join("man")) else { return out };
-    let mut paths: Vec<_> = rd.flatten().map(|e| e.path()).collect();
+    // Pages the build leaves out go before the cap, so they cannot fill it ahead of kept ones.
+    let mut paths: Vec<_> = rd
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| !excluded.contains(&rel_path(root, p)))
+        .collect();
     paths.sort();
     for p in paths.iter().take(RD_FILE_CAP) {
         let is_rd = p
@@ -4721,14 +4745,27 @@ fn rd_titles(root: &Path) -> std::collections::HashMap<String, String> {
         if raw.len() > RD_SIZE_CAP {
             continue;
         }
-        let text = String::from_utf8_lossy(&raw);
-        let Some(title) = rd_field(&text, "title") else { continue };
-        let title = rd_plain(&title);
-        if title.is_empty() {
-            continue;
-        }
+        // A commented-out template \source is no source at all.
+        let text = crate::strip_rd_comments(&String::from_utf8_lossy(&raw));
+        let title = rd_field(&text, "title").map(|t| rd_plain(&t)).filter(|t| !t.is_empty());
+        let source = rd_field(&text, "source").map(|s| {
+            let full = rd_inline_text(&s);
+            let mut end = full.len().min(RD_SOURCE_CAP);
+            while !full.is_char_boundary(end) {
+                end -= 1;
+            }
+            full[..end].to_string()
+        });
+        let has_format = rd_field(&text, "format").is_some();
         for alias in rd_all_fields(&text, "alias") {
-            out.entry(rd_plain(&alias)).or_insert_with(|| title.clone());
+            let key = rd_plain(&alias);
+            // The first titled page gives all three fields; an untitled one only stands in until then.
+            if out.get(&key).is_none_or(|d: &RdDatasetDoc| d.title.is_none() && title.is_some()) {
+                out.insert(
+                    key,
+                    RdDatasetDoc { title: title.clone(), source: source.clone().filter(|s| !s.is_empty()), has_format },
+                );
+            }
         }
     }
     out
@@ -4785,19 +4822,59 @@ fn rd_all_fields(text: &str, tag: &str) -> Vec<String> {
 /// of a function; carrying it as Rd puts a backslash in the middle of a
 /// sentence. Markdown is what the page it lands on can render.
 fn rd_plain(s: &str) -> String {
-    let out = rd_to_markdown(s, 0);
+    let out = rd_to_markdown(s, 0, false);
     let collapsed = out.split_whitespace().collect::<Vec<_>>().join(" ");
     collapsed.chars().take(300).collect()
 }
 
-fn rd_to_markdown(s: &str, depth: u32) -> String {
+/// Rd markup as one line of Markdown, with no length cap.
+pub(crate) fn rd_inline_text(s: &str) -> String {
+    rd_to_markdown(s, 0, false).split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// The inside of the brace group whose body starts at `start`, and the index just past its closing brace.
+fn rd_group(s: &str, start: usize) -> (&str, usize) {
+    let b = s.as_bytes();
+    let mut depth = 1i32;
+    let mut k = start;
+    while k < b.len() && depth > 0 {
+        match b[k] {
+            b'{' if b[k - 1] != b'\\' => depth += 1,
+            b'}' if b[k - 1] != b'\\' => depth -= 1,
+            _ => {}
+        }
+        k += 1;
+    }
+    let inner = if depth == 0 { &s[start..k - 1] } else { &s[start..] };
+    (inner, k)
+}
+
+/// One-argument Rd and R system macros with no rendering of their own. A group written
+/// straight after one of them is text of its own, as R reads it, not a second argument.
+const RD_ONE_ARG: &[&str] = &[
+    "abbr", "acronym", "describe", "email", "enumerate", "itemize", "link", "linkS4class", "out",
+    "preformatted", "special", "url", "verb", "CRANpkg", "I", "PR", "bibcitep", "bibcitet", "bibshow",
+    "doi", "packageAuthor", "packageDESCRIPTION", "packageDescription", "packageIndices",
+    "packageMaintainer", "packageTitle", "proglang",
+];
+
+/// Rd markup as Markdown. `verbatim` is set inside code and verbatim arguments,
+/// where R keeps a brace as text; elsewhere a bare brace group only groups.
+fn rd_to_markdown(s: &str, depth: u32, verbatim: bool) -> String {
     if depth > 8 {
         return String::new();
     }
+    let render = |t: &str, verbatim: bool| rd_to_markdown(t, depth + 1, verbatim);
     let b = s.as_bytes();
     let mut out = String::new();
     let mut i = 0usize;
     while i < b.len() {
+        if b[i] == b'{' && !verbatim {
+            let (inner, k) = rd_group(s, i + 1);
+            out.push_str(&render(inner, false));
+            i = k;
+            continue;
+        }
         if b[i] != b'\\' {
             let c = s[i..].chars().next().unwrap_or(' ');
             out.push(if c == '\n' || c == '\t' || c == '\r' { ' ' } else { c });
@@ -4816,22 +4893,44 @@ fn rd_to_markdown(s: &str, depth: u32) -> String {
             j += 1;
         }
         let cmd = &s[name_start..j];
-        if j < b.len() && b[j] == b'{' {
-            let start = j + 1;
-            let mut depth_b = 1i32;
-            let mut k = start;
-            while k < b.len() && depth_b > 0 {
-                match b[k] {
-                    b'{' if b[k - 1] != b'\\' => depth_b += 1,
-                    b'}' if b[k - 1] != b'\\' => depth_b -= 1,
-                    _ => {}
-                }
-                k += 1;
+        // A macro that takes no argument stands for a word; a group after it, as in \R{}, is its own text.
+        if matches!(cmd, "R" | "dots" | "ldots" | "cr" | "tab") {
+            out.push_str(match cmd {
+                "R" => "R",
+                "dots" | "ldots" => "...",
+                _ => "",
+            });
+            i = j;
+            continue;
+        }
+        // The option of \link[pkg]{x} names where it points, not what it reads as.
+        let mut arg = j;
+        if cmd == "link" && arg < b.len() && b[arg] == b'[' {
+            if let Some(close) = s[arg..].find(']') {
+                arg += close + 1;
             }
-            let inner = if depth_b == 0 { &s[start..k - 1] } else { &s[start..] };
-            let rendered = rd_to_markdown(inner, depth + 1);
+        }
+        if arg < b.len() && b[arg] == b'{' {
+            let (inner, mut k) = rd_group(s, arg + 1);
+            // The group written straight after the first, which two-argument macros read.
+            let second = (k < b.len() && b[k] == b'{').then(|| rd_group(s, k + 1));
             match cmd {
+                // \href{url}{text} keeps both halves as a Markdown link.
+                "href" => {
+                    let mut text = String::new();
+                    if let Some((t, after)) = second {
+                        text = render(t, false);
+                        k = after;
+                    }
+                    let url: String = render(inner, true).split_whitespace().collect();
+                    if text.trim().is_empty() {
+                        out.push_str(&url);
+                    } else {
+                        out.push_str(&format!("[{}]({url})", text.trim()));
+                    }
+                }
                 "code" | "command" | "env" | "file" | "kbd" | "option" | "pkg" | "samp" => {
+                    let rendered = render(inner, matches!(cmd, "code" | "env" | "kbd" | "option" | "samp"));
                     if !rendered.is_empty() {
                         out.push('`');
                         out.push_str(&rendered);
@@ -4840,35 +4939,80 @@ fn rd_to_markdown(s: &str, depth: u32) -> String {
                 }
                 "emph" | "var" | "dfn" | "cite" => {
                     out.push('*');
-                    out.push_str(&rendered);
+                    out.push_str(&render(inner, false));
                     out.push('*');
                 }
                 "strong" | "bold" => {
                     out.push_str("**");
-                    out.push_str(&rendered);
+                    out.push_str(&render(inner, false));
                     out.push_str("**");
                 }
                 "dQuote" => {
                     out.push('"');
-                    out.push_str(&rendered);
+                    out.push_str(&render(inner, false));
                     out.push('"');
                 }
                 "sQuote" => {
                     out.push('\'');
-                    out.push_str(&rendered);
+                    out.push_str(&render(inner, false));
                     out.push('\'');
                 }
+                // Rd2txt prints the plain second form of an equation or figure when there is one.
+                "eqn" | "deqn" | "figure" => match second {
+                    Some((plain, after)) => {
+                        out.push_str(&render(plain, true));
+                        k = after;
+                    }
+                    None => out.push_str(&render(inner, true)),
+                },
+                "tabular" => {
+                    if let Some((rows, after)) = second {
+                        out.push_str(&render(rows, false));
+                        k = after;
+                    }
+                }
+                // A \describe item reads as its label and its text.
+                "item" | "section" | "subsection" => {
+                    out.push_str(&render(inner, false));
+                    if let Some((text, after)) = second {
+                        out.push_str(": ");
+                        out.push_str(&render(text, false));
+                        k = after;
+                    }
+                }
+                // Rd2txt keeps the branch for text output: \if{fmt}{x}, \ifelse{fmt}{x}{y}.
+                "if" | "ifelse" => {
+                    if let Some((then, after)) = second {
+                        k = after;
+                        let mut other = None;
+                        if cmd == "ifelse" && k < b.len() && b[k] == b'{' {
+                            let (e, after_else) = rd_group(s, k + 1);
+                            other = Some(e);
+                            k = after_else;
+                        }
+                        if inner.split(',').any(|f| matches!(f.trim(), "text" | "TRUE")) {
+                            out.push_str(&render(then, false));
+                        } else if let Some(e) = other {
+                            out.push_str(&render(e, false));
+                        }
+                    }
+                }
                 // A cross-reference reads as the thing it names.
-                _ => out.push_str(&rendered),
+                c if RD_ONE_ARG.contains(&c) => {
+                    out.push_str(&render(inner, matches!(c, "url" | "verb" | "special" | "preformatted" | "out")));
+                }
+                // \enc, \method, \S3method, \S4method and user macros such as \insertRef{key}{pkg}
+                // read as their first argument; the second is an alternative or a qualifier.
+                _ => {
+                    out.push_str(&render(inner, false));
+                    if let Some((_, after)) = second {
+                        k = after;
+                    }
+                }
             }
             i = k;
         } else {
-            // A bare command such as \R or \dots stands for a word.
-            out.push_str(match cmd {
-                "R" => "R",
-                "dots" | "ldots" => "...",
-                _ => "",
-            });
+            // Any other bare command stands for nothing we can print.
             i = j.max(i + 1);
         }
     }
@@ -4893,6 +5037,13 @@ fn data_ext_rank(fname: &str) -> Option<usize> {
     })
 }
 
+/// A path relative to the package root with POSIX separators, as list_files writes it.
+fn rel_path(root: &Path, p: &Path) -> String {
+    p.strip_prefix(root)
+        .map(|r| r.to_string_lossy().replace('\\', "/"))
+        .unwrap_or_default()
+}
+
 /// How deep to follow directories under inst/extdata, and how much of a file to
 /// take on. The tail is long: a package may keep an 11 MB sequence file here,
 /// and fingerprinting one describes nothing a reader would ask about.
@@ -4901,7 +5052,15 @@ const EXTDATA_PARSE_LIMIT: u64 = 8 << 20;
 const EXTDATA_FILE_CAP: usize = 200;
 const EXTDATA_NAME_CAP: usize = 100;
 
-fn walk_extdata(dir: &Path, depth: u32, out: &mut Vec<std::path::PathBuf>) {
+/// Files under `dir` the release keeps. A file the build leaves out is skipped
+/// before it counts, so left-out files cannot fill the cap ahead of kept ones.
+fn walk_extdata(
+    root: &Path,
+    excluded: &BTreeSet<String>,
+    dir: &Path,
+    depth: u32,
+    out: &mut Vec<std::path::PathBuf>,
+) {
     if depth == 0 || out.len() >= EXTDATA_FILE_CAP {
         return;
     }
@@ -4913,11 +5072,23 @@ fn walk_extdata(dir: &Path, depth: u32, out: &mut Vec<std::path::PathBuf>) {
             return;
         }
         if p.is_dir() {
-            walk_extdata(&p, depth - 1, out);
-        } else {
+            walk_extdata(root, excluded, &p, depth - 1, out);
+        } else if !excluded.contains(&rel_path(root, &p)) {
             out.push(p);
         }
     }
+}
+
+/// True when `dir` holds files and the build leaves out every one of them, at any depth.
+fn holds_only_left_out_files(root: &Path, excluded: &BTreeSet<String>, dir: &Path) -> bool {
+    let prefix = format!("{}/", rel_path(root, dir));
+    // No left-out file under the directory means nothing here was taken away.
+    if !excluded.range(prefix.clone()..).next().is_some_and(|f| f.starts_with(&prefix)) {
+        return false;
+    }
+    let mut kept = Vec::new();
+    walk_extdata(root, excluded, dir, u32::MAX, &mut kept);
+    kept.is_empty()
 }
 
 // ---- tests ------------------------------------------------------------------
@@ -4931,7 +5102,7 @@ mod tests {
     use serde_json::Value;
 
     fn records() -> Vec<Value> {
-        scan_package(Path::new("tests/fixtures/pkg"))
+        scan_package(Path::new("tests/fixtures/pkg"), &BTreeSet::new())
     }
     fn by_name(name: &str) -> Value {
         records()
@@ -5902,6 +6073,41 @@ mod tests {
     }
 
     #[test]
+    fn brace_groups_and_second_arguments_read_as_r_prints_them() {
+        let r = |s: &str| rd_inline_text(s);
+        // A bare group only groups, so its braces are not text.
+        assert_eq!(r("{Maxime Taillardat}"), "Maxime Taillardat");
+        assert_eq!(r("{ Eurostat -- accounts } and {{nested}} words"), "Eurostat -- accounts and nested words");
+        assert_eq!(r("\\emph{a {b} c}"), "*a b c*");
+        // Code and verbatim arguments keep their braces.
+        assert_eq!(r("\\code{function(x) {x}}"), "`function(x) {x}`");
+        assert_eq!(r("\\samp{a {b} c}"), "`a {b} c`");
+        assert_eq!(r("\\url{https://x.org/{a}}"), "https://x.org/{a}");
+        assert_eq!(r("\\eqn{x^{2}}"), "x^{2}");
+        // \eqn and \deqn print their ASCII form when they have one.
+        assert_eq!(r("the \\eqn{r}{r}-largest"), "the r-largest");
+        assert_eq!(r("\\eqn{\\alpha}{alpha}"), "alpha");
+        assert_eq!(r("\\deqn{a^2}{a squared}"), "a squared");
+        // \enc, \method and \S4method keep their first argument.
+        assert_eq!(r("\\enc{M\u{fc}ller}{Mueller}"), "M\u{fc}ller");
+        assert_eq!(r("\\method{print}{foo} and \\S3method{print}{bar} and \\S4method{show}{baz}"), "print and print and show");
+        // A user macro keeps its first argument too, never a literal second group.
+        assert_eq!(r("\\insertRef{kapraun2022fetalmodel}{httk}"), "kapraun2022fetalmodel");
+        // A group after a one-argument macro is text of its own.
+        assert_eq!(r("\\link{foo}{bar}"), "foobar");
+        assert_eq!(r("\\pkg{foo}{bar}"), "`foo`bar");
+        // Macros that take no argument keep their word before an empty group.
+        assert_eq!(r("\\R{} package, \\dots{} more"), "R package, ... more");
+        // A two-part item reads as its label and text, and a conditional keeps its text branch.
+        assert_eq!(r("\\describe{\\item{Label}{Its text.}}"), "Label: Its text.");
+        assert_eq!(r("\\if{html}{hidden}\\if{html,text}{shown}"), "shown");
+        assert_eq!(r("\\ifelse{html}{h}{t}"), "t");
+        assert_eq!(r("\\figure{f.png}{alt text}"), "alt text");
+        // Titles read through the same renderer.
+        assert_eq!(rd_plain("The {Venice} sea levels"), "The Venice sea levels");
+    }
+
+    #[test]
     fn a_dataset_takes_the_title_from_its_help_page() {
         // The alias names what the page documents, so one page can title
         // several datasets, and the markup in a title has to come off.
@@ -5966,7 +6172,7 @@ mod tests {
 
     #[test]
     fn the_inventory_says_what_extdata_holds_without_opening_it() {
-        let inv = extdata_inventory(Path::new("tests/fixtures/pkg"));
+        let inv = extdata_inventory(Path::new("tests/fixtures/pkg"), &BTreeSet::new());
         assert_eq!(inv["files"], 5);
         // The formats we would expect under data/ anyway, opened and counted.
         assert_eq!(inv["read"]["csv"]["n"], 2);
@@ -5991,7 +6197,7 @@ mod tests {
 
     #[test]
     fn a_package_without_extdata_says_so() {
-        let inv = extdata_inventory(Path::new("tests/fixtures"));
+        let inv = extdata_inventory(Path::new("tests/fixtures"), &BTreeSet::new());
         assert!(inv.is_null());
     }
 
