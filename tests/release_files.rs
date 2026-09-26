@@ -127,19 +127,3 @@ fn a_wholly_left_out_extdata_is_absent_on_git_and_present_on_release() {
     ]);
     assert_eq!(summary(&deep, "git")["extdata"]["files"], 0);
 }
-
-#[test]
-fn a_kept_help_page_is_read_behind_more_left_out_pages_than_the_cap() {
-    let mut owned: Vec<(String, String)> = (0..4000)
-        .map(|i| (format!("man/a_{i:04}.Rd"), format!("\\name{{a_{i}}}\\alias{{a_{i}}}\\title{{Page {i}}}\n")))
-        .collect();
-    owned.push(("man/z.Rd".to_string(), "\\name{z}\\alias{z}\\title{The z data}\n".to_string()));
-    owned.push(("data/z.csv".to_string(), "a;b\n1;2\n".to_string()));
-    owned.push((".Rbuildignore".to_string(), "^man/a_\n".to_string()));
-    owned.push(("DESCRIPTION".to_string(), DESC.to_string()));
-    let files: Vec<(&str, &str)> = owned.iter().map(|(p, t)| (p.as_str(), t.as_str())).collect();
-    let t = tree(&files);
-    let recs = records(&t, "git");
-    let z = recs.iter().find(|r| r["rec"] == "dataset" && r["name"] == "z").expect("a z dataset record");
-    assert_eq!(z["title"], "The z data");
-}

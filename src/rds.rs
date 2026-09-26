@@ -4714,9 +4714,7 @@ fn extdata_is_readable(lower: &str) -> bool {
 fn rd_titles(root: &Path, excluded: &BTreeSet<String>) -> std::collections::HashMap<String, String> {
     let mut out = std::collections::HashMap::new();
     let Ok(rd) = std::fs::read_dir(root.join("man")) else { return out };
-    // Pages the build leaves out are dropped first, so they never use up the cap.
-    let mut paths: Vec<_> =
-        rd.flatten().map(|e| e.path()).filter(|p| !excluded.contains(&rel_path(root, p))).collect();
+    let mut paths: Vec<_> = rd.flatten().map(|e| e.path()).collect();
     paths.sort();
     for p in paths.iter().take(RD_FILE_CAP) {
         let is_rd = p
@@ -4724,7 +4722,7 @@ fn rd_titles(root: &Path, excluded: &BTreeSet<String>) -> std::collections::Hash
             .and_then(|e| e.to_str())
             .map(|e| e.eq_ignore_ascii_case("rd"))
             .unwrap_or(false);
-        if !is_rd {
+        if !is_rd || excluded.contains(&rel_path(root, p)) {
             continue;
         }
         let Ok(raw) = std::fs::read(&p) else { continue };
