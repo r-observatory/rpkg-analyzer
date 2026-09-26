@@ -3355,6 +3355,10 @@ fn main() {
     let port = metrics_portability(&desc, &root, &files);
     let tests = metrics_tests(&desc, &root, &files, &ns.exports);
     let docs = metrics_docs(&desc, &root, &files, &ns.exports, news_file);
+    let rd = rd_pages::page_facts(&root, &files);
+    let exc = rd_pages::example_counts(&rd);
+    // With no example pages there is nothing to break down, so the buckets stay NULL.
+    let bucket = |v: i64| (exc.pages > 0).then_some(v);
     let health = metrics_health(&desc, &root, &files);
     let meta = metrics_meta(&desc, &root, &files);
     let security = metrics_security(&desc, &root, &files);
@@ -3458,6 +3462,12 @@ fn main() {
         "ci_matrix_breadth": practices.ci_matrix_breadth,
         "ci_pr_gated": practices.ci_pr_gated,
         "dontrun_example_ratio": docs.dontrun_example_ratio,
+        "rd_example_pages": exc.pages,
+        "rd_example_pages_run": bucket(exc.run),
+        "rd_example_pages_donttest_only": bucket(exc.donttest_only),
+        "rd_example_pages_never_run": bucket(exc.never_run),
+        "rd_example_pages_empty": bucket(exc.empty),
+        "rd_example_pages_conditional": bucket(exc.conditional),
         "undocumented_params_rate": docs.undocumented_params_rate,
         "value_doc_rate": docs.value_doc_rate,
         "references_coverage": docs.references_coverage,
