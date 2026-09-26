@@ -16,9 +16,42 @@ static EXAMPLES_OPEN: LazyLock<regex::Regex> = LazyLock::new(|| regex::Regex::ne
 // roxygen2 7.3.3 writes withAutoprint(\{; earlier releases wrote (if (...) withAutoprint else force)(\{.
 static EXAMPLES_IF: LazyLock<regex::Regex> =
     LazyLock::new(|| regex::Regex::new(r"\\dontshow\s*\{\s*if\s*\(.*withAutoprint[^\n]*\(\s*\\?\{").unwrap());
-static IF_GUARD: LazyLock<regex::Regex> = LazyLock::new(|| {
-    regex::Regex::new(r"^if\s*\(\s*!?\s*(?:interactive|requireNamespace|Sys\.getenv)\s*\(").unwrap()
-});
+static IF_OPEN: LazyLock<regex::Regex> = LazyLock::new(|| regex::Regex::new(r"^if\s*\(").unwrap());
+static GUARD_CALL: LazyLock<regex::Regex> =
+    LazyLock::new(|| regex::Regex::new(r"\b(?:interactive|requireNamespace|Sys\.getenv)\s*\(").unwrap());
+
+/// Whether code opens with an `if (` whose condition calls interactive(), requireNamespace()
+/// or Sys.getenv(), bare or wrapped as in identical(Sys.getenv("NOT_CRAN"), "true").
+fn is_if_guard(code: &str) -> bool {
+    let Some(m) = IF_OPEN.find(code) else { return false };
+    let cond = &code[m.end()..];
+    let (mut depth, mut quote, mut end) = (1, None, cond.len());
+    let mut chars = cond.char_indices();
+    while let Some((k, c)) = chars.next() {
+        match (quote, c) {
+            (Some(_), '\\') => {
+                chars.next();
+            }
+            (Some(q), _) if c == q => quote = None,
+            (Some(_), _) => {}
+            (None, '"' | '\'') => quote = Some(c),
+            // An R comment inside a condition that spans lines holds no parenthesis that counts.
+            (None, '#') => {
+                chars.by_ref().find(|&(_, c)| c == '\n');
+            }
+            (None, '(') => depth += 1,
+            (None, ')') => {
+                depth -= 1;
+                if depth == 0 {
+                    end = k;
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    GUARD_CALL.is_match(&cond[..end])
+}
 
 /// The content of every \examples{...} block in comment-stripped Rd text. A block
 /// whose braces never close runs to the end of the page.
@@ -62,10 +95,11 @@ fn split_examples(s: &str, ctx: &[&str], acc: &mut ExampleText) {
             &mut acc.plain
         } else if ctx.contains(&"dontrun") {
             &mut acc.dontrun
-        } else if ctx.contains(&"dontshow") || ctx.contains(&"testonly") {
-            &mut acc.dontshow
-        } else {
+        } else if ctx.contains(&"donttest") {
+            // Hidden code inside \donttest, or \donttest inside hidden code, runs whenever donttest examples do.
             &mut acc.donttest
+        } else {
+            &mut acc.dontshow
         };
         slot.push_str(text);
     };
@@ -135,9 +169,15 @@ pub fn classify_examples(blocks: &[String]) -> Option<ExamplePage> {
     } else {
         ExampleClass::Empty
     };
-    let first_code = acc.plain.lines().map(str::trim).find(|l| !l.is_empty() && !l.starts_with('#'));
+    // Plain code from its first code line on, so a guard's condition may run onto later lines.
+    let skip: usize = acc
+        .plain
+        .split_inclusive('\n')
+        .take_while(|l| l.trim().is_empty() || l.trim().starts_with('#'))
+        .map(str::len)
+        .sum();
     let conditional = class == ExampleClass::Run
-        && (blocks.iter().any(|b| EXAMPLES_IF.is_match(b)) || first_code.is_some_and(|l| IF_GUARD.is_match(l)));
+        && (blocks.iter().any(|b| EXAMPLES_IF.is_match(b)) || is_if_guard(acc.plain[skip..].trim_start()));
     Some(ExamplePage { class, conditional })
 }
 
@@ -216,6 +256,19 @@ mod tests {
         assert_eq!(class_of("\\examples{\n\\dontshow{f(1)}\n}"), Some((ExampleClass::NeverRun, false)));
         assert_eq!(class_of("\\examples{\n# just a comment\n\n}"), Some((ExampleClass::Empty, false)));
         assert_eq!(class_of("\\name{f}\n\\title{x}"), None);
+        assert_eq!(class_of("\\examples{\n\\testonly{f(1)}\n}"), Some((ExampleClass::NeverRun, false)));
+        assert_eq!(
+            class_of("\\examples{\n\\donttest{\\dontshow{f(1)}}\n}"),
+            Some((ExampleClass::DonttestOnly, false)),
+            "hidden code inside donttest runs with donttest"
+        );
+        assert_eq!(class_of("\\examples{\n\\dontshow{\\donttest{f(1)}}\n}"), Some((ExampleClass::DonttestOnly, false)));
+        assert_eq!(
+            class_of("\\examples{\n\\dontrun{f(1)\n"),
+            Some((ExampleClass::NeverRun, false)),
+            "a wrapper brace that never closes runs to the end of the page"
+        );
+        assert_eq!(class_of("\\examples{\nf(1)\n"), Some((ExampleClass::Run, false)));
     }
 
     #[test]
@@ -236,5 +289,23 @@ mod tests {
         // roxygen2 before 7.3.3 wrote the wrapper as (if (getRversion() >= "3.4") withAutoprint else force)(...).
         let roxygen_71 = "\\examples{\n\\dontshow{if (interactive()) (if (getRversion() >= \"3.4\") withAutoprint else force)(\\{ # examplesIf}\nf(1)\n\\dontshow{\\}) # examplesIf}\n}";
         assert_eq!(class_of(roxygen_71), Some((ExampleClass::Run, true)));
+        let not_cran = "\\examples{\nif (identical(Sys.getenv(\"NOT_CRAN\"), \"true\")) {\n  f(1)\n}\n}";
+        assert_eq!(class_of(not_cran), Some((ExampleClass::Run, true)), "a wrapped Sys.getenv() guard counts");
+        assert_eq!(class_of("\\examples{\nif (Sys.getenv(\"KEY\") != \"\") f(1)\n}"), Some((ExampleClass::Run, true)));
+        assert_eq!(
+            class_of("\\examples{\nif (n > 1) f(Sys.getenv(\"A\"))\n}"),
+            Some((ExampleClass::Run, false)),
+            "a call after the condition is not a guard"
+        );
+        assert_eq!(
+            class_of("\\examples{\nif (x == \"(\") f(interactive())\n}"),
+            Some((ExampleClass::Run, false)),
+            "a parenthesis in a string is not counted"
+        );
+        assert_eq!(class_of("\\examples{\nif (x != \")\" && interactive()) f(1)\n}"), Some((ExampleClass::Run, true)));
+        let two_lines = "\\examples{\nif (length(x) > 0 &&\n    requireNamespace(\"sf\")) {\n  f(1)\n}\n}";
+        assert_eq!(class_of(two_lines), Some((ExampleClass::Run, true)), "a condition may span lines");
+        let donttest_if = "\\examples{\n\\dontshow{if (interactive()) withAutoprint(\\{ # examplesIf}\n\\donttest{f(1)}\n\\dontshow{\\}) # examplesIf}\n}";
+        assert_eq!(class_of(donttest_if), Some((ExampleClass::DonttestOnly, false)), "only run pages count as conditional");
     }
 }

@@ -31,6 +31,7 @@ fn example_pages_are_counted_by_how_a_check_runs_them() {
         ("man/d.Rd", "\\name{d}\n\\examples{\n# nothing\n}\n"),
         ("man/e.Rd", "\\name{e}\n\\examples{\nif (requireNamespace(\"x\")) e()\n}\n"),
         ("man/f.Rd", "\\name{f}\n\\title{no examples}\n"),
+        (".Rbuildignore", "^man/c\\.Rd$\n"),
     ]);
     let s = summary(&t, "release");
     assert_eq!(s["rd_example_pages"], 5);
@@ -39,6 +40,9 @@ fn example_pages_are_counted_by_how_a_check_runs_them() {
     assert_eq!(s["rd_example_pages_never_run"], 1);
     assert_eq!(s["rd_example_pages_empty"], 1);
     assert_eq!(s["rd_example_pages_conditional"], 1);
+    let g = summary(&t, "git");
+    assert_eq!(g["rd_example_pages"], 4, "a page the build leaves out is not counted on git input");
+    assert_eq!(g["rd_example_pages_never_run"], 0);
 }
 
 #[test]
