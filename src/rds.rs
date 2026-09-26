@@ -4450,7 +4450,7 @@ fn read_text_free(path: &Path) -> Option<(Vec<Node>, Vec<String>, usize, &'stati
 pub fn scan_package(root: &Path, excluded: &BTreeSet<String>) -> Vec<Value> {
     let mut out = Vec::new();
     let mut targets: Vec<(std::path::PathBuf, bool)> = Vec::new();
-    let titles = rd_titles(root, excluded);
+    let docs = rd_dataset_docs(root, excluded);
     if let Ok(rd) = std::fs::read_dir(root.join("data")) {
         let mut paths: Vec<_> = rd.flatten().map(|e| e.path()).collect();
         paths.sort();
@@ -4608,9 +4608,14 @@ pub fn scan_package(root: &Path, excluded: &BTreeSet<String>) -> Vec<Value> {
         }
         for r in out[before..].iter_mut() {
             r["origin_dir"] = json!(origin_dir);
-            if let Some(t) = r.get("name").and_then(|n| n.as_str()).and_then(|n| titles.get(n)) {
+            let doc = r.get("name").and_then(|n| n.as_str()).and_then(|n| docs.get(n));
+            if let Some(t) = doc.and_then(|d| d.title.as_ref()) {
                 r["title"] = json!(t);
             }
+            // Only a dataset data() can load has a help page to speak of.
+            let loadable = origin_dir == "data";
+            r["dataset_doc_source"] = json!(doc.filter(|_| loadable).and_then(|d| d.source.clone()));
+            r["dataset_doc_format"] = json!(doc.filter(|_| loadable).map(|d| d.has_format as i64));
         }
     }
     out
@@ -4706,12 +4711,18 @@ fn extdata_is_readable(lower: &str) -> bool {
             .any(|e| lower.contains(e))
 }
 
-/// The title of each dataset's help page, keyed by the name it documents.
-///
-/// A catalogue that lists a hundred names and says nothing about any of them
-/// is a poor catalogue, and the package has already written the sentence: an
-/// Rd page for a dataset carries a title and an alias naming what it documents.
-fn rd_titles(root: &Path, excluded: &BTreeSet<String>) -> std::collections::HashMap<String, String> {
+/// What a dataset's help page says about it: title, \source and whether \format is
+/// there, keyed by every alias the page documents.
+pub(crate) struct RdDatasetDoc {
+    pub title: Option<String>,
+    pub source: Option<String>,
+    pub has_format: bool,
+}
+
+/// \source text is capped here, at a character boundary.
+const RD_SOURCE_CAP: usize = 4096;
+
+fn rd_dataset_docs(root: &Path, excluded: &BTreeSet<String>) -> std::collections::HashMap<String, RdDatasetDoc> {
     let mut out = std::collections::HashMap::new();
     let Ok(rd) = std::fs::read_dir(root.join("man")) else { return out };
     let mut paths: Vec<_> = rd.flatten().map(|e| e.path()).collect();
@@ -4729,14 +4740,24 @@ fn rd_titles(root: &Path, excluded: &BTreeSet<String>) -> std::collections::Hash
         if raw.len() > RD_SIZE_CAP {
             continue;
         }
-        let text = String::from_utf8_lossy(&raw);
-        let Some(title) = rd_field(&text, "title") else { continue };
-        let title = rd_plain(&title);
-        if title.is_empty() {
-            continue;
-        }
+        // A commented-out template \source is no source at all.
+        let text = crate::strip_rd_comments(&String::from_utf8_lossy(&raw));
+        let title = rd_field(&text, "title").map(|t| rd_plain(&t)).filter(|t| !t.is_empty());
+        let source = rd_field(&text, "source").map(|s| {
+            let full = rd_inline_text(&s);
+            let mut end = full.len().min(RD_SOURCE_CAP);
+            while !full.is_char_boundary(end) {
+                end -= 1;
+            }
+            full[..end].to_string()
+        });
+        let has_format = rd_field(&text, "format").is_some();
         for alias in rd_all_fields(&text, "alias") {
-            out.entry(rd_plain(&alias)).or_insert_with(|| title.clone());
+            out.entry(rd_plain(&alias)).or_insert_with(|| RdDatasetDoc {
+                title: title.clone(),
+                source: source.clone().filter(|s| !s.is_empty()),
+                has_format,
+            });
         }
     }
     out
