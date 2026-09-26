@@ -26,6 +26,8 @@ mod tests {
         assert_eq!(news_file(&files(&["inst/NEWS", "NEWS.md"])), Some("NEWS.md"));
         assert_eq!(news_file(&files(&["inst/NEWS"])), Some("inst/NEWS"));
         assert_eq!(news_file(&files(&["news.md", "docs/NEWS.md"])), None);
+        assert_eq!(changelog_file(&files(&["CHANGELOG"])), Some("CHANGELOG"));
+        assert_eq!(changelog_file(&files(&["changelog", "Changes", "inst/ChangeLog"])), None, "exact case, at the root");
         assert_eq!(changelog_file(&files(&["CHANGES", "ChangeLog"])), Some("ChangeLog"));
     }
 }

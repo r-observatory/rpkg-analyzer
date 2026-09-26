@@ -12,6 +12,15 @@ fn a_plain_readme_counts_and_its_prose_is_measured() {
     assert_eq!(summary(&lower, "release")["has_readme"], true, "names match without regard to case");
     let deep = tree(&[("DESCRIPTION", DESC), ("inst/README.md", "x\n")]);
     assert_eq!(summary(&deep, "release")["has_readme"], false, "only the root counts");
+
+    // Each README has its own word count (5, 4 with the chunk stripped, 2), so the count names the file read.
+    let plain = ("README", "five words of plain text\n");
+    let rmd = ("README.Rmd", "a b c\n\n```{r}\nx <- 1\n```\n\nd\n");
+    let md = ("README.md", "one two\n");
+    let all = tree(&[("DESCRIPTION", DESC), plain, rmd, md]);
+    assert_eq!(summary(&all, "release")["readme_prose_length"], 2, "README.md is read first");
+    let no_md = tree(&[("DESCRIPTION", DESC), plain, rmd]);
+    assert_eq!(summary(&no_md, "release")["readme_prose_length"], 4, "then README.Rmd");
 }
 
 #[test]
