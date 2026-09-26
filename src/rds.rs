@@ -4803,6 +4803,23 @@ pub(crate) fn rd_inline_text(s: &str) -> String {
     rd_to_markdown(s, 0).split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+/// The inside of the brace group whose body starts at `start`, and the index just past its closing brace.
+fn rd_group(s: &str, start: usize) -> (&str, usize) {
+    let b = s.as_bytes();
+    let mut depth = 1i32;
+    let mut k = start;
+    while k < b.len() && depth > 0 {
+        match b[k] {
+            b'{' if b[k - 1] != b'\\' => depth += 1,
+            b'}' if b[k - 1] != b'\\' => depth -= 1,
+            _ => {}
+        }
+        k += 1;
+    }
+    let inner = if depth == 0 { &s[start..k - 1] } else { &s[start..] };
+    (inner, k)
+}
+
 fn rd_to_markdown(s: &str, depth: u32) -> String {
     if depth > 8 {
         return String::new();
@@ -4829,21 +4846,32 @@ fn rd_to_markdown(s: &str, depth: u32) -> String {
             j += 1;
         }
         let cmd = &s[name_start..j];
-        if j < b.len() && b[j] == b'{' {
-            let start = j + 1;
-            let mut depth_b = 1i32;
-            let mut k = start;
-            while k < b.len() && depth_b > 0 {
-                match b[k] {
-                    b'{' if b[k - 1] != b'\\' => depth_b += 1,
-                    b'}' if b[k - 1] != b'\\' => depth_b -= 1,
-                    _ => {}
-                }
-                k += 1;
+        // The option of \link[pkg]{x} names where it points, not what it reads as.
+        let mut arg = j;
+        if cmd == "link" && arg < b.len() && b[arg] == b'[' {
+            if let Some(close) = s[arg..].find(']') {
+                arg += close + 1;
             }
-            let inner = if depth_b == 0 { &s[start..k - 1] } else { &s[start..] };
+        }
+        if arg < b.len() && b[arg] == b'{' {
+            let (inner, mut k) = rd_group(s, arg + 1);
             let rendered = rd_to_markdown(inner, depth + 1);
             match cmd {
+                // \href{url}{text} keeps both halves as a Markdown link.
+                "href" => {
+                    let mut text = String::new();
+                    if k < b.len() && b[k] == b'{' {
+                        let (t, after) = rd_group(s, k + 1);
+                        text = rd_to_markdown(t, depth + 1);
+                        k = after;
+                    }
+                    let url: String = rendered.split_whitespace().collect();
+                    if text.trim().is_empty() {
+                        out.push_str(&url);
+                    } else {
+                        out.push_str(&format!("[{}]({url})", text.trim()));
+                    }
+                }
                 "code" | "command" | "env" | "file" | "kbd" | "option" | "pkg" | "samp" => {
                     if !rendered.is_empty() {
                         out.push('`');

@@ -184,15 +184,14 @@ fn rd_news_walk(s: &str, lines: &mut Vec<String>, cur: &mut String) {
                 "item" => {
                     flush(lines, cur);
                     cur.push_str("- ");
-                    // \item{label}{text} inside \describe.
-                    if let Some((label, end)) = group_at(s, j) {
-                        cur.push_str(&label);
-                        cur.push_str(": ");
-                        if let Some((text, end2)) = group_at(s, end + 1) {
-                            cur.push_str(&text);
+                    // A braced \item{text} is the item's text; only \describe's \item{label}{text} has a second group.
+                    if let Some((first, end)) = group_at(s, j) {
+                        rd_news_walk(&first, lines, cur);
+                        i = end + 1;
+                        if let Some((text, end2)) = group_at(s, i) {
+                            cur.push_str(": ");
+                            rd_news_walk(&text, lines, cur);
                             i = end2 + 1;
-                        } else {
-                            i = end + 1;
                         }
                         continue;
                     }
@@ -329,6 +328,15 @@ mod tests {
         let named = "\\section{Changes in fixpkg version 0.1.2}{\\itemize{\\item A.}}\n\\section{Version 0.1.1}{\\itemize{\\item B.}}";
         assert_eq!(rd_section(named, "0.1.2").as_deref(), Some("- A."));
         assert_eq!(rd_section(named, "0.1.1").as_deref(), Some("- B."));
+        let braced = "\\section{Changes in version 2.0.0}{\\itemize{\n  \\item{Use \\file{a.bib}.}\n  \\item {Second.}\n  \\item {\\bold{New}}: third.\n}}";
+        assert_eq!(
+            rd_section(braced, "2.0.0").as_deref(),
+            Some("- Use `a.bib`.\n- Second.\n- **New**: third.")
+        );
+        let described = "\\section{Changes in version 3.0.0}{\\describe{\n  \\item{\\code{f()}}{Now faster.}\n  \\item{Label}{Text.}\n}}";
+        assert_eq!(rd_section(described, "3.0.0").as_deref(), Some("- `f()`: Now faster.\n- Label: Text."));
+        let linked = "\\section{Changes in version 4.0.0}{\\itemize{\\item See \\href{https://example.org/x}{the site} and \\link[stats]{lm}.}}";
+        assert_eq!(rd_section(linked, "4.0.0").as_deref(), Some("- See [the site](https://example.org/x) and lm."));
     }
 
     #[test]
@@ -343,12 +351,14 @@ mod tests {
 
     #[test]
     fn notes_are_cut_at_a_character_boundary_and_flagged() {
-        let long = format!("# pkg 1.0\n{}", "é".repeat(RELEASE_NOTES_CAP));
+        // The leading byte puts the cap inside a two-byte character, so the cut backs off one byte.
+        let long = format!("# pkg 1.0\na{}", "é".repeat(RELEASE_NOTES_CAP));
         let n = release_notes("NEWS.md", &long, "1.0", "pkg").unwrap();
         assert!(n.truncated);
-        assert!(n.text.len() <= RELEASE_NOTES_CAP);
+        assert_eq!(n.text.len(), RELEASE_NOTES_CAP - 1);
         assert_eq!(n.source, "news_md");
         assert_eq!(cap_utf8("abc", 3), ("abc".to_string(), false));
+        assert_eq!(cap_utf8("aé", 2), ("a".to_string(), true));
     }
 
     #[test]
