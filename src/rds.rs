@@ -4798,6 +4798,11 @@ fn rd_plain(s: &str) -> String {
     collapsed.chars().take(300).collect()
 }
 
+/// Rd markup as one line of Markdown, with no length cap.
+pub(crate) fn rd_inline_text(s: &str) -> String {
+    rd_to_markdown(s, 0).split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 fn rd_to_markdown(s: &str, depth: u32) -> String {
     if depth > 8 {
         return String::new();

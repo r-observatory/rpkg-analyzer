@@ -67,3 +67,39 @@ fn a_news_file_the_build_leaves_out_is_not_in_the_release() {
     assert_eq!(s["has_readme"], false);
     assert_eq!(s["build_ignored"], serde_json::json!(["README.md", "NEWS.md"]));
 }
+
+#[test]
+fn the_section_for_the_analysed_version_is_its_own_record() {
+    let t = tree(&[
+        ("DESCRIPTION", DESC),
+        ("NEWS.md", "# fixpkg 1.0.0\n\n* Faster `f()`.\n\n# fixpkg 0.9.0\n\n* Old.\n"),
+    ]);
+    let recs = records(&t, "release");
+    let s = recs.iter().find(|r| r["rec"] == "summary").unwrap();
+    assert_eq!(s["release_notes_source"], "news_md");
+    assert!(s.get("release_notes").is_none(), "the text never rides the summary");
+    let n = recs.iter().find(|r| r["rec"] == "release_notes").expect("a release_notes record");
+    assert_eq!(n["package_version"], "1.0.0");
+    assert_eq!(n["news_file"], "NEWS.md");
+    assert_eq!(n["release_notes"], "* Faster `f()`.");
+    assert_eq!(n["release_notes_truncated"], false);
+
+    let other = tree(&[("DESCRIPTION", DESC), ("NEWS.md", "# fixpkg 0.9.0\n\n* Old.\n")]);
+    let recs = records(&other, "release");
+    assert_eq!(recs.iter().find(|r| r["rec"] == "summary").unwrap()["release_notes_source"], Value::Null);
+    assert!(recs.iter().all(|r| r["rec"] != "release_notes"), "no record without a section");
+}
+
+#[test]
+fn a_description_that_is_not_utf8_gives_no_release_notes() {
+    // Its Version cannot be read, so no NEWS section can be the analysed one.
+    let t = tree_bytes(&[
+        ("DESCRIPTION", b"Package: fixpkg\nVersion: 1.0.0\nAuthor: J\xfcrgen M\xfcller\n"),
+        ("NEWS.md", b"# fixpkg (development version)\n\n* Unreleased.\n\n# fixpkg 1.0.0\n\n* Fixed.\n"),
+    ]);
+    let recs = records(&t, "release");
+    let s = recs.iter().find(|r| r["rec"] == "summary").unwrap();
+    assert_eq!(s["news_file"], "NEWS.md");
+    assert_eq!(s["release_notes_source"], Value::Null);
+    assert!(recs.iter().all(|r| r["rec"] != "release_notes"));
+}

@@ -794,6 +794,32 @@ fn rd_brace_content(text: &str, after_open: usize) -> Option<(String, usize)> {
     None
 }
 
+/// Text with Rd `%` comments removed; an escaped `\%` stays.
+fn strip_rd_comments(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for line in text.split_inclusive('\n') {
+        let b = line.as_bytes();
+        let mut cut = line.len();
+        let mut j = 0;
+        while j < b.len() {
+            if b[j] == b'\\' {
+                j += 2;
+                continue;
+            }
+            if b[j] == b'%' {
+                cut = j;
+                break;
+            }
+            j += 1;
+        }
+        out.push_str(&line[..cut]);
+        if cut < line.len() && line.ends_with('\n') {
+            out.push('\n');
+        }
+    }
+    out
+}
+
 /// First \cmd{...} block in text. Port of docs.R's `.fb`.
 fn rd_first_block(text: &str, cmd: &str) -> Option<(String, usize)> {
     let pat = format!(r"\\{}\s*\{{", regex::escape(cmd));
@@ -3267,6 +3293,10 @@ fn main() {
     let n_fns_r = fn_stats.len();
     let n_fns_r_exported = fn_stats.iter().filter(|f| f.exported).count();
     let news_file = news::news_file(&files);
+    let release_notes = news_file.and_then(|p| {
+        let text = read_lossy(&root, p)?;
+        news::release_notes(p, &text, &version, &package)
+    });
     let ex = metrics_extra(&desc, &root, &files, news_file);
     let (net, r_edges) = metrics_network(&fn_stats);
     let ws = metrics_whitespace(&root, &files);
@@ -3437,6 +3467,7 @@ fn main() {
         "news_present": docs.news_present,
         "news_structure_quality": docs.news_structure_quality,
         "news_file": news_file,
+        "release_notes_source": release_notes.as_ref().map(|n| n.source),
         "changelog_file": news::changelog_file(&files),
         "on_exit_coverage_rate": health.on_exit_coverage_rate,
         "global_state_write_density": health.global_state_write_density,
@@ -3625,6 +3656,16 @@ fn main() {
     println!("{summary}");
     // Detail records describe release contents, which an unknown file list cannot give.
     if content_known {
+        if let (Some(p), Some(n)) = (news_file, &release_notes) {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "rec": "release_notes", "package_version": version, "news_file": p,
+                    "release_notes_source": n.source, "release_notes": n.text,
+                    "release_notes_truncated": n.truncated,
+                })
+            );
+        }
         for d in &deps {
             println!("{}", serde_json::json!({"rec": "dependency", "package": d}));
         }
