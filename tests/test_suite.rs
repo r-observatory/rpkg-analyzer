@@ -58,6 +58,25 @@ fn tinytest_counts_expectations_and_a_testthat_helper_names_no_framework() {
         ("tests/testthat/test-a.R", "test_that(\"a\", expect_true(TRUE))\n"),
     ]);
     assert_eq!(summary(&helper, "release")["test_frameworks_used"], json!(["testthat"]));
+
+    // Helper and setup files alone are support code, not a testthat suite.
+    let helper_only = tree(&[
+        ("DESCRIPTION", TT_DESC),
+        ("tests/testthat/helper-x.R", "make_fixture <- function() 1\n"),
+    ]);
+    let s = summary(&helper_only, "release");
+    assert_eq!(s["test_frameworks_used"], json!([]));
+    assert_eq!(s["test_framework_primary"], Value::Null, "files but no framework is undetermined");
+    let runner_and_setup = tree(&[
+        ("DESCRIPTION", TT_DESC),
+        ("tests/testthat.R", "test_check(\"fixpkg\")\n"),
+        ("tests/testthat/setup-x.R", "options(fixpkg.quiet = TRUE)\n"),
+    ]);
+    let s = summary(&runner_and_setup, "release");
+    assert_eq!(s["test_frameworks_used"], json!(["scripts"]));
+    assert_eq!(s["test_framework_primary"], "scripts");
+    assert_eq!(s["test_unit"], "script_file");
+    assert_eq!(s["n_test_units"], 1);
 }
 
 #[test]

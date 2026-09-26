@@ -73,11 +73,12 @@ contents. For these columns 0 means "not in this release", and NULL means the an
 not tell: the file could not be parsed, or on `git` input the `.Rbuildignore` exists and could
 not be read. In that last case every release-content column is NULL and only the `dcf` record
 follows the summary. A few detail columns are NULL when their parent says there is nothing to
-describe: `news_file` and `release_notes_source` (parent `news_present`), `changelog_file`,
-the `citation_*` columns (parent `has_citation`), the `rd_example_pages_*` breakdowns (parent
+describe: `news_file` and `release_notes_source` (parent `news_present`), the `citation_*`
+columns (parent `has_citation`), the `rd_example_pages_*` breakdowns (parent
 `rd_example_pages`), `examples_coverage_fn` and its basis (an empty denominator), `n_test_units`,
 `test_unit`, `n_test_blocks`, `n_test_blocks_cran_skipped` and `tests_gated_not_cran` (parent
-`test_framework_primary`), and `vignette_eval_gated` (parent `has_vignettes`).
+`test_framework_primary`), and `vignette_eval_gated` (parent `has_vignettes`). `changelog_file`
+has no parent: NULL means the release has no ChangeLog, CHANGELOG or CHANGES file.
 
 Repository-only columns are `ci_present`, `ci_type`, `ci_matrix_breadth`, `ci_pr_gated`,
 `has_pkgdown`, `has_code_of_conduct` and `has_contributing_guide`. On `git` input they read the
@@ -250,8 +251,10 @@ and its `_exported_` and `_internal_` splits; `npars_exported_mean/median`;
 
 `n_fns_src` (total) with `n_fns_c`, `n_fns_cpp`, `n_fns_fortran`, `n_fns_rust`,
 and `n_fns_per_file_src`. Counted with tree-sitter grammars for each language.
-Rust sources under `src/` count toward `has_src`, `loc_src` and `lang_breakdown`; vendored
-crates (`src/rust/vendor*/`) and cargo output (`target/` under `src/`) do not.
+
+From 0.5.0 Rust sources (`.rs` under `src/`) count as compiled code. Besides `n_fns_rust`, `rnet_*` and the Rust `function` and `call_edge` records, which already read them, they now count toward `has_src`, `loc_src`, `loc_total`, `compiled_share` and `lang_breakdown` (which gains `rs`), the source scan behind `uses_openmp` (`#pragma omp` or `_OPENMP`), and the registration-table scan behind `n_native_edges`, `n_native_targets` and `native_resolution_rate`.
+
+Vendored crates (`src/rust/vendor*/`) and cargo output (`target/` under `src/`) are not the package's own code. Files under them, in any language, are left out of `has_src`, `loc_src`, `loc_total`, `compiled_share`, `lang_breakdown`, `uses_openmp`, the registration-table scan, `n_fns_src`, `n_fns_per_file_src` and every per-language count (`n_fns_c`, `n_fns_cpp`, `n_fns_fortran`, `n_fns_rust`). Vendored Rust is also left out of `rnet_*` and the Rust `function` and `call_edge` records, while `cnet_*`, `fnet_*` and their records still read vendored C, C++ and Fortran. `files_src`, `blank_lines_src`, `comment_lines_src`, `rel_space_src`, `all_languages` and `language_categories` count every file as before, vendored ones included.
 
 ### Object systems
 
@@ -360,6 +363,8 @@ examples; with no plain export it uses pages that are not internal and do not do
 the package, a class or methods, and `examples_coverage_fn_basis` says which (`exports`,
 `not_internal`).
 
+The older help-page columns read the same page set from 0.5.0, so each now counts lowercase `.rd` pages and leaves out `man/macros`: `examples_coverage`, `help_pages_with_examples`, `dontrun_example_ratio`, `references_coverage`, `value_doc_rate`, `undocumented_params_rate`, `roxygen_doc_coverage`, `doclines_per_fn_mean` and `doclines_per_fn_median`. Apart from the page set, `examples_coverage` and `dontrun_example_ratio` keep their earlier rules. `examples_coverage_fn` and the `rd_example_pages_*` counts supersede them; both are kept for rows written before 0.5.0 and will be removed in a later release.
+
 ### Citation file and references
 
 `has_citation` is `inst/CITATION` in the release. The file is decoded as UTF-8, or Latin-1 when
@@ -378,9 +383,10 @@ DOIs are no venue). An empty DOI list claims "no DOI" only on `literal` and `met
 README.txt, in any case, and `readme_prose_length` reads the first one found. `news_file` is
 the first of inst/NEWS.Rd, NEWS.md, inst/NEWS.md, NEWS and inst/NEWS in the release, the order
 R's readers use; `news_present`, `news_up_to_date` and `news_structure_quality` read it (the
-last is NULL for NEWS.Rd). `changelog_file` is ChangeLog, CHANGELOG or CHANGES.
-`release_notes_source` says which reader found a section for the analysed version, whose text
-is the `release_notes` record.
+last is NULL for NEWS.Rd). `changelog_file` is the first of ChangeLog, CHANGELOG and CHANGES
+at the root of the release; it has no parent column, and NULL means the release has none of
+them. `release_notes_source` says which reader found a section for the analysed version, whose
+text is the `release_notes` record.
 
 A vignette source sits directly under `vignettes/`: `.Rnw` and `.Snw` count on their own, other
 engines only with `\VignetteEngine{` in the text. `has_vignettes` and `num_vignettes` count them.

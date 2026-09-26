@@ -72,7 +72,8 @@ pub fn test_suite(root: &Path, files: &[String], suggests: &[String]) -> TestSui
 
     // Pushed in the tie-break order: testthat, tinytest, RUnit, testit, unitizer, scripts.
     let mut used: Vec<&'static str> = Vec::new();
-    if files.iter().any(|f| f.starts_with("tests/testthat/")) {
+    // Helper and setup files alone are support code, not a testthat suite.
+    if files.iter().any(|f| f.starts_with("tests/testthat/") && !HELPER.is_match(f)) {
         used.push("testthat");
     }
     if files.iter().any(|f| f.starts_with("inst/tinytest/") || f == "tests/tinytest.R") || !tinytest.is_empty() {
