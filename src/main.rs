@@ -297,11 +297,11 @@ fn legal_tokenize(lic: &str) -> Vec<String> {
         .collect()
 }
 
-/// A value CRAN's template leaves unfilled: blank, <...>, YEAR, COPYRIGHT HOLDER or "your name".
+/// A value CRAN's template leaves unfilled: blank, a bare <...>, YEAR, COPYRIGHT HOLDER or "your name".
 fn is_license_placeholder(v: &str) -> bool {
     let v = v.trim();
     v.is_empty()
-        || (v.starts_with('<') && v.ends_with('>'))
+        || (v.starts_with('<') && v.ends_with('>') && !v[1..v.len() - 1].contains('>'))
         || v.eq_ignore_ascii_case("YEAR")
         || v.eq_ignore_ascii_case("COPYRIGHT HOLDER")
         || v.to_lowercase().contains("your name")
@@ -309,8 +309,10 @@ fn is_license_placeholder(v: &str) -> bool {
 
 /// A filled MIT/BSD template (both lines, real values), or a full license text (neither line).
 fn license_template_complete(content: &str) -> bool {
-    let year_re = regex::Regex::new(r"(?m)^\s*YEAR:\s*(.*)$").unwrap();
-    let holder_re = regex::Regex::new(r"(?m)^\s*COPYRIGHT HOLDER:\s*(.*)$").unwrap();
+    let content = content.strip_prefix('\u{feff}').unwrap_or(content);
+    // Only spaces and tabs after the colon, so an empty value never takes the next line.
+    let year_re = regex::Regex::new(r"(?m)^\s*YEAR:[ \t]*(.*)$").unwrap();
+    let holder_re = regex::Regex::new(r"(?m)^\s*COPYRIGHT HOLDER:[ \t]*(.*)$").unwrap();
     let year = year_re.captures(content).map(|c| c[1].to_string());
     let holder = holder_re.captures(content).map(|c| c[1].to_string());
     match (year, holder) {
@@ -3810,6 +3812,74 @@ mod tests {
         assert!(!license_template_complete("YEAR: 2024\nCOPYRIGHT HOLDER:\n"));
         assert!(!license_template_complete("YEAR: 2024\n"), "one line alone is not complete");
         assert!(!license_template_complete("  \n"));
+    }
+
+    // R 4.6.1's share/licenses/MIT byte for byte, as a package would copy it unfilled.
+    const R_MIT_TEMPLATE: &str = concat!(
+        "Based on <http://opensource.org/licenses/MIT>\n",
+        "\n",
+        "This is a template.  Provide completed entries of the form\n",
+        "\n",
+        "YEAR:\n",
+        "COPYRIGHT HOLDER: \n",
+        "\n",
+        "(separated by empty lines) as file LICENSE, and specify\n",
+        "\n",
+        "License: MIT + file LICENSE\n",
+        "\n",
+        "in file DESCRIPTION.\n",
+        "\n",
+        "************************************************************************\n",
+        "\n",
+        "Copyright (c) <YEAR>, <COPYRIGHT HOLDER>\n",
+        "\n",
+        "Permission is hereby granted, free of charge, to any person obtaining\n",
+        "a copy of this software and associated documentation files (the\n",
+        "\"Software\"), to deal in the Software without restriction, including\n",
+        "without limitation the rights to use, copy, modify, merge, publish,\n",
+        "distribute, sublicense, and/or sell copies of the Software, and to\n",
+        "permit persons to whom the Software is furnished to do so, subject to\n",
+        "the following conditions:\n",
+        "\n",
+        "The above copyright notice and this permission notice shall be\n",
+        "included in all copies or substantial portions of the Software.\n",
+        "\n",
+        "THE SOFTWARE IS PROVIDED \"AS IS\", WITHOUT WARRANTY OF ANY KIND,\n",
+        "EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF\n",
+        "MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND\n",
+        "NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE\n",
+        "LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION\n",
+        "OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION\n",
+        "WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.\n",
+    );
+
+    #[test]
+    fn an_empty_value_does_not_take_the_next_line() {
+        assert!(!license_template_complete("YEAR:\nCOPYRIGHT HOLDER: Ann Lee\n"));
+        assert!(!license_template_complete("YEAR:\r\nCOPYRIGHT HOLDER: Ann Lee\r\n"));
+        assert!(!license_template_complete("YEAR: 2024\nCOPYRIGHT HOLDER: \n\n(separated by empty lines) as file LICENSE\n"));
+        assert!(!license_template_complete("YEAR:\nCOPYRIGHT HOLDER: \nORGANIZATION:\n\n(separated by empty lines)\n"));
+        assert!(!license_template_complete(R_MIT_TEMPLATE), "an unfilled copy of R's template");
+        assert!(license_template_complete("YEAR:\t2024\nCOPYRIGHT HOLDER:\tAnn Lee\n"));
+        assert!(license_template_complete("  YEAR: 2024\n  COPYRIGHT HOLDER: Ann Lee\n"));
+    }
+
+    #[test]
+    fn only_a_whole_bracketed_value_is_a_placeholder() {
+        assert!(!is_license_placeholder("<Ann Lee> <ann@x.org>"));
+        assert!(license_template_complete("YEAR: 2024\nCOPYRIGHT HOLDER: <Ann Lee> <ann@x.org>\n"));
+        assert!(is_license_placeholder("<Your Name>"));
+        assert!(is_license_placeholder("<>"));
+        assert!(is_license_placeholder("<<name>"));
+        assert!(!is_license_placeholder("<"));
+    }
+
+    #[test]
+    fn a_byte_order_mark_does_not_hide_the_year_line() {
+        assert!(license_template_complete("\u{feff}YEAR: 2024\nCOPYRIGHT HOLDER: Ann Lee\n"));
+        assert!(license_template_complete("\u{feff}YEAR: 2024\r\nCOPYRIGHT HOLDER: Ann Lee\r\n"));
+        assert!(!license_template_complete("\u{feff}YEAR: <year>\nCOPYRIGHT HOLDER: Ann Lee\n"));
+        assert!(!license_template_complete("\u{feff}\n"), "a mark alone is an empty file");
     }
 
     fn version_parts(v: &str) -> Vec<u64> {

@@ -15,6 +15,8 @@ fn a_filled_template_reads_complete() {
     assert_eq!(summary(&t, "release")["license_file_completeness"], true);
     let licence = pkg("BSD_3_clause + file LICENCE", &[("LICENCE", "YEAR: 2024\nCOPYRIGHT HOLDER: Ann Lee\n")]);
     assert_eq!(summary(&licence, "release")["license_file_completeness"], true);
+    let marked = pkg("MIT + file LICENSE", &[("LICENSE", "\u{feff}YEAR: 2024\r\nCOPYRIGHT HOLDER: <Ann Lee> <ann@x.org>\r\n")]);
+    assert_eq!(summary(&marked, "release")["license_file_completeness"], true);
 }
 
 #[test]
@@ -22,6 +24,8 @@ fn placeholders_one_line_and_missing_files_read_incomplete() {
     for (license, files) in [
         ("MIT + file LICENSE", vec![("LICENSE", "YEAR: <year>\nCOPYRIGHT HOLDER: <name>\n")]),
         ("MIT + file LICENSE", vec![("LICENSE", "COPYRIGHT HOLDER: Ann Lee\n")]),
+        ("MIT + file LICENSE", vec![("LICENSE", "YEAR:\nCOPYRIGHT HOLDER: Ann Lee\n")]),
+        ("MIT + file LICENSE", vec![("LICENSE", "YEAR:\nCOPYRIGHT HOLDER: \n\n(separated by empty lines) as file LICENSE, and specify\n")]),
         ("MIT + file LICENSE", vec![("LICENSE.md", "MIT License\n")]),
         ("MIT + file LICENSE", vec![]),
     ] {
