@@ -225,6 +225,74 @@ pub fn filter_release(tree_files: &[String], rbi: &RbuildignoreText, package: &s
     ReleaseList::Filtered(BuildFilter { kept, excluded_files, excluded_dirs, bad_lines: lines.map(|_| bad) })
 }
 
+/// Release item names: the 15 vcs-signals reports in rbuildignore_excluded, then four
+/// only the analyzer can see. Output keeps this order.
+pub const RELEASE_ITEMS: [&str; 19] = [
+    "README.md",
+    "README.Rmd",
+    "README.qmd",
+    "NEWS.md",
+    "NEWS",
+    "tests",
+    "vignettes",
+    "vignettes/articles",
+    "_pkgdown.yml",
+    "pkgdown",
+    "docs",
+    "CODE_OF_CONDUCT.md",
+    "CONTRIBUTING.md",
+    "data-raw",
+    ".github",
+    "inst/NEWS.Rd",
+    "inst/CITATION",
+    "inst/REFERENCES.bib",
+    "man",
+];
+
+/// The release items present in the tree that the build leaves out.
+pub fn build_ignored_items(tree_files: &[String], filter: &BuildFilter, tree_vignette_sources: &[String]) -> Vec<String> {
+    use crate::repo_practices::{COC_FILES, CONTRIBUTING_FILES, PKGDOWN_CONFIG_PATHS};
+    let excluded = |f: &str| filter.excluded_files.contains(f);
+    let file_left_out = |f: &str| tree_files.iter().any(|t| t == f) && excluded(f);
+    let inside = |dir: &str| -> Vec<&String> {
+        let prefix = format!("{dir}/");
+        tree_files.iter().filter(|f| f.starts_with(&prefix)).collect()
+    };
+    let dir_or_parent_excluded = |dir: &str| {
+        let mut p = dir;
+        loop {
+            if filter.excluded_dirs.contains(p) {
+                return true;
+            }
+            match p.rsplit_once('/') {
+                Some((parent, _)) => p = parent,
+                None => return false,
+            }
+        }
+    };
+    let dir_left_out = |dir: &str| {
+        let files = inside(dir);
+        !files.is_empty() && (dir_or_parent_excluded(dir) || files.iter().all(|f| excluded(f)))
+    };
+    RELEASE_ITEMS
+        .iter()
+        .filter(|item| match **item {
+            "_pkgdown.yml" => PKGDOWN_CONFIG_PATHS.iter().any(|p| file_left_out(p)),
+            "CODE_OF_CONDUCT.md" => COC_FILES.iter().any(|p| file_left_out(p)),
+            "CONTRIBUTING.md" => CONTRIBUTING_FILES.iter().any(|p| file_left_out(p)),
+            // An auxiliary file such as a .bib may survive; the sources are what count.
+            "vignettes" => {
+                !inside("vignettes").is_empty()
+                    && (dir_or_parent_excluded("vignettes")
+                        || (!tree_vignette_sources.is_empty() && tree_vignette_sources.iter().all(|f| excluded(f))))
+            }
+            "tests" | "vignettes/articles" | "pkgdown" | "docs" | "data-raw" | ".github" | "man" => dir_left_out(item),
+            f => file_left_out(f),
+        })
+        .map(|s| s.to_string())
+        .collect()
+}
+
 /// Summary keys that keep their value when the release file list is unknown.
 pub const KEPT_WHEN_UNKNOWN: [&str; 12] = [
     "rec",
@@ -315,6 +383,29 @@ mod tests {
             filter_release(&files(&["R/a.R"]), &RbuildignoreText::Unreadable, "fixpkg"),
             ReleaseList::Unknown
         ));
+    }
+
+    #[test]
+    fn left_out_items_fold_into_the_shared_names() {
+        let tree = files(&[
+            "README.md", "_pkgdown.yaml", "pkgdown/_pkgdown.yml", "pkgdown/extra.css", "CONDUCT.md",
+            ".github/CONTRIBUTING.md", "vignettes/a.Rmd", "vignettes/refs.bib", "vignettes/articles/b.Rmd",
+            "inst/CITATION", "tests/testthat.R",
+        ]);
+        let f = match filter_release(
+            &tree,
+            &RbuildignoreText::Text("^README\\.md$\n^_pkgdown\\.yaml$\n^pkgdown$\n^CONDUCT\\.md$\n^\\.github$\n^vignettes/.*\\.Rmd$\n".into()),
+            "fixpkg",
+        ) {
+            ReleaseList::Filtered(f) => f,
+            _ => panic!("expected a filtered list"),
+        };
+        let sources = files(&["vignettes/a.Rmd"]);
+        assert_eq!(
+            build_ignored_items(&tree, &f, &sources),
+            vec!["README.md", "vignettes", "vignettes/articles", "_pkgdown.yml", "pkgdown", "CODE_OF_CONDUCT.md", ".github"],
+            "vignettes is reported although refs.bib survives; inst/CITATION and tests stay in"
+        );
     }
 
     #[test]

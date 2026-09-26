@@ -3607,6 +3607,14 @@ fn main() {
         "imports_whole": ns.imports_whole,
         "use_dyn_lib": ns.use_dyn_lib,
         "build_ignore_bad_lines": release.bad_lines(),
+        "build_ignored": match &release {
+            release_files::ReleaseList::Filtered(f) => Some(release_files::build_ignored_items(
+                &tree_files,
+                f,
+                &vignettes::vignette_sources(&root, &tree_files),
+            )),
+            _ => None,
+        },
     });
     if !content_known {
         release_files::null_release_content(&mut summary);

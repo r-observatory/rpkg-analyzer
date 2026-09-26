@@ -127,3 +127,21 @@ fn a_wholly_left_out_extdata_is_absent_on_git_and_present_on_release() {
     ]);
     assert_eq!(summary(&deep, "git")["extdata"]["files"], 0);
 }
+
+#[test]
+fn build_ignored_names_the_left_out_items_on_git_input_only() {
+    let t = tree(&[
+        ("DESCRIPTION", DESC),
+        ("README.Rmd", "x\n"),
+        ("README.md", "x\n"),
+        ("NEWS.md", "# fixpkg 1.0.0\n"),
+        ("inst/NEWS.Rd", "\\name{NEWS}\n"),
+        ("man/f.Rd", "\\name{f}\n"),
+        ("data-raw/make.R", "1\n"),
+        (".Rbuildignore", "^README\\.Rmd$\n^data-raw$\n^inst/NEWS\\.Rd$\n"),
+    ]);
+    assert_eq!(summary(&t, "git")["build_ignored"], serde_json::json!(["README.Rmd", "data-raw", "inst/NEWS.Rd"]));
+    assert_eq!(summary(&t, "release")["build_ignored"], Value::Null);
+    let none = tree(&[("DESCRIPTION", DESC)]);
+    assert_eq!(summary(&none, "git")["build_ignored"], serde_json::json!([]));
+}
