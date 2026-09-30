@@ -46,6 +46,8 @@ The `function` records are the graph's nodes (R and compiled alike, tagged by
 full labeled call graph can be reconstructed and stored or drawn. The summary
 carries only the aggregate network stats.
 
+From 0.5.1 the `call_edge` records of each graph come out in node order: by the position of `from` among that graph's `function` records, then of `to` (the `native` graph, whose ends sit in two graphs, in name order). So two runs over one tree print the same bytes, and the betweenness figures no longer move in their last digit between runs.
+
 These are not five separate graphs but one cross-language graph. The `native`
 edges go from an R function to the compiled function it invokes, bridging the R
 call graph to the C/C++/Rust/Fortran ones. To unite them, tag each node by the

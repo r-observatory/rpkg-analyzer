@@ -2498,13 +2498,16 @@ fn metrics_native_graph(root: &Path, files: &[String], fns: &[FnStat]) -> Native
             }
         }
     }
+    // Sorted, so the native edge records come out in one order on every run.
+    let mut edges: Vec<(String, String)> = edge_pairs.into_iter().collect();
+    edges.sort_unstable();
     NativeGraph {
         n_native_call_sites,
-        n_native_edges: edge_pairs.len() as i64,
+        n_native_edges: edges.len() as i64,
         n_native_targets: targets.len() as i64,
         native_resolution_rate: (n_native_call_sites > 0)
             .then(|| resolved as f64 / n_native_call_sites as f64),
-        edges: edge_pairs.into_iter().collect(),
+        edges,
     }
 }
 
@@ -3013,7 +3016,9 @@ fn graph_from_calls(
             }
         }
     }
-    let edges: Vec<(usize, usize)> = edge_set.into_iter().collect();
+    // Node order, so the edge records and the betweenness sums never depend on a hash seed.
+    let mut edges: Vec<(usize, usize)> = edge_set.into_iter().collect();
+    edges.sort_unstable();
     let named: Vec<(String, String)> =
         edges.iter().map(|&(a, b)| (names[a].clone(), names[b].clone())).collect();
     (graph_stats(names.len(), &edges), named)
@@ -4166,5 +4171,50 @@ mod tests {
             "ANALYZER_VERSION is {ANALYZER_VERSION}, at or below 0.4.0, the last release \
              under the old column contract"
         );
+    }
+
+    /// A hash set hands back its items in a new order on every instance, so the
+    /// edges are sorted before anything reads them.
+    #[test]
+    fn a_graph_comes_out_the_same_every_time() {
+        let names: Vec<String> = (0..60).map(|i| format!("f{i:02}")).collect();
+        let calls: Vec<Vec<String>> = (0..60)
+            .map(|i| (0..60).filter(|j| (i * 7 + j * 3) % 4 == 0).map(|j| format!("f{j:02}")).collect())
+            .collect();
+        let (net, edges) = graph_from_calls(&names, &calls);
+        assert!(edges.len() > 500, "enough edges for a hash order to show: {}", edges.len());
+        let mut sorted = edges.clone();
+        sorted.sort();
+        assert_eq!(edges, sorted, "edges come out in node order");
+        let bits = |n: &Network| {
+            (
+                n.betweenness_mean.map(f64::to_bits),
+                n.betweenness_median.map(f64::to_bits),
+                n.betweenness_max.map(f64::to_bits),
+            )
+        };
+        for _ in 0..50 {
+            let (again, again_edges) = graph_from_calls(&names, &calls);
+            assert_eq!(again_edges, edges);
+            assert_eq!(bits(&again), bits(&net));
+        }
+    }
+
+    /// Repeated function names (R across two files, a C static helper) keep the
+    /// later definition, and the order still never moves.
+    #[test]
+    fn a_graph_with_repeated_names_comes_out_the_same_every_time() {
+        let names: Vec<String> = (0..40).map(|i| format!("g{:02}", i % 25)).collect();
+        let calls: Vec<Vec<String>> = (0..40)
+            .map(|i| (0..25).filter(|j| (i + j) % 3 == 0).map(|j| format!("g{j:02}")).collect())
+            .collect();
+        let (net, edges) = graph_from_calls(&names, &calls);
+        assert!(edges.len() > 200, "{} edges", edges.len());
+        for _ in 0..50 {
+            let (again, again_edges) = graph_from_calls(&names, &calls);
+            assert_eq!(again_edges, edges);
+            assert_eq!(again.betweenness_max.map(f64::to_bits), net.betweenness_max.map(f64::to_bits));
+            assert_eq!(again.betweenness_mean.map(f64::to_bits), net.betweenness_mean.map(f64::to_bits));
+        }
     }
 }
