@@ -22,6 +22,14 @@ directory is a built release (a CRAN tarball, or the github.com/cran mirror of o
 means it is a git branch that R CMD build has not filtered yet (a Bioconductor release branch).
 A missing flag, or any other value, exits with status 2, a usage line on stderr and no records.
 
+## Environment
+
+None of these changes a record. Each is read only in the analysis mode, and an older build ignores it.
+
+| Variable | Effect |
+|---|---|
+| `RPKG_ANALYZER_STATS=<file>` | After the last record, append one JSON line to the file: `build`, `ms` (the whole run), `ms_compiled`, `ms_r`, `ms_tests`, `ms_data`, `ms_other`, then `compiled`, `r`, `tests` and `data`, each `{"files": n, "hits": n}`, then `cache_errors` and `verify_mismatch`. Unset or empty writes nothing, and a file that cannot be written is ignored. |
+
 ## Output contract
 
 One `summary` record per run, followed by intermediate records:

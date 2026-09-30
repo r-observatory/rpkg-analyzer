@@ -3082,6 +3082,55 @@ fn graph_stats(n: usize, edges: &[(usize, usize)]) -> Network {
 /// data a newer build would describe differently.
 const ANALYZER_VERSION: &str = env!("CARGO_PKG_VERSION");
 
+/// Where one run's time went, for the line RPKG_ANALYZER_STATS asks for.
+#[derive(Default)]
+struct RunStats {
+    ms_compiled: f64,
+    ms_r: f64,
+    ms_tests: f64,
+    ms_data: f64,
+    files_compiled: u64,
+    files_r: u64,
+    files_tests: u64,
+    files_data: u64,
+    hits_compiled: u64,
+    cache_errors: u64,
+    verify_mismatch: u64,
+}
+
+/// Milliseconds since `t`, to the microsecond.
+fn ms_since(t: std::time::Instant) -> f64 {
+    (t.elapsed().as_secs_f64() * 1e6).round() / 1e3
+}
+
+/// Appends one JSON line to the file RPKG_ANALYZER_STATS names, after the records.
+/// Unset or empty writes nothing, and any error is ignored.
+fn write_run_stats(s: &RunStats, total_ms: f64) {
+    let Some(path) = std::env::var_os("RPKG_ANALYZER_STATS").filter(|p| !p.is_empty()) else {
+        return;
+    };
+    let other = total_ms - s.ms_compiled - s.ms_r - s.ms_tests - s.ms_data;
+    let line = serde_json::json!({
+        "build": ANALYZER_VERSION,
+        "ms": total_ms,
+        "ms_compiled": s.ms_compiled,
+        "ms_r": s.ms_r,
+        "ms_tests": s.ms_tests,
+        "ms_data": s.ms_data,
+        "ms_other": (other.max(0.0) * 1e3).round() / 1e3,
+        "compiled": {"files": s.files_compiled, "hits": s.hits_compiled},
+        "r": {"files": s.files_r, "hits": 0},
+        "tests": {"files": s.files_tests, "hits": 0},
+        "data": {"files": s.files_data, "hits": 0},
+        "cache_errors": s.cache_errors,
+        "verify_mismatch": s.verify_mismatch,
+    });
+    let appended = std::fs::OpenOptions::new().create(true).append(true).open(path);
+    if let Ok(mut f) = appended {
+        let _ = std::io::Write::write_all(&mut f, format!("{line}\n").as_bytes());
+    }
+}
+
 /// Debug output: the parse tree of one file, or a histogram of its node kinds.
 fn print_parse_tree(f: &str, histogram: bool) {
     let mut parser = Parser::new();
@@ -3171,6 +3220,8 @@ fn main() {
         cli::Mode::Explain { dir, kind } => return explain(&dir, kind),
         cli::Mode::Analyze { dir, kind } => (dir, kind),
     };
+    let t_run = std::time::Instant::now();
+    let mut stats = RunStats::default();
 
     let mut parser = Parser::new();
     parser
@@ -3421,11 +3472,14 @@ fn main() {
         .map(|t| parse_namespace(&t, &mut parser))
         .unwrap_or_default();
     let has_ns = exists(&files, "NAMESPACE");
+    let t_r = std::time::Instant::now();
     let funcs = metrics_functions(&root, &files, &ns, has_ns, &package);
 
     // AST-derived per-function stats + OO kinds (new v2 metrics).
     let (fn_stats, oo) = metrics_ast(&root, &files, &ns.exports, &mut parser);
     let nexpr = metrics_nexpr(&root, &files, &mut parser);
+    stats.ms_r += ms_since(t_r);
+    stats.files_r = find_files(&files, r"^R/.*\.[Rr]$").len() as u64;
     let fn_locs: Vec<i64> = fn_stats.iter().map(|f| f.loc as i64).collect();
     let fn_cyclos: Vec<i64> = fn_stats.iter().map(|f| f.cyclocomp).collect();
     let exp_params: Vec<i64> =
@@ -3438,13 +3492,19 @@ fn main() {
         news::release_notes(p, &text, &version, &package)
     });
     let ex = metrics_extra(&desc, &root, &files, news_file);
+    let t_net = std::time::Instant::now();
     let (net, r_edges) = metrics_network(&fn_stats);
+    stats.ms_r += ms_since(t_net);
     let ws = metrics_whitespace(&root, &files);
+    let t_src = std::time::Instant::now();
     let src_fns = count_src_functions(&root, &files);
     let ng = metrics_native_graph(&root, &files, &fn_stats);
     let (cnet, c_edges, c_nodes) = build_src_graph(&root, &files, SrcLang::CFamily);
     let (rnet, rust_edges, rust_nodes) = build_src_graph(&root, &files, SrcLang::Rust);
     let (fnet, fortran_edges, fortran_nodes) = build_src_graph(&root, &files, SrcLang::Fortran);
+    stats.ms_compiled += ms_since(t_src);
+    stats.files_compiled =
+        files.iter().filter(|f| f.starts_with("src/") && language_for_ext(f).is_some()).count() as u64;
 
     // Deprecated R functions: body calls .Deprecated/.Defunct or lifecycle::deprecate_*.
     let dep_calls = [".Deprecated", ".Defunct", "deprecate_soft", "deprecate_warn", "deprecate_stop"];
@@ -3492,8 +3552,11 @@ fn main() {
     // --- legal + portability + tests ---
     let legal = metrics_legal(&desc, &root, &files);
     let port = metrics_portability(&desc, &root, &files);
+    let t_tests = std::time::Instant::now();
     let tests = metrics_tests(&desc, &root, &files, &ns.exports);
     let suite = test_suite::test_suite(&root, &files, &dep_names(&get("Suggests")));
+    stats.ms_tests += ms_since(t_tests);
+    stats.files_tests = tf_test_files.len() as u64;
     let blocks = suite.blocks.as_ref();
     let docs = metrics_docs(&desc, &root, &files, &ns.exports, news_file);
     let rd = rd_pages::page_facts(&root, &files, &package);
@@ -3889,11 +3952,16 @@ fn main() {
 
     // Datasets under data/ and R/sysdata.rda, read from R serialization with no R
     // runtime.
+    let t_data = std::time::Instant::now();
     if content_known {
         for rec in rds::scan_package(&root, &excluded) {
             println!("{rec}");
         }
     }
+    stats.ms_data += ms_since(t_data);
+    stats.files_data = num_data_files as u64;
+    let _ = std::io::Write::flush(&mut std::io::stdout());
+    write_run_stats(&stats, ms_since(t_run));
 }
 
 // ---- tests ------------------------------------------------------------------
