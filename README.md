@@ -29,6 +29,8 @@ None of these changes a record. Each is read only in the analysis mode, and an o
 | Variable | Effect |
 |---|---|
 | `RPKG_ANALYZER_STATS=<file>` | After the last record, append one JSON line to the file: `build`, `ms` (the whole run), `ms_compiled`, `ms_r`, `ms_tests`, `ms_data`, `ms_other`, then `compiled`, `r`, `tests` and `data`, each `{"files": n, "hits": n}`, then `cache_errors` and `verify_mismatch`. Unset or empty writes nothing, and a file that cannot be written is ignored. |
+| `RPKG_ANALYZER_CACHE_DIR=<dir>` | Keep what each compiled file under `src/` yields (counts, names, call-graph nodes) in `<dir>/src/`, keyed by the file's bytes and extension, so a later run that meets the same bytes reads them instead of parsing. Files under 2,048 bytes skip it. An entry written by another build, or damaged, is a miss; a directory that cannot be read or written only misses. Unset or empty means no cache. |
+| `RPKG_ANALYZER_CACHE_VERIFY=1` | With a cache, parse on every hit as well, use the parsed result, and count each disagreement in `verify_mismatch`. |
 
 ## Output contract
 

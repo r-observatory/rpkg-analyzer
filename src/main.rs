@@ -10,6 +10,9 @@ use std::path::{Path, PathBuf};
 use tree_sitter::Parser;
 
 mod authors;
+#[cfg(test)]
+mod build_id;
+mod cache;
 mod citation;
 mod cli;
 mod news;
@@ -2680,7 +2683,7 @@ fn build_src_graph(
 }
 
 /// One compiled function definition, as the call graph needs it.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 struct SrcDef {
     name: String,
     line: usize,
@@ -2689,7 +2692,8 @@ struct SrcDef {
 }
 
 /// One parse of a compiled file, from its bytes and extension alone; consumers apply their path rules.
-#[derive(Debug, Clone, PartialEq, Default)]
+/// A change to it or to SrcDef bumps cache::CACHE_FORMAT.
+#[derive(Debug, Clone, PartialEq, Default, serde::Serialize, serde::Deserialize)]
 struct SrcFacts {
     parsed: bool,
     n_defs: i64,
@@ -2799,8 +2803,8 @@ struct SrcScan {
 }
 
 /// Parses each compiled file under src/ once. Counts skip vendored files, names take
-/// every file, and the Rust graph skips vendored Rust.
-fn scan_src(root: &Path, files: &[String]) -> SrcScan {
+/// every file, and the Rust graph skips vendored Rust. Facts for bytes seen before come from `cache`.
+fn scan_src(root: &Path, files: &[String], cache: &mut cache::Cache) -> SrcScan {
     let mut parser = Parser::new();
     let (mut c, mut cpp, mut fortran, mut rust, mut nf) = (0i64, 0i64, 0i64, 0i64, 0i64);
     let mut names = std::collections::HashSet::new();
@@ -2815,7 +2819,7 @@ fn scan_src(root: &Path, files: &[String]) -> SrcScan {
         taken += 1;
         let Some(content) = read(root, f) else { continue };
         let ext = f.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
-        let facts = src_facts(&mut parser, &ext, &content);
+        let facts = cache.get_or_compute("src", &ext, content.as_bytes(), || src_facts(&mut parser, &ext, &content));
         drop(content);
         if !facts.parsed {
             continue;
@@ -3686,7 +3690,8 @@ fn main() {
     stats.ms_r += ms_since(t_net);
     let ws = metrics_whitespace(&root, &files);
     let t_src = std::time::Instant::now();
-    let scan = scan_src(&root, &files);
+    let mut src_cache = cache::Cache::from_env();
+    let scan = scan_src(&root, &files, &mut src_cache);
     let src_fns = scan.fns;
     let ng = metrics_native_graph(&root, &files, &fn_stats, &scan.names);
     let (cnet, c_edges, c_nodes) = scan.c_family.graph();
@@ -3694,6 +3699,9 @@ fn main() {
     let (fnet, fortran_edges, fortran_nodes) = scan.fortran.graph();
     stats.ms_compiled += ms_since(t_src);
     stats.files_compiled = scan.files;
+    stats.hits_compiled = src_cache.stats.hits;
+    stats.cache_errors = src_cache.stats.errors;
+    stats.verify_mismatch = src_cache.stats.verify_mismatch;
 
     // Deprecated R functions: body calls .Deprecated/.Defunct or lifecycle::deprecate_*.
     let dep_calls = [".Deprecated", ".Defunct", "deprecate_soft", "deprecate_warn", "deprecate_stop"];
@@ -4523,7 +4531,7 @@ mod tests {
     /// scan_src against the three passes it replaced, field for field.
     fn assert_scan_matches_the_old_passes(root: &Path) {
         let files = list_files(root);
-        let scan = scan_src(root, &files);
+        let scan = scan_src(root, &files, &mut cache::Cache::new(None, false));
         assert_eq!(scan.fns, count_src_functions(root, &files), "counts");
         assert_eq!(scan.names, collect_src_function_names(root, &files), "names");
         for (got, lang) in [
@@ -4545,7 +4553,7 @@ mod tests {
         let all: Vec<&(&'static str, Vec<u8>)> = pool.iter().collect();
         let root = write_src_tree(&all);
         let files = list_files(&root);
-        let scan = scan_src(&root, &files);
+        let scan = scan_src(&root, &files, &mut cache::Cache::new(None, false));
         assert!(scan.names.contains("vendored_c") && scan.names.contains("vendored_rs"), "names take vendored files");
         assert!(scan.fns.n_files >= 10, "the pool parses: {:?}", scan.fns);
         assert!(!scan.names.contains("latin"), "a non-UTF-8 file is skipped");
