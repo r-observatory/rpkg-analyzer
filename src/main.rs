@@ -2298,6 +2298,7 @@ fn count_kinds(node: tree_sitter::Node, kinds: &[&str]) -> i64 {
     n
 }
 
+#[derive(Debug, PartialEq)]
 struct SrcFns {
     total: i64,
     c: i64,
@@ -2307,7 +2308,8 @@ struct SrcFns {
     n_files: i64,
 }
 
-/// Function counts in src/ across C, C++, Fortran, and Rust.
+/// Function counts in src/ across C, C++, Fortran, and Rust. The oracle scan_src is tested against.
+#[cfg(test)]
 fn count_src_functions(root: &Path, files: &[String]) -> SrcFns {
     let mut parser = Parser::new();
     let (mut c, mut cpp, mut fortran, mut rust, mut nf) = (0i64, 0i64, 0i64, 0i64, 0i64);
@@ -2363,7 +2365,8 @@ fn c_fn_name(def: tree_sitter::Node, bytes: &[u8]) -> Option<String> {
     None
 }
 
-/// Names of every function defined in src/ (C, C++, Fortran, Rust).
+/// Names of every function defined in src/ (C, C++, Fortran, Rust). The oracle scan_src is tested against.
+#[cfg(test)]
 fn collect_src_function_names(root: &Path, files: &[String]) -> std::collections::HashSet<String> {
     let mut parser = Parser::new();
     let mut names = std::collections::HashSet::new();
@@ -2450,9 +2453,12 @@ struct NativeGraph {
     edges: Vec<(String, String)>,
 }
 
-fn metrics_native_graph(root: &Path, files: &[String], fns: &[FnStat]) -> NativeGraph {
-    let c_functions = collect_src_function_names(root, files);
-
+fn metrics_native_graph(
+    root: &Path,
+    files: &[String],
+    fns: &[FnStat],
+    c_functions: &std::collections::HashSet<String>,
+) -> NativeGraph {
     // Registration table: {"rname", (DL_FUNC) &cfunc, n} across the *MethodDef arrays.
     let reg_re =
         regex::Regex::new(r#"\{\s*"([^"]+)"\s*,\s*\(DL_FUNC\)\s*&?\s*(\w+)"#).unwrap();
@@ -2529,7 +2535,7 @@ fn callee_name(call: tree_sitter::Node, bytes: &[u8]) -> Option<String> {
     rightmost_ident(call.child_by_field_name("function")?, bytes)
 }
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq, Debug)]
 enum SrcLang {
     CFamily,
     Rust,
@@ -2581,6 +2587,7 @@ fn call_target(b: tree_sitter::Node, lang: SrcLang, bytes: &[u8]) -> Option<Stri
 }
 
 /// A compiled function node with metadata, mirroring the R `function` records.
+#[derive(Debug, PartialEq)]
 struct SrcFn {
     name: String,
     lang: &'static str,
@@ -2601,7 +2608,9 @@ fn lang_str_of(ext: &str) -> &'static str {
 
 /// Internal call graph for one compiled language: nodes are function definitions
 /// in src/, edges are calls between them. C and C++ are graphed together.
-/// Returns the stats, the edges, and the node records with metadata.
+/// Returns the stats, the edges, and the node records with metadata. The oracle
+/// scan_src is tested against.
+#[cfg(test)]
 fn build_src_graph(
     root: &Path,
     files: &[String],
@@ -2668,6 +2677,185 @@ fn build_src_graph(
     }
     let (net, edges) = graph_from_calls(&names, &calls);
     (net, edges, nodes)
+}
+
+/// One compiled function definition, as the call graph needs it.
+#[derive(Debug, Clone, PartialEq)]
+struct SrcDef {
+    name: String,
+    line: usize,
+    loc: usize,
+    callees: Vec<String>,
+}
+
+/// One parse of a compiled file, from its bytes and extension alone; consumers apply their path rules.
+#[derive(Debug, Clone, PartialEq, Default)]
+struct SrcFacts {
+    parsed: bool,
+    n_defs: i64,
+    names: Vec<String>,
+    defs: Vec<SrcDef>,
+}
+
+/// The call-graph language of a lowercased compiled-source extension.
+fn src_lang_of(ext: &str) -> Option<SrcLang> {
+    match ext {
+        "c" | "h" | "cc" | "cpp" | "cxx" | "hpp" | "hxx" => Some(SrcLang::CFamily),
+        "rs" => Some(SrcLang::Rust),
+        "f" | "f90" | "f95" | "f03" | "f08" => Some(SrcLang::Fortran),
+        _ => None,
+    }
+}
+
+/// The walks of count_src_functions, collect_src_function_names and build_src_graph, on one tree.
+fn src_facts(parser: &mut Parser, ext: &str, content: &str) -> SrcFacts {
+    let (Some(grammar), Some(lang)) = (language_for_ext(ext), src_lang_of(ext)) else {
+        return SrcFacts::default();
+    };
+    if parser.set_language(&grammar).is_err() {
+        return SrcFacts::default();
+    }
+    let Some(tree) = parser.parse(content, None) else { return SrcFacts::default() };
+    let bytes = content.as_bytes();
+    let root = tree.root_node();
+    // Counts, nested definitions included.
+    let kinds: &[&str] = match lang {
+        SrcLang::CFamily => &["function_definition"],
+        SrcLang::Fortran => &["function", "subroutine"],
+        SrcLang::Rust => &["function_item"],
+    };
+    let n_defs = count_kinds(root, kinds);
+    // Names, nested definitions included.
+    let mut names = Vec::new();
+    let mut st = vec![root];
+    while let Some(n) = st.pop() {
+        if is_def(n, lang) {
+            if let Some(nm) = def_name(n, lang, bytes) {
+                names.push(nm);
+            }
+        }
+        let mut c = n.walk();
+        for ch in n.children(&mut c) {
+            st.push(ch);
+        }
+    }
+    // Graph nodes: a nested definition folds into the one around it.
+    let mut defs = Vec::new();
+    let mut st = vec![root];
+    while let Some(n) = st.pop() {
+        if is_def(n, lang) {
+            if let Some(nm) = def_name(n, lang, bytes) {
+                let mut callees = Vec::new();
+                let mut bst = vec![n];
+                while let Some(b) = bst.pop() {
+                    if let Some(cn) = call_target(b, lang, bytes) {
+                        callees.push(cn);
+                    }
+                    let mut bc = b.walk();
+                    for ch in b.children(&mut bc) {
+                        bst.push(ch);
+                    }
+                }
+                defs.push(SrcDef {
+                    name: nm,
+                    line: n.start_position().row + 1,
+                    loc: n.end_position().row - n.start_position().row + 1,
+                    callees,
+                });
+            }
+            continue;
+        }
+        let mut c = n.walk();
+        for ch in n.children(&mut c) {
+            st.push(ch);
+        }
+    }
+    SrcFacts { parsed: true, n_defs, names, defs }
+}
+
+/// One language's call-graph input, in file order.
+#[derive(Default)]
+struct SrcGraphIn {
+    names: Vec<String>,
+    calls: Vec<Vec<String>>,
+    nodes: Vec<SrcFn>,
+}
+
+impl SrcGraphIn {
+    fn graph(self) -> (Network, Vec<(String, String)>, Vec<SrcFn>) {
+        let (net, edges) = graph_from_calls(&self.names, &self.calls);
+        (net, edges, self.nodes)
+    }
+}
+
+/// Everything the compiled-source metrics read, from one pass over src/.
+struct SrcScan {
+    fns: SrcFns,
+    names: std::collections::HashSet<String>,
+    c_family: SrcGraphIn,
+    rust: SrcGraphIn,
+    fortran: SrcGraphIn,
+    files: u64,
+}
+
+/// Parses each compiled file under src/ once. Counts skip vendored files, names take
+/// every file, and the Rust graph skips vendored Rust.
+fn scan_src(root: &Path, files: &[String]) -> SrcScan {
+    let mut parser = Parser::new();
+    let (mut c, mut cpp, mut fortran, mut rust, mut nf) = (0i64, 0i64, 0i64, 0i64, 0i64);
+    let mut names = std::collections::HashSet::new();
+    let mut c_family = SrcGraphIn::default();
+    let mut rust_g = SrcGraphIn::default();
+    let mut fortran_g = SrcGraphIn::default();
+    let mut taken = 0u64;
+    for f in files {
+        if !f.starts_with("src/") || language_for_ext(f).is_none() {
+            continue;
+        }
+        taken += 1;
+        let Some(content) = read(root, f) else { continue };
+        let ext = f.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
+        let facts = src_facts(&mut parser, &ext, &content);
+        drop(content);
+        if !facts.parsed {
+            continue;
+        }
+        let vendored = is_vendored_src(f);
+        if !vendored {
+            nf += 1;
+            match ext.as_str() {
+                "c" | "h" => c += facts.n_defs,
+                "cc" | "cpp" | "cxx" | "hpp" | "hxx" => cpp += facts.n_defs,
+                "f" | "f90" | "f95" | "f03" | "f08" => fortran += facts.n_defs,
+                "rs" => rust += facts.n_defs,
+                _ => {}
+            }
+        }
+        names.extend(facts.names);
+        let Some(lang) = src_lang_of(&ext) else { continue };
+        if lang == SrcLang::Rust && vendored {
+            continue;
+        }
+        let g = match lang {
+            SrcLang::CFamily => &mut c_family,
+            SrcLang::Rust => &mut rust_g,
+            SrcLang::Fortran => &mut fortran_g,
+        };
+        let lang_str = lang_str_of(&ext);
+        for d in facts.defs {
+            g.nodes.push(SrcFn { name: d.name.clone(), lang: lang_str, file: f.clone(), line: d.line, loc: d.loc });
+            g.names.push(d.name);
+            g.calls.push(d.callees);
+        }
+    }
+    SrcScan {
+        fns: SrcFns { total: c + cpp + fortran + rust, c, cpp, fortran, rust, n_files: nf },
+        names,
+        c_family,
+        rust: rust_g,
+        fortran: fortran_g,
+        files: taken,
+    }
 }
 
 fn metrics_ast(root: &Path, files: &[String], exports: &[String], parser: &mut Parser) -> (Vec<FnStat>, Oo) {
@@ -2923,6 +3111,7 @@ fn metrics_whitespace(root: &Path, files: &[String]) -> WhiteSpace {
 // directed edge A -> B means A's body calls B (B also a package function).
 // Metrics are our own definitions.
 
+#[derive(Debug, PartialEq)]
 struct Network {
     n_nodes: i64,
     n_edges: i64,
@@ -3497,14 +3686,14 @@ fn main() {
     stats.ms_r += ms_since(t_net);
     let ws = metrics_whitespace(&root, &files);
     let t_src = std::time::Instant::now();
-    let src_fns = count_src_functions(&root, &files);
-    let ng = metrics_native_graph(&root, &files, &fn_stats);
-    let (cnet, c_edges, c_nodes) = build_src_graph(&root, &files, SrcLang::CFamily);
-    let (rnet, rust_edges, rust_nodes) = build_src_graph(&root, &files, SrcLang::Rust);
-    let (fnet, fortran_edges, fortran_nodes) = build_src_graph(&root, &files, SrcLang::Fortran);
+    let scan = scan_src(&root, &files);
+    let src_fns = scan.fns;
+    let ng = metrics_native_graph(&root, &files, &fn_stats, &scan.names);
+    let (cnet, c_edges, c_nodes) = scan.c_family.graph();
+    let (rnet, rust_edges, rust_nodes) = scan.rust.graph();
+    let (fnet, fortran_edges, fortran_nodes) = scan.fortran.graph();
     stats.ms_compiled += ms_since(t_src);
-    stats.files_compiled =
-        files.iter().filter(|f| f.starts_with("src/") && language_for_ext(f).is_some()).count() as u64;
+    stats.files_compiled = scan.files;
 
     // Deprecated R functions: body calls .Deprecated/.Defunct or lifecycle::deprecate_*.
     let dep_calls = [".Deprecated", ".Defunct", "deprecate_soft", "deprecate_warn", "deprecate_stop"];
@@ -4283,6 +4472,99 @@ mod tests {
             assert_eq!(again_edges, edges);
             assert_eq!(again.betweenness_max.map(f64::to_bits), net.betweenness_max.map(f64::to_bits));
             assert_eq!(again.betweenness_mean.map(f64::to_bits), net.betweenness_mean.map(f64::to_bits));
+        }
+    }
+
+    /// Compiled files covering every rule the three old passes apply by path or
+    /// by extension, and the parse quirks the one pass must keep.
+    fn src_pool() -> Vec<(&'static str, Vec<u8>)> {
+        let t = |s: &str| s.as_bytes().to_vec();
+        vec![
+            ("src/a.c", t("static int helper(int x) { return x + 1; }\nint twice(int x) { return helper(helper(x)); }\nvoid takes_cb(int n) { int (*cb)(int) = helper; cb(n); twice(n); }\n")),
+            ("src/b.h", t("int shared(int x);\nstatic inline int in_header(int x) { return shared(x); }\n")),
+            ("src/c.cpp", t("int shared(int x) { return x; }\nnamespace n { int cpp_fn(int y) { return shared(y) + in_header(y); } }\n")),
+            ("src/nested/deep.cc", t("struct S { int m(int v) { return v; } };\nint deep(int x) { S s; return s.m(x); }\n")),
+            ("src/upper.C", t("int upper_c(void) { return 0; }\n")),
+            ("src/rust/vendor/dep/v.c", t("int vendored_c(void) { return twice(1); }\n")),
+            ("src/rust/vendor/dep/src/lib.rs", t("fn vendored_rs() -> i32 { 1 }\nfn more() -> i32 { vendored_rs() }\n")),
+            ("src/rust/vendor-patched/p/src/lib.rs", t("fn patched() {}\n")),
+            ("src/sub/target/debug/build/gen.c", t("int generated(void) { return 0; }\n")),
+            ("src/rust/src/lib.rs", t("fn one() -> i32 { two() }\nfn two() -> i32 { fn nested() -> i32 { 2 } nested() }\n")),
+            ("src/f77.f", t("      SUBROUTINE SUB1(X)\n      DOUBLE PRECISION X\n      CALL SUB2(X)\n      RETURN\n      END\n      SUBROUTINE SUB2(X)\n      DOUBLE PRECISION X\n      X = X + 1\n      RETURN\n      END\n")),
+            ("src/mod.f90", t("module m\ncontains\n  function sq(x) result(y)\n    real :: x, y\n    y = x * x\n  end function sq\n  subroutine use_sq(a)\n    real :: a\n    a = sq(a)\n    call sub1(a)\n  end subroutine use_sq\nend module m\n")),
+            ("src/m95.f95", t("subroutine s95()\n  call s03()\nend subroutine s95\n")),
+            ("src/m03.f03", t("subroutine s03()\n  call s08()\nend subroutine s03\n")),
+            ("src/m08.f08", t("subroutine s08()\nend subroutine s08\n")),
+            ("src/latin1.c", b"/* caf\xe9 */ int latin(void) { return 0; }\n".to_vec()),
+            ("src/dup1.c", t("int same(void) { return 1; }\nint user1(void) { return same(); }\n")),
+            ("src/dup2.c", t("int same(void) { return 2; }\nint user2(void) { return same(); }\n")),
+            ("src/crlf.c", t("int crlf_a(void) {\r\n  return 0;\r\n}\r\nint crlf_b(void) { return crlf_a(); }\r\n")),
+            ("src/empty.c", Vec::new()),
+            ("src/Makevars", t("PKG_LIBS = -lm\n")),
+            ("src/init.hpp", t("inline int hpp_fn(int x) { return x; }\n")),
+            ("R/a.R", t("f <- function(x) .Call(C_twice, x)\n")),
+        ]
+    }
+
+    fn write_src_tree(entries: &[&(&'static str, Vec<u8>)]) -> PathBuf {
+        static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let root = std::env::temp_dir().join(format!("rpa-scan-src-{}-{n}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        for (rel, bytes) in entries {
+            let p = root.join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(&p, bytes).unwrap();
+        }
+        std::fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    /// scan_src against the three passes it replaced, field for field.
+    fn assert_scan_matches_the_old_passes(root: &Path) {
+        let files = list_files(root);
+        let scan = scan_src(root, &files);
+        assert_eq!(scan.fns, count_src_functions(root, &files), "counts");
+        assert_eq!(scan.names, collect_src_function_names(root, &files), "names");
+        for (got, lang) in [
+            (scan.c_family, SrcLang::CFamily),
+            (scan.rust, SrcLang::Rust),
+            (scan.fortran, SrcLang::Fortran),
+        ] {
+            let (net, edges, nodes) = got.graph();
+            let (old_net, old_edges, old_nodes) = build_src_graph(root, &files, lang);
+            assert_eq!(nodes, old_nodes, "{lang:?} nodes");
+            assert_eq!(edges, old_edges, "{lang:?} edges");
+            assert_eq!(net, old_net, "{lang:?} network");
+        }
+    }
+
+    #[test]
+    fn one_parse_per_file_gives_what_three_passes_gave() {
+        let pool = src_pool();
+        let all: Vec<&(&'static str, Vec<u8>)> = pool.iter().collect();
+        let root = write_src_tree(&all);
+        let files = list_files(&root);
+        let scan = scan_src(&root, &files);
+        assert!(scan.names.contains("vendored_c") && scan.names.contains("vendored_rs"), "names take vendored files");
+        assert!(scan.fns.n_files >= 10, "the pool parses: {:?}", scan.fns);
+        assert!(!scan.names.contains("latin"), "a non-UTF-8 file is skipped");
+        assert_scan_matches_the_old_passes(&root);
+        let _ = std::fs::remove_dir_all(&root);
+
+        // Random subsets, so no pass gets to lean on a file another one brought.
+        let mut seed: u64 = 0x5eed_0510;
+        for _ in 0..150 {
+            let subset: Vec<&(&'static str, Vec<u8>)> = pool
+                .iter()
+                .filter(|_| {
+                    seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                    (seed >> 33) & 1 == 1
+                })
+                .collect();
+            let root = write_src_tree(&subset);
+            assert_scan_matches_the_old_passes(&root);
+            let _ = std::fs::remove_dir_all(&root);
         }
     }
 }
