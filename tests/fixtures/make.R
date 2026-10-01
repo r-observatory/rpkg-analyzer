@@ -484,6 +484,8 @@ sv(data.frame(
 if (requireNamespace("zoo", quietly = TRUE)) {
   sv(zoo::zoo(1:10, as.Date("2020-01-01") + 0:9), "z_regular")
   sv(zoo::zoo(1:6, as.Date("2020-01-01") + c(0, 1, 2, 16, 17, 18)), "z_gappy")
+  # Steps of 1, 2, 3, 4 and 5 each occur once: a tie for the commonest step.
+  sv(zoo::zoo(1:6, c(0, 1, 3, 6, 10, 15)), "z_tied_steps")
 }
 # A symmetric matrix keeps one triangle, so its stored count is roughly half
 # its non-zeros: every off-diagonal entry stands for two.

@@ -1,0 +1,84 @@
+mod common;
+use common::*;
+use serde_json::Value;
+use std::path::Path;
+use std::process::{Command, Output};
+
+fn analyze(dir: &str, stats: Option<&Path>) -> Output {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_rpkg-analyzer"));
+    cmd.args([dir, "--input-kind", "release"])
+        .env_remove("RPKG_ANALYZER_STATS")
+        .env_remove("RPKG_ANALYZER_CACHE_DIR")
+        .env_remove("RPKG_ANALYZER_CACHE_VERIFY");
+    if let Some(p) = stats {
+        cmd.env("RPKG_ANALYZER_STATS", p);
+    }
+    cmd.output().expect("run the analyzer")
+}
+
+fn package() -> Tree {
+    tree(&[
+        ("DESCRIPTION", DESC),
+        ("R/a.R", "f <- function(x) g(x)\ng <- function(x) x\n"),
+        ("src/a.c", "int one(void) { return 1; }\n"),
+        ("tests/t.R", "stopifnot(TRUE)\n"),
+        ("data/d.csv", "a;b\n1;2\n"),
+    ])
+}
+
+#[test]
+fn the_stats_line_is_written_only_when_asked_and_changes_nothing_else() {
+    let t = package();
+    // The stats file sits outside the package, so the analyzer never reads it.
+    let side = tree(&[("keep", "")]);
+    let path = side.root.join("stats.ndjson");
+
+    let plain = analyze(t.path(), None);
+    assert!(plain.status.success());
+    assert!(plain.stderr.is_empty());
+    assert!(!path.exists(), "no stats file unless asked");
+
+    for _ in 0..2 {
+        let with = analyze(t.path(), Some(&path));
+        assert!(with.status.success());
+        assert!(with.stderr.is_empty(), "stderr: {}", String::from_utf8_lossy(&with.stderr));
+        assert_eq!(with.stdout, plain.stdout, "stdout is the same with stats on");
+    }
+    let text = std::fs::read_to_string(&path).expect("stats file");
+    let lines: Vec<&str> = text.lines().collect();
+    assert_eq!(lines.len(), 2, "one line per run, appended");
+    let s: Value = serde_json::from_str(lines[1]).expect("a JSON line");
+    let mut keys: Vec<&str> = s.as_object().unwrap().keys().map(String::as_str).collect();
+    keys.sort();
+    assert_eq!(
+        keys,
+        [
+            "build", "cache_errors", "compiled", "data", "ms", "ms_compiled", "ms_data", "ms_other", "ms_r",
+            "ms_tests", "r", "tests", "verify_mismatch"
+        ]
+    );
+    assert_eq!(s["build"], env!("CARGO_PKG_VERSION"));
+    assert_eq!(s["compiled"]["files"], 1);
+    assert_eq!(s["compiled"]["hits"], 0);
+    assert_eq!(s["r"]["files"], 1);
+    assert_eq!(s["tests"]["files"], 1);
+    assert_eq!(s["data"]["files"], 1);
+    assert_eq!(s["cache_errors"], 0);
+    assert_eq!(s["verify_mismatch"], 0);
+    let ms = |k: &str| s[k].as_f64().unwrap_or_else(|| panic!("{k} is a number"));
+    for k in ["ms_compiled", "ms_r", "ms_tests", "ms_data", "ms_other"] {
+        assert!(ms(k) >= 0.0, "{k} is not negative");
+    }
+    let parts = ms("ms_compiled") + ms("ms_r") + ms("ms_tests") + ms("ms_data");
+    assert!(parts <= ms("ms") + 0.01, "the phases fit inside the total");
+}
+
+#[test]
+fn a_stats_path_that_cannot_be_written_changes_nothing() {
+    let t = package();
+    let plain = analyze(t.path(), None);
+    let bad = analyze(t.path(), Some(Path::new("/nonexistent-rpkg-analyzer-dir/stats.ndjson")));
+    assert!(bad.status.success());
+    assert!(bad.stderr.is_empty());
+    assert_eq!(bad.stdout, plain.stdout);
+}

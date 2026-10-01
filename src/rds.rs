@@ -821,6 +821,19 @@ fn spatial_fields(col: &Node, o: &mut Value) {
     }
 }
 
+/// The step that occurs most often, and how often. A tie goes to the smallest
+/// step, so the answer never depends on a hash seed.
+fn modal_step(steps: &[f64]) -> Option<(f64, usize)> {
+    let mut counts: std::collections::HashMap<u64, usize> = Default::default();
+    for st in steps {
+        *counts.entry(st.to_bits()).or_default() += 1;
+    }
+    counts
+        .into_iter()
+        .map(|(bits, hits)| (f64::from_bits(bits), hits))
+        .max_by(|a, b| a.1.cmp(&b.1).then_with(|| b.0.total_cmp(&a.0)))
+}
+
 /// Time-index fields for a series object, from attributes the reader already
 /// decodes and has never looked at.
 ///
@@ -875,14 +888,9 @@ fn series_fields(pairs: &[(String, &Node)], rec: &mut Value) {
                 _ => Vec::new(),
             };
             if !steps.is_empty() {
-                let mut counts: std::collections::HashMap<u64, usize> = Default::default();
-                for st in &steps {
-                    *counts.entry(st.to_bits()).or_default() += 1;
-                }
-                if let Some((bits, hits)) = counts.iter().max_by_key(|(_, c)| **c) {
-                    let modal = f64::from_bits(*bits);
+                if let Some((modal, hits)) = modal_step(&steps) {
                     rec["index_delta"] = json!(round_stat(modal));
-                    rec["index_regular"] = json!(*hits == steps.len());
+                    rec["index_regular"] = json!(hits == steps.len());
                     let gaps = steps.iter().filter(|st| **st > modal).count();
                     if gaps > 0 {
                         rec["index_n_gaps"] = json!(gaps);
@@ -5514,6 +5522,42 @@ mod tests {
         assert_eq!(gap["index_max_gap"], 14.0);
     }
 
+    /// Steps of 1, 2, 3, 4 and 5 each occur once, and a hash map picked any of
+    /// them. The smallest is the one every run now reports.
+    #[test]
+    fn a_tie_between_steps_resolves_the_same_way_every_run() {
+        for _ in 0..20 {
+            let z = by_name("z_tied_steps");
+            assert_eq!(z["index_delta"], 1.0);
+            assert_eq!(z["index_regular"], false);
+            assert_eq!(z["index_n_gaps"], 4);
+            assert_eq!(z["index_max_gap"], 5.0);
+        }
+    }
+
+    #[test]
+    fn the_modal_step_is_the_commonest_then_the_smallest() {
+        assert_eq!(modal_step(&[2.0, 2.0, 1.0, 1.0, 3.0]), Some((1.0, 2)));
+        assert_eq!(modal_step(&[5.0, 3.0, 3.0]), Some((3.0, 2)));
+        assert_eq!(modal_step(&[4.0, 3.0, 2.0, 1.0]), Some((1.0, 1)));
+        let signed = modal_step(&[0.0, -0.0]).map(|(st, n)| (st.to_bits(), n));
+        assert_eq!(signed, Some(((-0.0f64).to_bits(), 1)), "a total order puts -0 before 0");
+        assert_eq!(modal_step(&[]), None);
+    }
+
+    /// A missing value in an index makes a NaN step, and R's NA is a NaN with a
+    /// payload. Tied with a real step, the real one is taken, every time.
+    #[test]
+    fn a_missing_step_tied_with_a_real_one_resolves_the_same_way() {
+        let na = f64::from_bits(0x7FF0_0000_0000_07A2);
+        for _ in 0..20 {
+            assert_eq!(modal_step(&[na, 1.0]), Some((1.0, 1)));
+            assert_eq!(modal_step(&[f64::NAN, 2.0, na]).map(|(st, n)| (st.to_bits(), n)), Some((2.0f64.to_bits(), 1)));
+            let two_nan = modal_step(&[na, na, 1.0]).map(|(st, n)| (st.to_bits(), n));
+            assert_eq!(two_nan, Some((na.to_bits(), 2)), "a NaN step that is commoner still wins on count");
+        }
+    }
+
     #[test]
     fn a_symmetric_matrix_counts_both_halves() {
         // It stores one triangle, so every off-diagonal entry it holds stands
@@ -6552,7 +6596,7 @@ mod tests {
     #[test]
     fn every_fixture_is_readable() {
         let recs = records();
-        assert_eq!(recs.len(), 126, "one record per saved object");
+        assert_eq!(recs.len(), 127, "one record per saved object");
         // Not everything saved under data/ is data. These carry behaviour rather
         // than observations, so there is nothing to fingerprint; what they must
         // still do is read cleanly, because a file that fails mid-object takes
