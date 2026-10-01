@@ -1,0 +1,23 @@
+# Keeps this repository's Actions logs past GitHub's 90-day retention, as
+# monthly assets on its ci-logs prerelease. The job lives in r-observatory/.github.
+name: Archive CI logs
+
+on:
+  schedule:
+    - cron: "41 3 * * 1"
+  workflow_dispatch:
+    inputs:
+      month:
+        description: Closed month still inside retention (YYYY-MM); empty archives every month that is due
+        required: false
+        default: ""
+
+permissions:
+  actions: write
+  contents: write
+
+jobs:
+  archive:
+    uses: r-observatory/.github/.github/workflows/archive-ci-logs.yml@main
+    with:
+      month: ${{ inputs.month || '' }}
