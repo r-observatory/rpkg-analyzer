@@ -1,0 +1,184 @@
+name: memory-ceiling
+
+# The analyzer's peak memory on Linux x86_64, measured by hand before a release:
+# every input of ci/memory-ceiling/inputs.tsv alone in a 2 GiB container and under an
+# address-space limit, then the Bioconductor pipeline's own worker, four packages at
+# a time. Every input is a public repository under github.com/bioc or github.com/cran.
+run-name: memory ceiling of ${{ inputs.build }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      build:
+        description: "A branch, tag or commit to build, or release:<tag> for that release's linux asset"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  # The published build each peak is compared with.
+  BASELINE: v0.5.1
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/checkout@v7
+        if: ${{ !startsWith(inputs.build, 'release:') }}
+        with:
+          ref: ${{ inputs.build }}
+          path: candidate
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+        if: ${{ !startsWith(inputs.build, 'release:') }}
+      - name: Build
+        if: ${{ !startsWith(inputs.build, 'release:') }}
+        run: |
+          cargo build --release --locked --manifest-path candidate/Cargo.toml
+          strip candidate/target/release/rpkg-analyzer
+          install -D -m 755 candidate/target/release/rpkg-analyzer bin/candidate/rpkg-analyzer
+      - name: Download the release asset
+        if: ${{ startsWith(inputs.build, 'release:') }}
+        env:
+          BUILD: ${{ inputs.build }}
+        run: bash ci/memory-ceiling/release-asset.sh "${BUILD#release:}" bin/candidate/rpkg-analyzer
+      - name: Download the baseline
+        run: bash ci/memory-ceiling/release-asset.sh "$BASELINE" bin/baseline/rpkg-analyzer
+      - name: Build the peak reader
+        run: gcc -O2 -Wall -Wextra -static -o bin/peak ci/memory-ceiling/peak.c
+      - name: Versions
+        run: |
+          echo "candidate $(bin/candidate/rpkg-analyzer --version)"
+          echo "baseline $(bin/baseline/rpkg-analyzer --version)"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: binaries
+          path: bin
+          retention-days: 7
+
+  measure:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4, 5, 6, 7, 8]
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v8
+        with:
+          name: binaries
+          path: bin
+      - name: Measure
+        env:
+          SHARD: ${{ matrix.shard }}/${{ strategy.job-total }}
+        run: |
+          chmod +x bin/peak bin/candidate/rpkg-analyzer bin/baseline/rpkg-analyzer
+          CAND="$PWD/bin/candidate/rpkg-analyzer" BASE="$PWD/bin/baseline/rpkg-analyzer" \
+            PEAK="$PWD/bin/peak" OUT="$PWD/results" WORK="$RUNNER_TEMP/trees" JOBS=2 \
+            bash ci/memory-ceiling/measure.sh
+      - uses: actions/upload-artifact@v7
+        if: ${{ !cancelled() }}
+        with:
+          name: runs-${{ matrix.shard }}
+          path: |
+            results/runs.tsv
+            results/trees.tsv
+            results/platform.txt
+            results/stderr
+
+  worker:
+    needs: [build, measure]
+    if: ${{ !cancelled() && needs.build.result == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/checkout@v7
+        with:
+          repository: r-observatory/bioc-code-metrics
+          ref: main
+          path: pipeline
+          persist-credentials: false
+      - uses: r-lib/actions/setup-r@v2
+        with:
+          r-version: "release"
+          use-public-rspm: true
+      - uses: r-lib/actions/setup-r-dependencies@v2
+        with:
+          packages: |
+            any::RSQLite
+            any::DBI
+            any::jsonlite
+            any::digest
+      - uses: actions/download-artifact@v8
+        with:
+          name: binaries
+          path: bin
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: runs-*
+          path: runs
+      - name: Run the worker
+        run: |
+          chmod +x bin/candidate/rpkg-analyzer
+          awk '/^(MemTotal|MemAvailable|SwapTotal):/' /proc/meminfo
+          df -h "$RUNNER_TEMP" /tmp | awk '{print $2, $4, $6}'
+          RPKG_ANALYZER_BIN="$PWD/bin/candidate/rpkg-analyzer" \
+            PIPELINE_COMMIT="$(git -C pipeline rev-parse HEAD)" \
+            bash ci/memory-ceiling/worker.sh pipeline "$PWD/results/worker" runs/*/runs.tsv
+      - uses: actions/upload-artifact@v7
+        if: ${{ !cancelled() }}
+        with:
+          name: worker
+          path: results/worker
+
+  verdict:
+    needs: [measure, worker]
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: runs-*
+          path: runs
+      - uses: actions/download-artifact@v8
+        continue-on-error: true
+        with:
+          name: worker
+          path: results/worker
+      - name: Judge
+        run: |
+          mkdir -p results/stderr
+          for f in runs/*/runs.tsv; do
+            if [ ! -f results/runs.tsv ]; then
+              head -1 "$f" > results/runs.tsv
+              cp "$(dirname "$f")/platform.txt" results/platform.txt
+            fi
+            tail -n +2 "$f" >> results/runs.tsv
+          done
+          cp runs/*/stderr/* results/stderr/ 2> /dev/null || true
+          python3 ci/memory-ceiling/judge.py verdict --runs results/runs.tsv \
+            --platform results/platform.txt --worker results/worker \
+            --out results/verdict.txt --sha-out results/sha256.tsv \
+            --markdown "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v7
+        if: ${{ !cancelled() }}
+        with:
+          name: memory-ceiling-results
+          path: results
