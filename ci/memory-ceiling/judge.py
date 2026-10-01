@@ -7,8 +7,10 @@
 verdict applies five checks and prints PASS or FAIL on the first line:
   1 ceiling    every run of the build exits 0 with empty stderr, no OOM kill, and a
                resident peak (VmHWM) at or under the ceiling
-  2 rise       no resident peak more than a few MiB above the baseline build's,
-               where the baseline fits
+  2 rise       the build's smallest finished run is no more than a few MiB above
+               the baseline build's largest finished run, where the baseline fits.
+               Identical runs of one build differ, so each build's own range is
+               the noise the comparison has to clear
   3 worker     the real worker runs: every package ok, no OOM kill, and available
                memory never under the floor
   4 limit      same output and exit 0 under the address-space limit
@@ -75,21 +77,34 @@ def faults(r, ceiling_kb=None):
     return out
 
 
+def peaks(rows):
+    """The resident peaks of the runs that finished: exit 0, no OOM kill, empty stderr."""
+    return [resident(r) for r in rows if not faults(r)]
+
+
+def span(kbs):
+    """A build's range over its finished runs, as text."""
+    lo, hi = mib(min(kbs)), mib(max(kbs))
+    return lo if lo == hi else f"{lo} to {hi}"
+
+
 class Input:
-    """One input's rows, sorted into the build's runs, the baseline run and the limit runs."""
+    """One input's rows, sorted into the build's runs, the baseline's runs and the limit runs."""
 
     def __init__(self, rows):
         self.fetch_failed = any(r["build"] == "fetch" for r in rows)
         self.cand = sorted(
             (r for r in rows if r["build"] == "cand" and r["limit_mib"] == "none"), key=lambda r: r["run"]
         )
-        self.base = [r for r in rows if r["build"] == "base" and r["limit_mib"] == "none"]
+        self.base = sorted(
+            (r for r in rows if r["build"] == "base" and r["limit_mib"] == "none"), key=lambda r: r["run"]
+        )
+        self.cand_peaks, self.base_peaks = peaks(self.cand), peaks(self.base)
         self.limits = {
             int(r["limit_mib"]): r for r in rows if r["build"] == "cand" and r["limit_mib"] != "none"
         }
         self.hwm = max((resident(r) for r in self.cand), default=0)
         self.vmpeak = max((max(r["vmpeak_kb"], 0) for r in self.cand), default=0)
-        self.finished = bool(self.cand) and all(r["exit"] == 0 for r in self.cand)
         ok = [r for r in self.cand if r["exit"] == 0]
         self.sha = ok[0]["sha256"] if ok else None
 
@@ -117,32 +132,54 @@ def check_inputs(a, inputs, runs):
     not_run = [i["id"] for i in inputs if i["id"] not in runs]
     measured = [(i["id"], Input(runs[i["id"]])) for i in inputs if i["id"] in runs]
     over, rises, limit_bad, base_seen, base_fit, limit_seen = [], [], [], 0, 0, 0
+    risen, spreads, base_short = [], [], 0
     for id_, x in measured:
         bad = x.ceiling_faults(a)
         if bad:
             over.append(id_)
         text = [f"VmHWM {mib(x.hwm)} MiB, VmPeak {mib(x.vmpeak)} MiB"]
         row = {"id": id_, "hwm": mib(x.hwm), "vmpeak": mib(x.vmpeak), "base": "", "rise": "", "limits": {}}
-        # 2: the rise over the baseline build.
+        # 2: the build's smallest finished run against the baseline's largest.
+        spread = 0
+        for build, kbs in (("the build", x.cand_peaks), ("the baseline", x.base_peaks)):
+            if len(kbs) > 1:
+                spreads.append((max(kbs) - min(kbs), id_, build))
+                spread = max(spread, max(kbs) - min(kbs))
+        noisy = spread > a.noise_mib * 1024
+        if noisy and x.cand_peaks:
+            row["hwm"] = span(x.cand_peaks)
         if x.base:
             base_seen += 1
-            b = x.base[0]
-            if faults(b):
-                text.append(f"baseline does not fit ({', '.join(faults(b))})")
+            base_short += len(x.base) < a.run_count
+            if not x.base_peaks:
+                text.append(f"baseline does not fit ({', '.join(faults(x.base[0]))})")
                 row["base"] = "does not fit"
-            elif not x.finished:
+            elif not x.cand_peaks:
                 base_fit += 1
-                row["base"] = mib(resident(b))
-                text.append(f"baseline {mib(resident(b))} MiB, rise not judged on a run that did not finish")
+                row["base"] = span(x.base_peaks)
+                text.append(
+                    f"baseline {span(x.base_peaks)} MiB, rise not judged, no run of the build finished"
+                )
             else:
                 base_fit += 1
-                rise = x.hwm - resident(b)
+                rise = min(x.cand_peaks) - max(x.base_peaks)
                 rises.append((rise, id_))
-                row["base"], row["rise"] = mib(resident(b)), f"{signed(rise)}"
-                text.append(f"baseline {mib(resident(b))} MiB ({signed(rise)})")
+                row["rise"] = signed(rise)
+                if rise > a.rise_mib * 1024 or noisy:
+                    row["hwm"], row["base"] = span(x.cand_peaks), span(x.base_peaks)
+                    text.append(
+                        f"runs {span(x.cand_peaks)} MiB, baseline runs {span(x.base_peaks)} MiB "
+                        f"(smallest against largest {signed(rise)})"
+                    )
+                else:
+                    row["base"] = mib(max(x.base_peaks))
+                    text.append(f"baseline {mib(max(x.base_peaks))} MiB ({signed(rise)})")
                 if rise > a.rise_mib * 1024:
-                    bad.append(f"{signed(rise)} MiB over the baseline")
+                    risen.append(id_)
+                    bad.append(f"smallest run {signed(rise)} MiB over the baseline's largest")
                     status[2] = "FAIL"
+        if noisy and len(x.cand_peaks) > 1 and not any(t.startswith("runs ") for t in text):
+            text.append(f"runs {span(x.cand_peaks)} MiB")
         # 4: the address-space limits. Only the first is judged.
         for n, lim in enumerate(a.limits):
             r = x.limits.get(lim)
@@ -186,11 +223,21 @@ def check_inputs(a, inputs, runs):
     elif rises:
         rise, id_ = max(rises)
         summary[2] = (
-            f"largest rise {signed(rise)} MiB ({id_}) against {a.rise_mib} MiB allowed; "
-            f"baseline fits on {base_fit} of {base_seen} inputs"
+            f"{len(risen)} of {len(rises)} inputs have their smallest finished run more than "
+            f"{a.rise_mib} MiB above the baseline's largest finished run; largest such rise "
+            f"{signed(rise)} MiB ({id_}); baseline fits on {base_fit} of {base_seen} inputs"
         )
     else:
         summary[2] = f"baseline fits on 0 of {base_seen} inputs, nothing to compare"
+    if base_seen and spreads:
+        wide, id_, build = max(spreads)
+        noisy_ids = {i for s, i, _ in spreads if s > a.noise_mib * 1024}
+        summary[2] += (
+            f"; largest spread within one build {mib(wide)} MiB ({id_}, {build}), "
+            f"{len(noisy_ids)} inputs above {a.noise_mib} MiB"
+        )
+    if base_short:
+        summary[2] += f"; the baseline ran fewer than {a.run_count} times on {base_short} inputs"
     if not limit_seen:
         status[4] = "NOT RUN"
         summary[4] = "no limit run"
@@ -401,7 +448,10 @@ def verdict(a):
 def markdown(a, head, body, rows, worker_tables):
     out = [f"### {head}\n\n"] + [f"- {x}\n" for x in body]
     limits = "".join(f" {lim:,} MiB limit |" for lim in a.limits)
-    out.append(f"\n| Input | VmHWM MiB | VmPeak MiB | Baseline VmHWM MiB | Rise MiB |{limits} Result |\n")
+    out.append(
+        "\n| Input | VmHWM MiB | VmPeak MiB | Baseline VmHWM MiB | Smallest over baseline's largest MiB |"
+        f"{limits} Result |\n"
+    )
     out.append("|---|---:|---:|---:|---:|" + "---|" * len(a.limits) + "---|\n")
     for r in rows:
         cells = "".join(f" {r['limits'].get(lim, '')} |" for lim in a.limits)
@@ -456,9 +506,10 @@ def main():
     p.add_argument("--out")
     p.add_argument("--sha-out")
     p.add_argument("--markdown")
-    p.add_argument("--run-count", type=int, default=3, help="runs of the build per input")
+    p.add_argument("--run-count", type=int, default=3, help="unlimited runs of each build per input")
     p.add_argument("--ceiling-mib", type=int, default=2048)
     p.add_argument("--rise-mib", type=int, default=16)
+    p.add_argument("--noise-mib", type=int, default=4, help="a spread above this prints both ranges")
     p.add_argument("--floor-mib", type=int, default=2048)
     p.add_argument("--limits", type=int, nargs="+", default=[3072, 2560])
     a = p.parse_args()

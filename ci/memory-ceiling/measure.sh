@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 # measure.sh: peak memory of the analyzer on each input of inputs.tsv, on Linux.
 # Per input: fetch the tree, run CAND RUNS times in a container limited to MEMORY, run
-# BASE once the same way, run CAND once under each address-space limit of LIMITS, then
-# delete the tree. Rows go to $OUT/runs.tsv (in-container.sh lists the columns, plus
-# container_exit and container_oom), the platform to $OUT/platform.txt.
+# BASE RUNS times the same way, run CAND once under each address-space limit of LIMITS,
+# then delete the tree. Identical runs of one build differ by tens of MiB on some
+# inputs, so both builds need a range. Rows go to $OUT/runs.tsv (in-container.sh lists
+# the columns, plus container_exit and container_oom), the platform to $OUT/platform.txt.
 #
 #   CAND    the build under test, a linux binary                  required
 #   PEAK    peak.c compiled for the container, statically linked  required
@@ -73,7 +74,7 @@ one_input() { # id
     rm -f "$rows.fetch"
     printf '%s\t%s\n' "$id" "$(du -sk "$tree" | cut -f1)" > "$OUT/rows/$id.tree"
     container cand none "$RUNS" "$MEMORY" "$CAND"
-    if [ -n "$BASE" ]; then container base none 1 "$MEMORY" "$BASE"; fi
+    if [ -n "$BASE" ]; then container base none "$RUNS" "$MEMORY" "$BASE"; fi
     for limit in $LIMITS; do container cand "$limit" 1 "$LIMIT_MEMORY" "$CAND"; done
   else
     echo "$id tree not fetched"
