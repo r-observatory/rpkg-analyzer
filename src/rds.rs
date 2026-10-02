@@ -8889,6 +8889,114 @@ mod tests {
         );
     }
 
+    /// What a state carries beside its values is not the vector's. The
+    /// attributes of a compact or wrapped vector are the ones written after
+    /// its state, and one written with none has none, whatever its state or
+    /// the vector inside its state was written with.
+    #[test]
+    fn a_compact_vector_takes_no_attributes_from_its_state() {
+        /// The attributes a vector is written with: its names.
+        fn named(w: &mut Wire, names: &[&[u8]]) {
+            w.tagged("names").head(STRSXP).int(names.len() as i32);
+            for n in names {
+                w.chars(n);
+            }
+            w.nil();
+        }
+        const WITH_ATTRIBUTES: i32 = 1 << 9;
+        let mut cases: Vec<(&str, Wire)> = Vec::new();
+
+        let mut w = Wire::rds();
+        w.altrep("deferred_string")
+            .int(STRSXP as i32 | WITH_ATTRIBUTES)
+            .int(2)
+            .chars(b"a")
+            .chars(b"b");
+        named(&mut w, &[b"x", b"y"]);
+        w.nil();
+        cases.push(("a class the reader does not know", w));
+
+        let mut w = Wire::rds();
+        w.altrep("mmap_integer")
+            .int(INTSXP as i32 | WITH_ATTRIBUTES)
+            .int(2)
+            .int(7)
+            .int(8);
+        named(&mut w, &[b"x", b"y"]);
+        w.nil();
+        cases.push(("another, over integers", w));
+
+        let mut w = Wire::rds();
+        w.altrep("wrap_integer").head(VECSXP).int(2);
+        w.int(INTSXP as i32 | WITH_ATTRIBUTES).int(2).int(3).int(1);
+        named(&mut w, &[b"x", b"y"]);
+        w.ints(&[0, 0]).nil();
+        cases.push(("a wrapper whose vector has attributes", w));
+
+        let mut w = Wire::rds();
+        w.altrep("wrap_real")
+            .int(VECSXP as i32 | WITH_ATTRIBUTES)
+            .int(2)
+            .reals(&[1.5, 2.5])
+            .ints(&[0, 0]);
+        named(&mut w, &[b"x", b"y"]);
+        w.nil();
+        cases.push(("a wrapper whose state has attributes", w));
+
+        let mut w = Wire::rds();
+        w.altrep("wrap_real").int(LISTSXP as i32 | WITH_ATTRIBUTES);
+        named(&mut w, &[b"x"]);
+        w.reals(&[1.5, 2.5]).nil().nil();
+        cases.push(("a wrapper over a pairlist that has attributes", w));
+
+        let mut w = Wire::rds();
+        w.altrep("compact_intseq")
+            .int(REALSXP as i32 | WITH_ATTRIBUTES)
+            .int(3);
+        for x in [4.0f64, 1.0, 1.0] {
+            w.0.extend_from_slice(&x.to_be_bytes());
+        }
+        named(&mut w, &[b"n", b"from", b"by"]);
+        w.nil();
+        cases.push(("a sequence whose state has attributes", w));
+
+        for (what, w) in &cases {
+            assert_eq!(agreed(what, &w.0), Ok(1), "{what}");
+            let read = read_bytes(&w.0).expect("it reads").remove(0).1;
+            assert!(read.attr.is_none(), "{what}: attributes from the state");
+            each_damaged(&w.0, &spread(w.0.len(), w.0.len()), |how, bytes| {
+                let _ = agreed(&format!("{what} {how}"), bytes);
+            });
+        }
+        let read = |i: usize| read_bytes(&cases[i].1.0).expect("it reads").remove(0).1;
+        assert!(matches!(read(0).val, Val::Str(v) if v.len() == 2));
+        assert!(matches!(read(1).val, Val::Ints { vals, .. } if vals == [7, 8]));
+        assert!(matches!(read(2).val, Val::Ints { vals, .. } if vals == [3, 1]));
+        assert!(matches!(read(3).val, Val::Reals { vals, .. } if vals == [1.5, 2.5]));
+        assert!(matches!(read(4).val, Val::Reals { vals, .. } if vals == [1.5, 2.5]));
+        assert!(matches!(read(5).val, Val::Ints { vals, .. } if vals == [1, 2, 3, 4]));
+
+        // And the attributes written after a state are kept beside one that
+        // has its own.
+        let mut w = Wire::rds();
+        w.altrep("deferred_string")
+            .int(STRSXP as i32 | WITH_ATTRIBUTES)
+            .int(1)
+            .chars(b"a");
+        named(&mut w, &[b"of the state"]);
+        named(&mut w, &[b"of the vector"]);
+        assert_eq!(agreed("both have attributes", &w.0), Ok(1));
+        let read = read_bytes(&w.0).expect("it reads").remove(0).1;
+        let own = read.attr.expect("the vector's own attributes");
+        let Val::List { car, .. } = &own.val else {
+            panic!("attributes are a list")
+        };
+        assert!(
+            matches!(&car.val, Val::Str(v) if v == &[Some("of the vector".to_string())]),
+            "the names are the vector's"
+        );
+    }
+
     /// What the windowed reader makes of a decoder, against what the
     /// whole-buffer reader makes of the bytes that decoder hands over.
     fn agreed_through(
@@ -9056,6 +9164,71 @@ mod tests {
                 digest: Some(_)
             }
         ));
+    }
+
+    /// A string longer than the window arrives in pieces, and a character
+    /// of several bytes can lie across two of them. It is one character all
+    /// the same: the string is put together before it is made text, and
+    /// text made a piece at a time would mark each half as a byte that is
+    /// not UTF-8.
+    #[test]
+    fn a_character_across_two_pieces_of_a_long_string_is_one_character() {
+        // Two, three and four bytes, nine to a round. With each of nine
+        // lengths of string before it, each character meets every edge of
+        // the window at each of its bytes.
+        let round = "\u{e9}\u{6f22}\u{1f600}";
+        assert_eq!(round.len(), 9);
+        let text = round.repeat((3 * WINDOW + 4096) / round.len());
+        assert!(text.len() > 3 * WINDOW);
+        // The same bytes marked Latin-1 are a character each.
+        let as_latin1: String = text.bytes().map(|b| b as char).collect();
+        let mut pieces = 0;
+        for lead in 0..round.len() {
+            let mut w = Wire::image();
+            w.tagged("lead").chars(&b"abcdefghi"[..lead]);
+            w.tagged("utf8").chars(text.as_bytes());
+            w.tagged("latin1")
+                .int(CHARSXP as i32 | LATIN1_MASK << 12)
+                .int(text.len() as i32);
+            w.0.extend_from_slice(text.as_bytes());
+            // One that fills a window exactly, and one a byte longer, which
+            // is the shortest that comes in pieces.
+            for (name, bytes) in [("full", WINDOW), ("over", WINDOW + 1)] {
+                let fill = "\u{6f22}".repeat(bytes / 3);
+                w.tagged(name).chars(fill.as_bytes());
+                w.0.extend_from_slice(&b"ab"[..bytes % 3]);
+                let at = w.0.len() - bytes - 4;
+                w.0[at..at + 4].copy_from_slice(&(bytes as i32).to_be_bytes());
+            }
+            w.nil();
+
+            let what = format!("{lead} bytes before");
+            assert_eq!(agreed(&what, &w.0), Ok(5), "{what}");
+            // In pieces of every size, the smallest of which split every
+            // character.
+            for step in [1, 2, 3, 5, 4096, WINDOW - 1] {
+                let from = Dribble { left: &w.0, step };
+                assert_eq!(agreed_through(&what, Box::new(from), &w.0), Ok(5), "{what}");
+                pieces += 1;
+            }
+            if lead == 0 || lead == 4 {
+                for how in ["gzip", "bzip2", "xz"] {
+                    assert_eq!(agreed(&what, &pack(&w.0, how)), Ok(5), "{what} {how}");
+                }
+            }
+            // And against the text itself, whatever the other reader says.
+            let objs = read_bytes(&w.0).expect("the strings read");
+            let read = |i: usize| match &objs[i].1.val {
+                Val::Char(Some(t)) => t.as_str(),
+                _ => panic!("object {i} is not a string"),
+            };
+            assert!(read(1) == text, "{what}: the UTF-8 string is not the text written");
+            assert!(read(2) == as_latin1, "{what}: the Latin-1 string is not a character a byte");
+            assert!(!read(3).contains('\u{fffd}') && !read(4).contains('\u{fffd}'), "{what}");
+            assert_eq!(read(3).len(), WINDOW, "{what}");
+            assert_eq!(read(4).len(), WINDOW + 1, "{what}");
+        }
+        assert_eq!(pieces, 54);
     }
 
     /// A decoder may hand over as little as it likes at a time.
