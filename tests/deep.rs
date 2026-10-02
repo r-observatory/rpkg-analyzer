@@ -312,19 +312,27 @@ fn a_panic_reads_and_exits_as_it_did_on_the_first_thread() {
     assert!(!stats.exists());
 }
 
-/// Records are printed as they are made, so a reader that goes away part way
-/// through is a panic in the middle of a run.
+/// Records are printed as they are made, so a stdout that takes no more of
+/// them is a panic in the middle of a run.
+///
+/// The stdout is a socket shut for writing, which refuses a write whoever
+/// holds its other end, and the other end stays open here. A pipe whose
+/// reader was closed refuses only while no process holds that end, and where
+/// a pipe is made in one step and kept from new processes in a second, a
+/// process another test starts between the two holds it.
 #[cfg(unix)]
 #[test]
 fn a_panic_in_the_middle_of_a_run_ends_it_the_same_way() {
+    use std::os::fd::OwnedFd;
+    use std::os::unix::net::UnixStream;
     let t = package("R/a.R", b"f <- function(x) x\n");
     let stats = t.root.with_extension("stats");
-    let (gone, into) = std::io::pipe().expect("a pipe");
-    drop(gone);
+    let (_open, into) = UnixStream::pair().expect("a pair of sockets");
+    into.shutdown(std::net::Shutdown::Write).expect("shut it for writing");
     let out = Command::new(env!("CARGO_BIN_EXE_rpkg-analyzer"))
         .args([t.path(), "--input-kind", "release"])
         .env("RPKG_ANALYZER_STATS", &stats)
-        .stdout(into)
+        .stdout(OwnedFd::from(into))
         .output()
         .expect("run the analyzer");
     let said = String::from_utf8_lossy(&out.stderr);
