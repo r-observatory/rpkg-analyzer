@@ -4954,7 +4954,14 @@ fn read_text_free(path: &Path) -> Option<(Vec<Node>, Vec<String>, usize, &'stati
 /// Emit one `dataset` record per dataset shipped under `root`'s data/ directory
 /// and R/sysdata.rda. Never panics on a bad file; it degrades with a note.
 pub fn scan_package(root: &Path, excluded: &BTreeSet<String>) -> Vec<Value> {
-    let mut out = Vec::new();
+    let mut all = Vec::new();
+    scan_package_each(root, excluded, &mut |rec| all.push(rec));
+    all
+}
+
+/// The records of `scan_package` in its order, the ones of a file handed to
+/// `sink` when that file is done, so none is held while the next is read.
+pub fn scan_package_each(root: &Path, excluded: &BTreeSet<String>, sink: &mut dyn FnMut(Value)) {
     let mut targets: Vec<(std::path::PathBuf, bool)> = Vec::new();
     let docs = rd_dataset_docs(root, excluded);
     if let Ok(rd) = crate::memory::read_dir(root.join("data")) {
@@ -5059,7 +5066,7 @@ pub fn scan_package(root: &Path, excluded: &BTreeSet<String>) -> Vec<Value> {
             (is_rbin, is_script, is_text)
         };
 
-        let before = out.len();
+        let mut out: Vec<Value> = Vec::new();
         if is_rbin {
             match read_file(&path) {
                 Ok(recs) => {
@@ -5112,7 +5119,7 @@ pub fn scan_package(root: &Path, excluded: &BTreeSet<String>) -> Vec<Value> {
                 })),
             }
         }
-        for r in out[before..].iter_mut() {
+        for r in out.iter_mut() {
             r["origin_dir"] = json!(origin_dir);
             let doc = r.get("name").and_then(|n| n.as_str()).and_then(|n| docs.get(n));
             if let Some(t) = doc.and_then(|d| d.title.as_ref()) {
@@ -5123,8 +5130,10 @@ pub fn scan_package(root: &Path, excluded: &BTreeSet<String>) -> Vec<Value> {
             r["dataset_doc_source"] = json!(doc.filter(|_| loadable).and_then(|d| d.source.clone()));
             r["dataset_doc_format"] = json!(doc.filter(|_| loadable).map(|d| d.has_format as i64));
         }
+        for r in out {
+            sink(r);
+        }
     }
-    out
 }
 
 /// What a package keeps under inst/extdata, counted by extension.
@@ -10737,5 +10746,298 @@ mod tests {
         let checked = sketches_checked() - before;
         assert!(checked >= 10_000, "the tables profiled: {checked}");
         assert!(rows >= 30_000, "and their rows: {rows}");
+    }
+
+    /// The scan as it was made: every record of the package held until the
+    /// last file was read, and handed back together.
+    fn scan_package_held(root: &Path, excluded: &BTreeSet<String>) -> Vec<Value> {
+        let mut out = Vec::new();
+        let mut targets: Vec<(std::path::PathBuf, bool)> = Vec::new();
+        let docs = rd_dataset_docs(root, excluded);
+        if let Ok(rd) = crate::memory::read_dir(root.join("data")) {
+            let mut paths: Vec<_> = rd.flatten().map(|e| e.path()).collect();
+            paths.sort();
+            let mut best: std::collections::BTreeMap<String, (usize, std::path::PathBuf)> =
+                Default::default();
+            for p in paths {
+                let fname = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                if excluded.contains(&rel_path(root, &p)) {
+                    continue;
+                }
+                let Some(rank) = data_ext_rank(fname) else { continue };
+                let name = dataset_name(fname);
+                match best.get(&name) {
+                    Some((r, _)) if *r <= rank => {}
+                    _ => {
+                        best.insert(name, (rank, p));
+                    }
+                }
+            }
+            for (_, (_, p)) in best {
+                targets.push((p, false));
+            }
+        }
+        let sys = root.join("R").join("sysdata.rda");
+        if sys.exists() && !excluded.contains("R/sysdata.rda") {
+            targets.push((sys, true));
+        }
+        let n_loadable = targets.len();
+        let mut extra: Vec<std::path::PathBuf> = Vec::new();
+        let ext_root = {
+            let src = root.join("inst").join("extdata");
+            if src.is_dir() { src } else { root.join("extdata") }
+        };
+        walk_extdata(root, excluded, &ext_root, EXTDATA_DEPTH, &mut extra);
+        for p in extra {
+            targets.push((p, false));
+        }
+
+        for (i, (path, internal)) in targets.into_iter().enumerate() {
+            let fname = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            let lower = fname.to_lowercase();
+            let from_extdata = i >= n_loadable;
+            let origin_dir = if from_extdata {
+                "extdata"
+            } else if internal {
+                "sysdata"
+            } else {
+                "data"
+            };
+            let rel = if from_extdata {
+                let tail = path
+                    .strip_prefix(&ext_root)
+                    .map(|r| r.to_string_lossy().replace('\\', "/"))
+                    .unwrap_or_else(|_| fname.to_string());
+                format!("inst/extdata/{tail}")
+            } else {
+                format!("{}/{}", if internal { "R" } else { "data" }, fname)
+            };
+            let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+            let name = dataset_name(fname);
+
+            let is_rbin = lower.ends_with(".rda") || lower.ends_with(".rdata");
+            let is_script = lower.ends_with(".r");
+            let is_text = !is_rbin && text_data_sep(fname).is_some();
+
+            let (is_rbin, is_script, is_text) = if from_extdata {
+                if size > EXTDATA_PARSE_LIMIT {
+                    continue;
+                }
+                if !extdata_is_readable(&lower) {
+                    continue;
+                }
+                let bin = lower.ends_with(".rds") || lower.ends_with(".rda") || lower.ends_with(".rdata");
+                let txt = !bin;
+                (bin, false, txt)
+            } else {
+                (is_rbin, is_script, is_text)
+            };
+
+            let before = out.len();
+            if is_rbin {
+                match read_file(&path) {
+                    Ok(recs) => {
+                        for (nm, node, fmt, ver, comp) in recs {
+                            let nm = if nm.is_empty() { name.clone() } else { nm };
+                            out.push(describe(&nm, &rel, &node, &fmt, ver, &comp, internal, size));
+                        }
+                    }
+                    Err(e) => out.push(json!({
+                        "rec": "dataset", "name": name, "file": rel,
+                        "internal": internal, "compressed_bytes": size,
+                        "confidence": "degraded", "notes": e
+                    })),
+                }
+            } else if is_script {
+                out.push(json!({
+                    "rec": "dataset", "name": name, "file": rel, "format": "script",
+                    "internal": internal, "compressed_bytes": size,
+                    "confidence": "needs_r", "notes": "R script data (requires R)"
+                }));
+            } else if is_text {
+                let read = if from_extdata { read_text_free(&path) } else { read_text(&path, fname) };
+                match read {
+                    Some((cols, names, nrow, fmt, comp, alt)) => {
+                        let refs: Vec<&Node> = cols.iter().collect();
+                        let mut rec = json!({
+                            "rec": "dataset", "name": name, "file": rel, "format": fmt,
+                            "compression": comp, "compressed_bytes": size, "internal": internal,
+                            "class": "data.frame", "kind": "table", "nrow": nrow,
+                            "ncol": names.len(), "confidence": "degraded",
+                            "notes": "text: column types inferred"
+                        });
+                        if let Some((c, n)) = alt {
+                            rec["delimiter_looks_like"] =
+                                json!(if c == '\t' { "tab".to_string() } else { c.to_string() });
+                            rec["delimiter_would_give_ncol"] = json!(n as i64);
+                        }
+                        if let Some(p) = profile_columns(&refs, &names) {
+                            attach_profile(&mut rec, p, &refs);
+                        }
+                        out.push(rec);
+                    }
+                    None => out.push(json!({
+                        "rec": "dataset", "name": name, "file": rel,
+                        "internal": internal, "compressed_bytes": size,
+                        "confidence": "degraded", "notes": "text: data() cannot load this file"
+                    })),
+                }
+            }
+            for r in out[before..].iter_mut() {
+                r["origin_dir"] = json!(origin_dir);
+                let doc = r.get("name").and_then(|n| n.as_str()).and_then(|n| docs.get(n));
+                if let Some(t) = doc.and_then(|d| d.title.as_ref()) {
+                    r["title"] = json!(t);
+                }
+                let loadable = origin_dir == "data";
+                r["dataset_doc_source"] = json!(doc.filter(|_| loadable).and_then(|d| d.source.clone()));
+                r["dataset_doc_format"] = json!(doc.filter(|_| loadable).map(|d| d.has_format as i64));
+            }
+        }
+        out
+    }
+
+    /// A package tree under the temp directory, removed when dropped.
+    struct TempPackage(std::path::PathBuf);
+
+    impl TempPackage {
+        fn new(tag: &str) -> TempPackage {
+            let root = std::env::temp_dir().join(format!("rpkg-each-{tag}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&root);
+            std::fs::create_dir_all(&root).expect("make the package");
+            TempPackage(root)
+        }
+        fn write(&self, rel: &str, bytes: &[u8]) {
+            let p = self.0.join(rel);
+            std::fs::create_dir_all(p.parent().expect("a parent")).expect("make its directory");
+            std::fs::write(p, bytes).expect("write a file");
+        }
+        /// A file of the fixture package, under another path here.
+        fn fixture(&self, from: &str, to: &str) {
+            let bytes = std::fs::read(Path::new("tests/fixtures/pkg").join(from)).expect("read a fixture");
+            self.write(to, &bytes);
+        }
+    }
+
+    impl Drop for TempPackage {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// Some of the fixtures as an installed package keeps them, with what the
+    /// fixture package lacks: internal data, a data script and a file cut short.
+    fn rearranged_package() -> TempPackage {
+        let t = TempPackage::new("rearranged");
+        for f in ["v1_ascii_frame.rda", "plain_frame.rda", "altrep_frame.rda", "csv_comma.csv", "ws_ragged.tab"] {
+            t.fixture(&format!("data/{f}"), &format!("data/{f}"));
+        }
+        t.fixture("data/notdata.rds", "data/notdata.rds");
+        t.write("data/made.R", b"made <- data.frame(x = 1)\n");
+        let cut = std::fs::read("tests/fixtures/pkg/data/mixed_compiled.rda").expect("read a fixture");
+        t.write("data/cut_short.rda", &cut[..cut.len() / 2]);
+        t.fixture("data/mixed_builtin.rda", "R/sysdata.rda");
+        t.fixture("man/altrep_frame.Rd", "man/altrep_frame.Rd");
+        for f in ["ext_comma.csv", "ext_ignored.xlsx", "ext_object.rds", "ext_tabbed.tsv", "nested/ext_nested.csv"] {
+            t.fixture(&format!("inst/extdata/{f}"), &format!("extdata/{f}"));
+        }
+        t
+    }
+
+    fn left_out(files: &[&str]) -> BTreeSet<String> {
+        files.iter().map(|f| f.to_string()).collect()
+    }
+
+    fn printed(recs: &[Value]) -> Vec<String> {
+        recs.iter().map(Value::to_string).collect()
+    }
+
+    /// The records handed over a file at a time are the records the scan held
+    /// to its end, in the same order, and collected they are the same again.
+    #[test]
+    fn each_file_hands_over_what_the_whole_scan_held() {
+        let rearranged = rearranged_package();
+        let empty = TempPackage::new("empty");
+        let fixture = Path::new("tests/fixtures/pkg");
+        let cases: [(&str, &Path, BTreeSet<String>, usize); 6] = [
+            ("the fixtures", fixture, left_out(&[]), 127),
+            (
+                "the fixtures with files left out",
+                fixture,
+                left_out(&[
+                    "data/one_per_name.rda",
+                    "data/altrep_frame.rda",
+                    "man/altrep_frame.Rd",
+                    "inst/extdata/ext_comma.csv",
+                ]),
+                125,
+            ),
+            ("an installed tree", &rearranged.0, left_out(&[]), 15),
+            (
+                "an installed tree with files left out",
+                &rearranged.0,
+                left_out(&["R/sysdata.rda", "data/plain_frame.rda", "extdata/nested/ext_nested.csv"]),
+                11,
+            ),
+            ("a package with no data", &empty.0, left_out(&[]), 0),
+            ("a directory that is not there", Path::new("tests/fixtures/pkg/absent"), left_out(&[]), 0),
+        ];
+        for (what, root, excluded, n) in cases {
+            let held = scan_package_held(root, &excluded);
+            assert_eq!(held.len(), n, "{what}: records");
+            let mut handed = Vec::new();
+            scan_package_each(root, &excluded, &mut |rec| handed.push(rec));
+            assert_eq!(printed(&handed), printed(&held), "{what}: handed over");
+            assert_eq!(printed(&scan_package(root, &excluded)), printed(&held), "{what}: collected");
+        }
+        // What the installed tree adds is there to be compared.
+        let recs = scan_package_held(&rearranged.0, &left_out(&[]));
+        let of = |file: &str| -> Vec<&Value> { recs.iter().filter(|r| r["file"] == file).collect() };
+        assert_eq!(of("data/v1_ascii_frame.rda").len(), 3, "a file of several objects");
+        assert_eq!(of("R/sysdata.rda").len(), 2);
+        assert!(of("R/sysdata.rda").iter().all(|r| r["origin_dir"] == "sysdata" && r["internal"] == true));
+        assert_eq!(of("data/made.R")[0]["format"], "script");
+        assert_eq!(of("data/cut_short.rda")[0]["confidence"], "degraded");
+        assert_eq!(of("data/ws_ragged.tab")[0]["notes"], "text: data() cannot load this file");
+        assert_eq!(of("data/plain_frame.rda")[0]["title"], "Readings from the `example` instrument");
+        assert_eq!(recs.iter().filter(|r| r["origin_dir"] == "extdata").count(), 4);
+    }
+
+    /// A file's records are handed over before the next file is opened: a
+    /// file changed while the one before it is handed over is read as changed.
+    #[test]
+    fn a_file_is_handed_over_before_the_next_is_read() {
+        let t = TempPackage::new("in-turn");
+        t.fixture("data/v1_ascii_frame.rda", "data/a_first.rda");
+        t.write("data/b_second.csv", b"x;y\n1;2\n");
+        t.write("extdata/c_third.csv", b"x,y\n1,2\n");
+        let mut handed: Vec<Value> = Vec::new();
+        scan_package_each(&t.0, &BTreeSet::new(), &mut |rec| {
+            let next = match rec["file"].as_str() {
+                Some("data/a_first.rda") => Some(("data/b_second.csv", "3;4\n")),
+                Some("data/b_second.csv") => Some(("extdata/c_third.csv", "3,4\n")),
+                _ => None,
+            };
+            if let Some((next, row)) = next {
+                // One row longer each time a record of the file before it arrives.
+                let grown = std::fs::read_to_string(t.0.join(next)).expect("read the next file") + row;
+                t.write(next, grown.as_bytes());
+            }
+            handed.push(rec);
+        });
+        let files: Vec<&str> = handed.iter().map(|r| r["file"].as_str().unwrap()).collect();
+        assert_eq!(
+            files,
+            ["data/a_first.rda", "data/a_first.rda", "data/a_first.rda", "data/b_second.csv", "inst/extdata/c_third.csv"]
+        );
+        assert_eq!(handed[3]["nrow"], 4, "all three objects of the first file came before the second was read");
+        assert_eq!(handed[4]["nrow"], 2, "and the one record of the second before the third was");
+        // Held to the end, the same scan reads every file as it was first written.
+        let t = TempPackage::new("in-turn-held");
+        t.fixture("data/v1_ascii_frame.rda", "data/a_first.rda");
+        t.write("data/b_second.csv", b"x;y\n1;2\n");
+        t.write("extdata/c_third.csv", b"x,y\n1,2\n");
+        let held = scan_package_held(&t.0, &BTreeSet::new());
+        assert_eq!((held[3]["nrow"].clone(), held[4]["nrow"].clone()), (json!(1), json!(1)));
     }
 }

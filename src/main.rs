@@ -4160,9 +4160,7 @@ fn run() {
     // runtime.
     let t_data = std::time::Instant::now();
     if content_known {
-        for rec in rds::scan_package(&root, &excluded) {
-            println!("{rec}");
-        }
+        rds::scan_package_each(&root, &excluded, &mut |rec| println!("{rec}"));
     }
     stats.ms_data += ms_since(t_data);
     stats.files_data = num_data_files as u64;

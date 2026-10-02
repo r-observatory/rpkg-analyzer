@@ -76,3 +76,20 @@ fn call_edges_come_out_in_node_order_within_each_graph() {
     want.sort();
     assert_eq!(native, want, "native edges in name order");
 }
+
+/// The dataset records of a run are the ones the data mode prints, in its
+/// order, and nothing is printed after them or among the other records.
+#[test]
+fn dataset_records_end_the_output_in_the_order_of_the_data_mode() {
+    let fixtures = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/pkg");
+    let whole = String::from_utf8(stdout_of(fixtures)).expect("utf-8 output");
+    let data = run(&["--datasets", fixtures]);
+    assert!(data.status.success(), "the data mode exited {:?}", data.status.code());
+    let data = String::from_utf8(data.stdout).expect("utf-8 output");
+    assert_eq!(data.lines().count(), 127, "one record per saved object");
+    assert!(whole.ends_with(&data), "the dataset records end the output");
+    for line in whole[..whole.len() - data.len()].lines() {
+        let rec: Value = serde_json::from_str(line).expect("one JSON record per line");
+        assert_ne!(rec["rec"], "dataset", "a dataset record among the others");
+    }
+}
