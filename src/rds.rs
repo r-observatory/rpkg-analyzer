@@ -83,6 +83,50 @@ const CELL_CAP: usize = 8_000_000;
 /// there is no way back to the start of the next object.
 const ITEM_BUDGET: u32 = 5_000_000;
 
+/// What one data file may keep before it is counted as over, by the count the
+/// reader makes as it goes: 48 bytes an object, 4 or 8 a cell that is kept,
+/// a string at `string_kept`. The item budget bounds how many objects a file
+/// holds and the cell cap how long one vector is, and nothing bounds their
+/// sum. This does not either. No read is stopped by it: it is counted, so
+/// that the files a bound would stop are known before there is one.
+const KEPT_BUDGET: u64 = 1536 << 20;
+
+/// The longest text table that is not counted as over, in rows.
+const ROW_BUDGET: usize = 8_000_000;
+
+/// What a string of `n` bytes costs to keep: its place in the vector that
+/// holds it, and the block glibc sets aside for its bytes.
+fn string_kept(n: usize) -> u64 {
+    24 + ((n as u64 + 8 + 15) & !15).max(32)
+}
+
+/// What the data files of a run kept, for its statistics line.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Kept {
+    /// The most any one file kept, in bytes.
+    pub max: u64,
+    /// The files that kept more than `KEPT_BUDGET`, or were a text table of
+    /// more than `ROW_BUDGET` rows.
+    pub over: u64,
+}
+
+thread_local! {
+    static KEPT: std::cell::Cell<Kept> = const { std::cell::Cell::new(Kept { max: 0, over: 0 }) };
+}
+
+/// Counts one file that kept `bytes`, in the `rows` of a text table if it
+/// was one.
+fn file_kept(bytes: u64, rows: usize) {
+    let was = KEPT.get();
+    let over = bytes > KEPT_BUDGET || rows > ROW_BUDGET;
+    KEPT.set(Kept { max: was.max.max(bytes), over: was.over + over as u64 });
+}
+
+/// What the files read on this thread have kept so far.
+pub fn kept() -> Kept {
+    KEPT.get()
+}
+
 /// The width past which describing every column one at a time stops being a
 /// description.
 ///
@@ -380,6 +424,8 @@ struct Reader<'a> {
     ver: i32,
     refs: Vec<Node>,
     budget: u32,
+    /// What the file has kept so far, by the count `KEPT_BUDGET` describes.
+    kept: u64,
     /// Where the stack was when the read began.
     base: usize,
     /// Whether the decoder may still have an error to report.
@@ -427,11 +473,25 @@ impl<'a> Reader<'a> {
         // Latin-1 is not UTF-8, and reading it as though it were replaces
         // every accented character with a marker: the text is wrong, and so
         // is the fingerprint taken over it.
-        Ok(if latin1 {
+        let text = if latin1 {
             raw.iter().map(|b| *b as char).collect::<String>()
         } else {
             String::from_utf8_lossy(raw).into_owned()
-        })
+        };
+        self.kept += string_kept(text.len());
+        Ok(text)
+    }
+    /// A compact sequence written out, counted as the cells it now is. Out
+    /// of line for the same reason.
+    #[inline(never)]
+    fn expanded(&mut self, state: &Node, want_int: bool) -> Option<Val> {
+        let val = expand_seq(state, want_int);
+        match &val {
+            Some(Val::Ints { len, .. }) => self.kept += 4 * *len as u64,
+            Some(Val::Reals { len, .. }) => self.kept += 8 * *len as u64,
+            _ => {}
+        }
+        val
     }
     /// The headers of a data file and the one object after them.
     fn file(&mut self) -> Result<Parsed, String> {
@@ -454,7 +514,9 @@ impl<'a> Reader<'a> {
         if is_v1 {
             let bytes = self.s.rest();
             let text = String::from_utf8_lossy(&bytes);
-            return Ok(Parsed::Text(read_ascii_v1(&text)?));
+            let objects = read_ascii_v1(&text)?;
+            self.kept += objects.iter().map(|(_, object)| node_kept(object)).sum::<u64>();
+            return Ok(Parsed::Text(objects));
         }
         let sel = self.s.held()[0];
         if sel != b'X' {
@@ -530,6 +592,7 @@ impl<'a> Reader<'a> {
             return Err("item budget exceeded".into());
         }
         self.budget -= 1;
+        self.kept += 48;
         // Before going deeper than this, find out whether the decoder passes
         // the file. If it does, the rest is read as it always was, at any
         // depth. If it does not, its error is the outcome and nothing more is
@@ -636,6 +699,7 @@ impl<'a> Reader<'a> {
                     let of = if t == LGLSXP { "logical" } else { "integer" };
                     return Ok(Node { val: Val::Blob { len: n, of, digest: Some(digest) }, attr });
                 }
+                self.kept += 4 * n as u64;
                 let mut vals = Vec::with_capacity(n);
                 for _ in 0..n {
                     vals.push(self.i32()?);
@@ -656,6 +720,7 @@ impl<'a> Reader<'a> {
                         attr,
                     });
                 }
+                self.kept += 8 * n as u64;
                 let mut vals = Vec::with_capacity(n);
                 for _ in 0..n {
                     vals.push(self.f64()?);
@@ -789,8 +854,8 @@ impl<'a> Reader<'a> {
                 let val = match cls.as_str() {
                     // state is c(length, start, step); expand it back to the
                     // vector R would have materialized on access.
-                    "compact_intseq" => expand_seq(&state, true),
-                    "compact_realseq" => expand_seq(&state, false),
+                    "compact_intseq" => self.expanded(&state, true),
+                    "compact_realseq" => self.expanded(&state, false),
                     // A wrapper carries the real vector as the first element of
                     // its state and adds only metadata, so unwrap to it.
                     _ if cls.starts_with("wrap_") => first_element(&mut state),
@@ -4340,6 +4405,22 @@ fn v1_build(
     Node { val, attr }
 }
 
+/// What an object of the old format keeps, at the sizes the reader of the
+/// newer ones counts by. That format is taken whole and built afterwards, at
+/// most 64 levels deep, so it is counted when it is built.
+fn node_kept(node: &Node) -> u64 {
+    let own = match &node.val {
+        Val::Sym(s) | Val::Char(Some(s)) => string_kept(s.len()),
+        Val::Str(v) => v.iter().map(|s| 48 + s.as_ref().map_or(0, |s| string_kept(s.len()))).sum(),
+        Val::Ints { vals, .. } => 4 * vals.len() as u64,
+        Val::Reals { vals, .. } => 8 * vals.len() as u64,
+        Val::Vec(items) => items.iter().map(node_kept).sum(),
+        Val::List { tag, car, cdr } => node_kept(tag) + node_kept(car) + node_kept(cdr),
+        _ => 0,
+    };
+    48 + own + node.attr.as_deref().map_or(0, node_kept)
+}
+
 /// One object out of a data file: its name, the object, the container format,
 /// the serialization version and the compression.
 type Loaded = (String, Node, String, i32, String);
@@ -4369,6 +4450,7 @@ fn read_stream(from: Box<dyn std::io::Read + '_>, comp: &str) -> Result<Vec<Load
         ver: 0,
         refs: Vec::new(),
         budget: ITEM_BUDGET,
+        kept: 0,
         base: stack_here(),
         unverified: true,
     };
@@ -4378,6 +4460,8 @@ fn read_stream(from: Box<dyn std::io::Read + '_>, comp: &str) -> Result<Vec<Load
     // there: a checksum that does not match is the last thing a decoder says.
     r.s.run_out();
     let failed = r.s.failed.take();
+    // What was kept was kept whether or not the file is then refused.
+    file_kept(r.kept, 0);
     // Nothing reads the reference table past this point.
     drop(r);
     if let Some(e) = failed {
@@ -4777,6 +4861,30 @@ fn table_ncol(text: &str, sep: char) -> Option<usize> {
     table_shape(text, sep, |_| {}).map(|(header, _)| header.len())
 }
 
+/// What a table read from text keeps: each column as the vector it was typed
+/// to, an object with a name, and for each row eight bytes for where its
+/// cells start and eight for its hash in the sketch. A table too wide to type
+/// in place also lists a column's cells, sixteen bytes a row. The text and
+/// the cells cut from it are not in the count: they are gone once the columns
+/// are typed.
+fn table_kept(cols: &[Node], names: &[String], nrow: usize) -> u64 {
+    let columns: u64 = cols
+        .iter()
+        .zip(names)
+        .map(|(col, name)| {
+            let cells: u64 = match &col.val {
+                Val::Ints { vals, .. } => 4 * vals.len() as u64,
+                Val::Reals { vals, .. } => 8 * vals.len() as u64,
+                Val::Str(v) => v.iter().map(|s| s.as_ref().map_or(24, |s| string_kept(s.len()))).sum(),
+                _ => 0,
+            };
+            48 + string_kept(name.len()) + cells
+        })
+        .sum();
+    let a_row = if names.len() > IN_PLACE { 32 } else { 16 };
+    columns + a_row * nrow as u64
+}
+
 /// The cells of a table, each kept once: one run of bytes, a row after a
 /// row, and for each cell where it ends, counted from the start of its row.
 /// A string of its own for every cell cost several times the text.
@@ -4912,6 +5020,7 @@ fn read_text(
     let (text, comp) = decompress_text(std::fs::read(path).ok()?)?;
     let fmt = if sep == WS { "tab" } else { "csv" };
     let (cols, names, nrow) = parse_table(&text, sep)?;
+    file_kept(table_kept(&cols, &names, nrow), nrow);
     // Only worth asking when the rules produced one column, which is the shape
     // a wrong separator always leaves behind.
     let mut alt = None;
@@ -4948,6 +5057,7 @@ fn read_text_free(path: &Path) -> Option<(Vec<Node>, Vec<String>, usize, &'stati
         .map(|(c, f, _)| (c, f))
         .unwrap_or((WS, "txt"));
     let (cols, names, nrow) = parse_table(&text, sep)?;
+    file_kept(table_kept(&cols, &names, nrow), nrow);
     Some((cols, names, nrow, fmt, comp, None))
 }
 
@@ -11039,5 +11149,230 @@ mod tests {
         t.write("extdata/c_third.csv", b"x,y\n1,2\n");
         let held = scan_package_held(&t.0, &BTreeSet::new());
         assert_eq!((held[3]["nrow"].clone(), held[4]["nrow"].clone()), (json!(1), json!(1)));
+    }
+
+    /// What `read` keeps, counted on a thread of its own, where nothing else
+    /// has been read.
+    fn kept_reading(read: impl FnOnce() + Send + 'static) -> Kept {
+        std::thread::spawn(move || {
+            read();
+            kept()
+        })
+        .join()
+        .expect("the read")
+    }
+
+    /// glibc gives a block eight bytes more than was asked, rounded up to
+    /// sixteen, and never under 32. The other 24 are the string's place in
+    /// its vector.
+    #[test]
+    fn a_string_is_counted_at_the_block_it_is_given() {
+        for (n, block) in [(0, 32), (1, 32), (24, 32), (25, 48), (40, 48), (41, 64), (1000, 1008)] {
+            assert_eq!(string_kept(n), 24 + block, "{n} bytes");
+        }
+    }
+
+    #[test]
+    fn a_serialized_file_is_counted_as_it_is_read() {
+        // A list of three integers, two reals and two strings, one missing:
+        // six objects.
+        let mut w = Wire::rds();
+        w.head(VECSXP).int(3).ints(&[1, 2, 3]).reals(&[1.0, 2.0]);
+        w.head(STRSXP).int(2).chars(b"a").head(CHARSXP).int(-1);
+        let want = 6 * 48 + 3 * 4 + 2 * 8 + string_kept(1);
+        for how in PACKINGS {
+            let packed = pack(&w.0, how);
+            let counted = kept_reading(move || assert_eq!(read_bytes(&packed).map(|o| o.len()), Ok(1)));
+            assert_eq!(counted, Kept { max: want, over: 0 }, "{how}");
+        }
+        // A string is counted as the text it became, which in Latin-1 is longer.
+        let mut w = Wire::rds();
+        w.int(CHARSXP as i32 | LATIN1_MASK << 12).int(30);
+        w.0.extend_from_slice(&[0xe8; 30]);
+        let latin1 = w.0;
+        let counted = kept_reading(move || assert!(read_bytes(&latin1).is_ok()));
+        assert_eq!(counted.max, 48 + string_kept(60));
+    }
+
+    /// The count is of what is kept. A vector past the cell cap is hashed and
+    /// gone, and one at the cap is held.
+    #[test]
+    fn a_vector_the_cap_passes_over_is_not_counted() {
+        let ints = |n: usize| {
+            let mut w = Wire::rds();
+            w.head(INTSXP).int(n as i32);
+            w.0.resize(w.0.len() + 4 * n, 0);
+            w.0
+        };
+        let reals = |n: usize| {
+            let mut w = Wire::rds();
+            w.head(REALSXP).int(n as i32);
+            w.0.resize(w.0.len() + 8 * n, 0);
+            w.0
+        };
+        for (what, stream, want) in [
+            ("integers at the cap", ints(CELL_CAP), 48 + 4 * CELL_CAP as u64),
+            ("integers past it", ints(CELL_CAP + 1), 48),
+            ("reals at the cap", reals(CELL_CAP), 48 + 8 * CELL_CAP as u64),
+            ("reals past it", reals(CELL_CAP + 1), 48),
+        ] {
+            let counted = kept_reading(move || assert!(read_bytes(&stream).is_ok()));
+            assert_eq!(counted, Kept { max: want, over: 0 }, "{what}");
+        }
+    }
+
+    /// A sequence is three numbers in the file and a vector once it is read.
+    #[test]
+    fn a_compact_sequence_is_counted_as_the_vector_it_becomes() {
+        let seq = |class: &str, n: usize| {
+            let mut w = Wire::rds();
+            w.altrep(class).reals(&[n as f64, 1.0, 1.0]).nil();
+            let stream = w.0;
+            kept_reading(move || assert!(read_bytes(&stream).is_ok())).max
+        };
+        for (class, cell) in [("compact_intseq", 4), ("compact_realseq", 8)] {
+            let none = seq(class, 0);
+            assert!(none > 0, "{class}");
+            assert_eq!(seq(class, 1000) - none, 1000 * cell, "{class}");
+            assert_eq!(seq(class, CELL_CAP) - none, CELL_CAP as u64 * cell, "{class} at the cap");
+            assert_eq!(seq(class, CELL_CAP + 1), none, "{class} past the cap keeps no cell");
+        }
+    }
+
+    /// A file that is refused kept what it kept up to there.
+    #[test]
+    fn a_read_that_fails_is_still_counted() {
+        // A list of one object more than the budget allows.
+        let mut w = Wire::rds();
+        w.head(VECSXP).int(ITEM_BUDGET as i32);
+        let empty = (NILVALUE as i32).to_be_bytes().repeat(ITEM_BUDGET as usize);
+        w.0.extend_from_slice(&empty);
+        let stream = w.0;
+        let counted = kept_reading(move || {
+            assert_eq!(read_bytes(&stream).err().as_deref(), Some("item budget exceeded"));
+        });
+        assert_eq!(counted, Kept { max: 48 * ITEM_BUDGET as u64, over: 0 });
+        // A vector that ends early was given its room before that was known.
+        let mut w = Wire::rds();
+        w.ints(&[1, 2, 3]);
+        w.0.truncate(w.0.len() - 4);
+        let stream = w.0;
+        let counted = kept_reading(move || {
+            assert_eq!(read_bytes(&stream).err().as_deref(), Some("truncated stream"));
+        });
+        assert_eq!(counted.max, 48 + 3 * 4);
+    }
+
+    /// The format from before R 1.4.0 is counted once its objects are built,
+    /// at the same sizes.
+    #[test]
+    fn the_old_text_format_is_counted_when_it_is_built() {
+        let ints = Node { val: Val::Ints { len: 3, vals: vec![1, 2, 3], logical: false }, attr: None };
+        let reals = Node { val: Val::Reals { len: 2, vals: vec![1.0, 2.0] }, attr: None };
+        let text = Node { val: Val::Str(vec![Some("ab".into()), None]), attr: None };
+        let names = Node { val: Val::Str(vec![Some("x".into()), Some("y".into()), Some("z".into())]), attr: None };
+        let frame = Node { val: Val::Vec(vec![ints, reals, text]), attr: Some(Box::new(names)) };
+        let want = 48
+            + (48 + 3 * 4)
+            + (48 + 2 * 8)
+            + (48 + (48 + string_kept(2)) + 48)
+            + (48 + 3 * (48 + string_kept(1)));
+        assert_eq!(node_kept(&frame), want);
+        let symbol = Node { val: Val::Sym("name".into()), attr: None };
+        let nothing = || Box::new(Node { val: Val::Nil, attr: None });
+        assert_eq!(node_kept(&symbol), 48 + string_kept(4));
+        let cell = Node { val: Val::List { tag: Box::new(symbol), car: nothing(), cdr: nothing() }, attr: None };
+        assert_eq!(node_kept(&cell), 48 + (48 + string_kept(4)) + 48 + 48);
+
+        let raw = std::fs::read("tests/fixtures/pkg/data/v1_ascii_frame.rda").expect("the fixture");
+        let objects = read_bytes(&raw).expect("the fixture reads");
+        let want: u64 = objects.iter().map(|(_, node, ..)| node_kept(node)).sum();
+        assert!(want > 48 * objects.len() as u64, "{want}");
+        let counted = kept_reading(move || assert!(read_bytes(&raw).is_ok()));
+        assert_eq!(counted, Kept { max: want, over: 0 });
+    }
+
+    /// A table read from text is its typed columns and sixteen bytes a row,
+    /// or thirty-two where a column's cells are listed to type it.
+    #[test]
+    fn a_text_table_is_counted_by_its_columns_and_its_rows() {
+        let (cols, names, nrow) = parse_table("a;bb;c\n1;x;1.5\n2;;2.5\n", ';').expect("a table");
+        // An object and a name a column, then two integers, a string and a
+        // missing one, and two reals.
+        let columns = 3 * 48 + 2 * string_kept(1) + string_kept(2);
+        let cells = 2 * 4 + (string_kept(1) + 24) + 2 * 8;
+        assert_eq!(table_kept(&cols, &names, nrow), columns + cells + 2 * 16);
+
+        let wide = |ncol: usize| {
+            let row = vec!["7"; ncol].join(";");
+            let header = (0..ncol).map(|j| format!("v{j}")).collect::<Vec<_>>().join(";");
+            let (cols, names, nrow) = parse_table(&format!("{header}\n{row}\n{row}\n"), ';').expect("a table");
+            table_kept(&cols, &names, nrow)
+        };
+        let a_column = 48 + string_kept(3) + 2 * 4;
+        assert_eq!(wide(IN_PLACE), IN_PLACE as u64 * a_column + 2 * 16);
+        assert_eq!(wide(IN_PLACE + 1), (IN_PLACE as u64 + 1) * a_column + 2 * 32);
+    }
+
+    /// The scan counts each file once, and the figure is the largest file's
+    /// and not the sum. A text file that is no table kept nothing.
+    #[test]
+    fn a_run_counts_its_largest_file() {
+        let t = TempPackage::new("kept");
+        t.write("data/small.csv", b"a;b\n1;2\n");
+        t.write("data/large.csv", b"a;b\n1;2\n3;4\n5;6\n");
+        t.write("data/ragged.csv", b"a;b\n1;2\n3\n");
+        t.write("inst/extdata/free.csv", b"a,b\n1,2\n3,4\n");
+        let a_table = |rows: u64| 2 * (48 + string_kept(1) + 4 * rows) + 16 * rows;
+        let scanned = |root: &Path, records: usize| {
+            let root = root.to_path_buf();
+            kept_reading(move || {
+                let mut handed = 0;
+                scan_package_each(&root, &BTreeSet::new(), &mut |_| handed += 1);
+                assert_eq!(handed, records);
+            })
+        };
+        assert_eq!(scanned(&t.0, 4), Kept { max: a_table(3), over: 0 });
+        // A file outside data/ is read by other rules and counted the same.
+        t.write("inst/extdata/free.csv", b"a,b\n1,2\n3,4\n5,6\n7,8\n");
+        assert_eq!(scanned(&t.0, 4), Kept { max: a_table(4), over: 0 });
+
+        let alone = TempPackage::new("kept-alone");
+        alone.write("data/ragged.csv", b"a;b\n1;2\n3\n");
+        assert_eq!(scanned(&alone.0, 1), Kept::default());
+
+        let serialized = TempPackage::new("kept-serialized");
+        serialized.fixture("data/plain_frame.rda", "data/plain_frame.rda");
+        serialized.write("data/small.csv", b"a;b\n1;2\n");
+        let counted = scanned(&serialized.0, 2);
+        assert!(counted.max > a_table(1), "{counted:?}");
+        assert_eq!(counted.over, 0);
+    }
+
+    /// A file is over at one byte past 1,536 MiB, a text table at one row
+    /// past eight million, and a file that is both is one file.
+    #[test]
+    fn a_file_past_a_line_is_counted_as_over_once() {
+        assert_eq!(KEPT_BUDGET, 1_610_612_736);
+        assert_eq!(ROW_BUDGET, 8_000_000);
+        // The README gives the two lines as these numbers.
+        let readme = std::fs::read_to_string("README.md").expect("read README.md");
+        for line in ["1,610,612,736 bytes", "8,000,000 rows"] {
+            assert!(readme.contains(line), "the README does not say {line}");
+        }
+        let counted = kept_reading(|| {
+            file_kept(KEPT_BUDGET, 0);
+            file_kept(7, ROW_BUDGET);
+        });
+        assert_eq!(counted, Kept { max: KEPT_BUDGET, over: 0 });
+        let counted = kept_reading(|| {
+            file_kept(KEPT_BUDGET + 1, 0);
+            file_kept(7, ROW_BUDGET + 1);
+            file_kept(KEPT_BUDGET + 2, ROW_BUDGET + 1);
+            file_kept(9, 9);
+        });
+        assert_eq!(counted, Kept { max: KEPT_BUDGET + 2, over: 3 });
+        // Nothing read, nothing counted.
+        assert_eq!(kept_reading(|| {}), Kept::default());
     }
 }

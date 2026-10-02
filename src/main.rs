@@ -3329,6 +3329,7 @@ struct RunStats {
     hits_compiled: u64,
     cache_errors: u64,
     verify_mismatch: u64,
+    data_kept: rds::Kept,
 }
 
 /// Milliseconds since `t`, to the microsecond.
@@ -3378,6 +3379,8 @@ fn write_run_stats(s: &RunStats, total_ms: f64) {
         // same everywhere.
         "peak_rss_kb": peak_rss_kb,
         "peak_vm_kb": peak_vm_kb,
+        "data_kept_max": s.data_kept.max,
+        "data_over_budget": s.data_kept.over,
     });
     let appended = std::fs::OpenOptions::new().create(true).append(true).open(path);
     if let Ok(mut f) = appended {
@@ -4218,6 +4221,7 @@ fn run() {
     let t_data = std::time::Instant::now();
     if content_known {
         rds::scan_package_each(&root, &excluded, &mut |rec| println!("{rec}"));
+        stats.data_kept = rds::kept();
     }
     stats.ms_data += ms_since(t_data);
     stats.files_data = num_data_files as u64;
