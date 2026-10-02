@@ -4439,8 +4439,9 @@ fn is_na_text(s: &str) -> bool {
 // Infer a column type from delimited-text cells, building the same Node the
 // binary path produces so the value profile and fingerprints are shared (and a
 // text dataset can match a serialized one with the same data).
-fn infer_column(cells: &[String]) -> Node {
-    let non_na: Vec<&str> = cells.iter().map(|s| s.as_str()).filter(|c| !is_na_text(c)).collect();
+fn infer_column<S: AsRef<str>>(cells: &[S]) -> Node {
+    let cells = cells.iter().map(|c| c.as_ref());
+    let non_na: Vec<&str> = cells.clone().filter(|c| !is_na_text(c)).collect();
     let all_int = !non_na.is_empty()
         && non_na.iter().all(|c| !c.contains('.') && c.parse::<i32>().is_ok());
     let all_logical = !non_na.is_empty()
@@ -4450,17 +4451,15 @@ fn infer_column(cells: &[String]) -> Node {
     let all_num = !non_na.is_empty() && non_na.iter().all(|c| c.parse::<f64>().is_ok());
     if all_int {
         let vals = cells
-            .iter()
             .map(|c| if is_na_text(c) { NA_INT } else { c.parse().unwrap_or(NA_INT) })
             .collect::<Vec<_>>();
         Node { val: Val::Ints { len: vals.len(), vals, logical: false }, attr: None }
     } else if all_logical {
         let vals = cells
-            .iter()
             .map(|c| {
                 if is_na_text(c) {
                     NA_INT
-                } else if c.eq_ignore_ascii_case("true") || *c == "T" {
+                } else if c.eq_ignore_ascii_case("true") || c == "T" {
                     1
                 } else {
                     0
@@ -4470,14 +4469,12 @@ fn infer_column(cells: &[String]) -> Node {
         Node { val: Val::Ints { len: vals.len(), vals, logical: true }, attr: None }
     } else if all_num {
         let vals = cells
-            .iter()
             .map(|c| if is_na_text(c) { f64::NAN } else { c.parse().unwrap_or(f64::NAN) })
             .collect::<Vec<_>>();
         Node { val: Val::Reals { len: vals.len(), vals }, attr: None }
     } else {
         let vals = cells
-            .iter()
-            .map(|c| if is_na_text(c) { None } else { Some(c.clone()) })
+            .map(|c| if is_na_text(c) { None } else { Some(c.to_string()) })
             .collect::<Vec<_>>();
         Node { val: Val::Str(vals), attr: None }
     }
@@ -4618,19 +4615,159 @@ fn decompress_text(raw: Vec<u8>) -> Option<(String, &'static str)> {
     // is applied within a line: a \r inside a quoted field of an otherwise
     // LF-terminated file is data, and folding it would break the row into two and
     // cost the whole file, since a row of the wrong width is refused.
-    let lossy = String::from_utf8_lossy(&bytes);
+    // Valid bytes are the text as they stand. Only the rest are copied.
+    let lossy = match String::from_utf8(bytes) {
+        Ok(text) => text,
+        Err(not_text) => String::from_utf8_lossy(not_text.as_bytes()).into_owned(),
+    };
     // Most files carry no \r at all, and those pay one scan rather than a rewrite.
     let text = if lossy.contains('\r') {
         let folded = lossy.replace("\r\n", "\n");
         if folded.contains('\n') { folded } else { folded.replace('\r', "\n") }
     } else {
-        lossy.into_owned()
+        lossy
     };
     Some((text, comp))
 }
 
 /// Split a delimited table that has already been read into memory.
+///
+/// Each cell is kept once, in `Cells`, and a column is typed from slices of
+/// what is kept there.
 fn parse_table(text: &str, sep: char) -> Option<(Vec<Node>, Vec<String>, usize)> {
+    parse_table_within(text, sep, ROW_MAX)
+}
+
+/// The most bytes the cells of one row can hold, where an end takes four.
+const ROW_MAX: usize = u32::MAX as usize;
+
+/// `parse_table`, for rows of at most `row_max` bytes. A table with a longer
+/// row is read by `parse_table_by_row`.
+fn parse_table_within(text: &str, sep: char, row_max: usize) -> Option<(Vec<Node>, Vec<String>, usize)> {
+    let mut cells = Cells::new(row_max);
+    let (header, nrow) = table_shape(text, sep, |row| cells.push_row(row))?;
+    if cells.over {
+        return parse_table_by_row(text, sep);
+    }
+    let mut names: Vec<String> = header.iter().map(|n| make_names(n)).collect();
+    for (j, n) in names.iter_mut().enumerate() {
+        if n.is_empty() {
+            *n = format!("V{}", j + 1);
+        }
+    }
+    // One column at a time, borrowed from where the cells are kept.
+    let mut column: Vec<&str> = Vec::with_capacity(nrow);
+    let cols = (0..names.len())
+        .map(|j| {
+            column.clear();
+            column.extend(cells.column(j));
+            infer_column(&column)
+        })
+        .collect();
+    Some((cols, names, nrow))
+}
+
+/// A table's header and its row count, or None for what `parse_table_by_row`
+/// refuses, by the same rules. The cells of each row are handed to `keep` as
+/// the row is split, without the field that names the row. A row of the wrong
+/// width ends the read, since no row after it can make the file a table.
+fn table_shape(text: &str, sep: char, mut keep: impl FnMut(&[String])) -> Option<(Vec<String>, usize)> {
+    let mut header: Option<Vec<String>> = None;
+    // The fields every row has to hold, which the first row settles.
+    let mut width = 0;
+    let mut nrow = 0;
+    for line in text.split(['\n', '\r']) {
+        let f = split_fields(line, sep);
+        if f.is_empty() || f.iter().all(|x| x.is_empty()) {
+            continue;
+        }
+        let Some(names) = &header else {
+            header = Some(f);
+            continue;
+        };
+        if nrow == 0 {
+            // A row one field longer than the header starts with its name.
+            if f.len() != names.len() && f.len() != names.len() + 1 {
+                return None;
+            }
+            width = f.len();
+        } else if f.len() != width {
+            return None;
+        }
+        keep(&f[width - names.len()..]);
+        nrow += 1;
+    }
+    // A header with nothing under it is not a table.
+    if nrow == 0 {
+        return None;
+    }
+    Some((header?, nrow))
+}
+
+/// How many columns `parse_table` finds. No cell is kept to find out.
+fn table_ncol(text: &str, sep: char) -> Option<usize> {
+    table_shape(text, sep, |_| {}).map(|(header, _)| header.len())
+}
+
+/// The cells of a table, each kept once: one run of bytes, a row after a
+/// row, and for each cell where it ends, counted from the start of its row.
+/// A string of its own for every cell cost several times the text.
+struct Cells {
+    bytes: String,
+    ends: Vec<u32>,
+    /// Where each row starts in `bytes`.
+    rows: Vec<usize>,
+    /// The cells in a row.
+    width: usize,
+    row_max: usize,
+    /// A row was longer than `row_max`, and nothing is kept.
+    over: bool,
+}
+
+impl Cells {
+    fn new(row_max: usize) -> Self {
+        Cells {
+            bytes: String::new(),
+            ends: Vec::new(),
+            rows: Vec::new(),
+            width: 0,
+            row_max: row_max.min(ROW_MAX),
+            over: false,
+        }
+    }
+
+    fn push_row(&mut self, cells: &[String]) {
+        if self.over {
+            return;
+        }
+        if cells.iter().map(|c| c.len()).sum::<usize>() > self.row_max {
+            *self = Cells { over: true, ..Cells::new(self.row_max) };
+            return;
+        }
+        self.width = cells.len();
+        self.rows.push(self.bytes.len());
+        let mut end = 0;
+        for cell in cells {
+            self.bytes.push_str(cell);
+            end += cell.len();
+            self.ends.push(end as u32);
+        }
+    }
+
+    /// The cells of column `j`, from the first row to the last.
+    fn column(&self, j: usize) -> impl Iterator<Item = &str> {
+        let rows = self.rows.iter().zip(self.ends.chunks_exact(self.width.max(1)));
+        rows.map(move |(start, ends)| {
+            let from = if j == 0 { 0 } else { ends[j - 1] as usize };
+            &self.bytes[start + from..start + ends[j] as usize]
+        })
+    }
+}
+
+/// The same table, read by holding every row and then every column, a
+/// string to a cell. It is the reader for a row too long for `Cells`, and
+/// what the tests hold `parse_table` to.
+fn parse_table_by_row(text: &str, sep: char) -> Option<(Vec<Node>, Vec<String>, usize)> {
     let mut rows: Vec<Vec<String>> = Vec::new();
     let mut header: Option<Vec<String>> = None;
     // Split on either ending. A file written on a Mac before OS X separates its
@@ -4715,11 +4852,11 @@ fn read_text(
             if cand == sep {
                 continue;
             }
-            if let Some((_, n2, _)) = parse_table(&text, cand) {
-                if n2.len() > 1 {
+            if let Some(n2) = table_ncol(&text, cand) {
+                if n2 > 1 {
                     match alt {
-                        Some((_, best)) if best >= n2.len() => {}
-                        _ => alt = Some((cand, n2.len())),
+                        Some((_, best)) if best >= n2 => {}
+                        _ => alt = Some((cand, n2)),
                     }
                 }
             }
@@ -9629,5 +9766,551 @@ mod tests {
         }
         assert!(tables >= 6, "the sound tables read: {tables}");
         assert!(refused >= 1000, "and the damaged ones do not: {refused}");
+    }
+
+    // ---- a text table, held to the reader that kept every row ----
+
+    type Table = (Vec<Node>, Vec<String>, usize);
+
+    /// Every separator a table is read under.
+    const SEPS: [char; 5] = [WS, ',', ';', '\t', '|'];
+
+    /// Where two readings of one table part, or nothing when they are the same.
+    fn table_difference(new: &Option<Table>, old: &Option<Table>) -> Option<String> {
+        match (new, old) {
+            (None, None) => None,
+            (Some(_), None) => Some("it is a table and it was refused".into()),
+            (None, Some(_)) => Some("it is refused and it was a table".into()),
+            (Some((c1, n1, r1)), Some((c2, n2, r2))) => {
+                if n1 != n2 {
+                    return Some(format!("the names are {n1:?} and were {n2:?}"));
+                }
+                if r1 != r2 {
+                    return Some(format!("{r1} rows against {r2}"));
+                }
+                if c1.len() != c2.len() {
+                    return Some(format!("{} columns against {}", c1.len(), c2.len()));
+                }
+                c1.iter()
+                    .zip(c2)
+                    .enumerate()
+                    .find_map(|(j, (a, b))| node_difference(a, b).map(|d| format!("column {j}{d}")))
+            }
+        }
+    }
+
+    /// One text under one separator, through both readers: the table, its
+    /// column count alone, and the table again when rows are too long for
+    /// their offsets. Returns what the reader that keeps every row made of it.
+    fn same_table(what: &str, text: &str, sep: char) -> Option<Table> {
+        let old = parse_table_by_row(text, sep);
+        let new = parse_table(text, sep);
+        if let Some(d) = table_difference(&new, &old) {
+            panic!("{what}, separator {sep:?}: {d}\n{text:?}");
+        }
+        assert_eq!(
+            table_ncol(text, sep),
+            old.as_ref().map(|t| t.1.len()),
+            "{what}, separator {sep:?}: the column count alone\n{text:?}"
+        );
+        for row_max in [0, 2, 7] {
+            let short = parse_table_within(text, sep, row_max);
+            if let Some(d) = table_difference(&short, &old) {
+                panic!("{what}, separator {sep:?}, rows of at most {row_max} bytes: {d}\n{text:?}");
+            }
+        }
+        old
+    }
+
+    /// How a run of comparisons came out, so a test can show it compared
+    /// tables of every kind and files that are not tables.
+    #[derive(Default)]
+    struct Tables {
+        read: usize,
+        refused: usize,
+        /// Tables of more than one column.
+        wide: usize,
+        whole: usize,
+        logical: usize,
+        real: usize,
+        text: usize,
+        missing: usize,
+    }
+
+    impl Tables {
+        fn add(&mut self, what: &str, text: &str) {
+            for sep in SEPS {
+                self.add_under(what, text, sep);
+            }
+        }
+        fn add_under(&mut self, what: &str, text: &str, sep: char) -> bool {
+            let Some((cols, _, _)) = same_table(what, text, sep) else {
+                self.refused += 1;
+                return false;
+            };
+            self.read += 1;
+            self.wide += (cols.len() > 1) as usize;
+            for col in &cols {
+                match &col.val {
+                    Val::Ints { vals, logical, .. } => {
+                        *if *logical { &mut self.logical } else { &mut self.whole } += 1;
+                        self.missing += vals.iter().filter(|v| **v == NA_INT).count();
+                    }
+                    Val::Reals { vals, .. } => {
+                        self.real += 1;
+                        self.missing += vals.iter().filter(|v| v.is_nan()).count();
+                    }
+                    Val::Str(vals) => {
+                        self.text += 1;
+                        self.missing += vals.iter().filter(|v| v.is_none()).count();
+                    }
+                    _ => panic!("{what}: a column of a type no text gives"),
+                }
+            }
+            true
+        }
+    }
+
+    /// The text of a file as it was made: copied whether or not its bytes
+    /// were valid, then folded.
+    fn text_by_copy(bytes: &[u8]) -> String {
+        let lossy = String::from_utf8_lossy(bytes);
+        if lossy.contains('\r') {
+            let folded = lossy.replace("\r\n", "\n");
+            if folded.contains('\n') { folded } else { folded.replace('\r', "\n") }
+        } else {
+            lossy.into_owned()
+        }
+    }
+
+    /// The text of bytes that are not compressed, which has to be the text
+    /// they gave before.
+    fn text_of(what: &str, bytes: &[u8]) -> String {
+        let (text, comp) = decompress_text(bytes.to_vec()).expect("plain bytes are text");
+        assert_eq!(comp, "none", "{what}");
+        assert_eq!(text, text_by_copy(bytes), "{what}");
+        text
+    }
+
+    #[test]
+    fn every_fixture_reads_as_the_table_by_row_read_it() {
+        let mut seen = Tables::default();
+        let mut files = 0;
+        for (name, raw) in fixture_files() {
+            // A serialized file is text as well, to a reader that is handed it.
+            let Some((text, _)) = decompress_text(raw) else { continue };
+            seen.add(&name, &text);
+            files += 1;
+        }
+        assert!(files >= 120, "the fixtures were read: {files}");
+        assert!(seen.read >= 300 && seen.wide >= 20, "the tables read: {} {}", seen.read, seen.wide);
+        assert!(seen.refused >= 200, "and what is not a table does not: {}", seen.refused);
+        // No fixture holds a column of TRUE and FALSE as text.
+        assert!(
+            seen.whole > 0 && seen.real > 0 && seen.text > 0 && seen.missing > 0,
+            "columns of numbers and of text, and missing values"
+        );
+    }
+
+    /// The lines of a table with `s` between its fields and `end` after each.
+    fn lines(of: &[&str], s: &str, end: &str) -> Vec<u8> {
+        of.iter()
+            .map(|l| l.replace("{s}", s) + end)
+            .collect::<String>()
+            .into_bytes()
+    }
+
+    /// One small table for each rule the reader has.
+    fn a_table_for_each_rule(s: &str) -> Vec<(&'static str, Vec<u8>)> {
+        const HEAD: &str = "id{s}name{s}val";
+        const BODY: [&str; 3] = ["1{s}x{s}1.5", "2{s}y{s}2.5", "3{s}z{s}3.5"];
+        let table = |first: &[&str], last: &[&str]| lines(&[first, &BODY[..], last].concat(), s, "\n");
+        let plain = table(&[HEAD], &[]);
+        let after = |first: &[u8]| [first, &plain[..]].concat();
+        let joined = |with: &str| [HEAD, BODY[0], BODY[1], BODY[2]].join(with).replace("{s}", s);
+        vec![
+            ("a short row", table(&[HEAD], &["4{s}w"])),
+            ("a long row", table(&[HEAD], &["4{s}w{s}4.5{s}extra"])),
+            ("a first row of the wrong width", lines(&[HEAD, "0{s}v{s}0.5{s}more{s}yet", BODY[0]], s, "\n")),
+            ("a header one field short", table(&["name{s}val"], &[])),
+            (
+                "separators inside quotes",
+                lines(&[HEAD, "1{s}\"a{s}b\"{s}1.5", "2{s}'c{s}d'{s}2.5", "3{s}\"e\"{s}3.5"], s, "\n"),
+            ),
+            (
+                "a quote that is not closed",
+                lines(&[HEAD, "1{s}it's{s}1.5", "2{s}\"open{s}2.5", "3{s}z{s}3.5"], s, "\n"),
+            ),
+            (
+                "a comment part way along a line",
+                lines(&[HEAD, "1{s}x{s}1.5 # trailing", "2{s}y{s}2.5#cut", "3{s}\"z#q\"{s}3.5"], s, "\n"),
+            ),
+            (
+                "a comment that shortens a row",
+                lines(&[HEAD, "1{s}x{s}1.5", "2{s}y # the rest is gone", "3{s}z{s}3.5"], s, "\n"),
+            ),
+            ("a comment as the first line", table(&["# a first line that reads as a comment", HEAD], &[])),
+            ("a header that starts as a comment", table(&["#id{s}name{s}val"], &[])),
+            ("lines that end in a carriage return", joined("\r").into_bytes()),
+            ("and a last one that does too", (joined("\r") + "\r").into_bytes()),
+            ("lines that end in both", (joined("\r\n") + "\r\n").into_bytes()),
+            (
+                "a carriage return before a line feed elsewhere",
+                (joined("\n").replacen('\n', "\r", 1) + "\n").into_bytes(),
+            ),
+            (
+                "a carriage return inside quotes",
+                lines(&[HEAD, "1{s}\"x\ry\"{s}1.5", "2{s}y{s}2.5", "3{s}z{s}3.5"], s, "\n"),
+            ),
+            ("blank first lines", after(b"\n  \n\t\n")),
+            ("first lines of spaces that do not break", after("\u{a0}\u{2003}\n\u{a0}\n".as_bytes())),
+            ("empty cells", lines(&[HEAD, "1{s}{s}1.5", "{s}y{s}", "3{s}z{s}3.5"], s, "\n")),
+            (
+                "every spelling of a missing value",
+                lines(
+                    &[
+                        "i{s}l{s}n{s}c",
+                        "0{s}NA{s}NA{s}NA",
+                        "1{s}na{s}na{s}na",
+                        "2{s}Na{s}Na{s}Na",
+                        "3{s}nA{s}nA{s}nA",
+                        "4{s}N/A{s}N/A{s}N/A",
+                        "5{s}.{s}.{s}.",
+                        "6{s}{s}{s}",
+                        "7{s}TRUE{s}1.5{s}txt",
+                        "8{s}FALSE{s}2{s}NA.",
+                    ],
+                    s,
+                    "\n",
+                ),
+            ),
+            (
+                "each column type",
+                lines(
+                    &[
+                        "int{s}lgl{s}num{s}chr{s}zero{s}exp{s}big{s}dot{s}tf{s}mix{s}minint",
+                        "1{s}TRUE{s}1.5{s}a{s}007{s}1e3{s}2147483647{s}1.{s}T{s}1{s}-2147483648",
+                        "2{s}F{s}inf{s}b{s}8{s}NaN{s}2147483648{s}2.{s}F{s}TRUE{s}5",
+                        "NA{s}NA{s}NA{s}NA{s}NA{s}NA{s}NA{s}NA{s}NA{s}NA{s}NA",
+                        "-3{s}true{s}-2{s}c{s}9{s}+4{s}-2147483648{s}3.{s}T{s}x{s}6",
+                    ],
+                    s,
+                    "\n",
+                ),
+            ),
+            (
+                "bytes that are not text",
+                [
+                    &lines(&[HEAD], s, "\n")[..],
+                    b"1",
+                    s.as_bytes(),
+                    b"caf\xe9",
+                    s.as_bytes(),
+                    b"1.5\n2",
+                    s.as_bytes(),
+                    b"\xff\xfe",
+                    s.as_bytes(),
+                    b"2.5\n",
+                ]
+                .concat(),
+            ),
+            ("a first line that is not text", after(b"\xff\n")),
+            ("a first line that is half a character", after(b"\xc2\n")),
+            ("a header and no row", lines(&[HEAD], s, "\n")),
+            ("nothing", Vec::new()),
+            ("only blank lines", b"\n \n\t\n".to_vec()),
+            ("one line with no line end", lines(&[HEAD], s, "")),
+            ("a header name that is empty", table(&["id{s}{s}val"], &[])),
+            ("header names that are rewritten", table(&["1st{s}_x{s}a-b.c"], &[])),
+            ("one column that another separator splits", b"a,b|c|d\n1,2|3|4\n5,6|7|8\n".to_vec()),
+        ]
+    }
+
+    #[test]
+    fn a_table_for_each_rule_reads_as_the_table_by_row_read_it() {
+        let mut seen = Tables::default();
+        let mut tables = 0;
+        for s in [",", ";", "\t", "|", " "] {
+            for (rule, bytes) in a_table_for_each_rule(s) {
+                let what = format!("{rule}, written with {s:?}");
+                seen.add(&what, &text_of(&what, &bytes));
+                tables += 1;
+            }
+        }
+        assert_eq!(tables, 150, "thirty rules under five separators");
+        assert!(seen.read >= 500 && seen.wide >= 100, "the tables read: {} {}", seen.read, seen.wide);
+        assert!(seen.refused >= 100, "and the rest do not: {}", seen.refused);
+        assert!(
+            seen.whole >= 100 && seen.logical >= 10 && seen.real >= 100 && seen.text >= 500,
+            "columns of every type"
+        );
+        assert!(seen.missing >= 100, "and missing values: {}", seen.missing);
+    }
+
+    /// What some of those rules come to, said outright.
+    #[test]
+    fn the_rules_of_a_table_are_the_ones_it_had() {
+        let read = |text: &str| parse_table(text, ',');
+        let strs = |col: &Node| match &col.val {
+            Val::Str(v) => v.clone(),
+            _ => panic!("not a text column"),
+        };
+        let ints = |col: &Node| match &col.val {
+            Val::Ints { vals, logical: false, .. } => vals.clone(),
+            _ => panic!("not a whole number column"),
+        };
+
+        // A header one field short: the first field of a row names the row.
+        let (cols, names, nrow) = read("name,val\n1,x,1.5\n2,y,2.5\n").expect("named rows");
+        assert_eq!((names, nrow, cols.len()), (vec!["name".to_string(), "val".into()], 2, 2));
+        assert_eq!(strs(&cols[0]), [Some("x".to_string()), Some("y".into())]);
+
+        // A first line that starts with # holds no field, so the first row
+        // of data is taken for the header.
+        let (cols, names, nrow) = read("#id,name,val\n1,x,1.5\n2,y,2.5\n3,z,3.5\n").expect("a table");
+        assert_eq!(names, ["X1", "x", "X1.5"]);
+        assert_eq!((nrow, ints(&cols[0])), (2, vec![2, 3]));
+
+        // Rows of different widths are no table, wherever the odd one is.
+        assert!(read("a,b\n1,2\n3\n").is_none());
+        assert!(read("a,b\n1\n2,3\n").is_none());
+        assert!(read("a,b\n1,2,3\n4,5\n").is_none());
+        assert!(read("a,b\n1,2,3\n4,5,6,7\n").is_none());
+        assert!(read("a,b\n1,2,3,4\n5,6,7,8\n").is_none());
+
+        // A separator inside quotes is part of the cell.
+        let (cols, _, _) = read("k,v\n1,\"a,b\"\n2,'c,d'\n").expect("quoted cells");
+        assert_eq!(strs(&cols[1]), [Some("a,b".to_string()), Some("c,d".into())]);
+
+        // A missing value is missing in a column of any type.
+        let (cols, _, _) = read("i,c\n1,x\nNA,N/A\n3,.\n").expect("missing values");
+        assert_eq!(ints(&cols[0]), [1, NA_INT, 3]);
+        assert_eq!(strs(&cols[1]), [Some("x".to_string()), None, None]);
+
+        // A file data() reads as one column, and the separators that split it.
+        assert_eq!(table_ncol("a,b|c|d\n1,2|3|4\n5,6|7|8\n", ';'), Some(1));
+        assert_eq!(table_ncol("a,b|c|d\n1,2|3|4\n5,6|7|8\n", ','), Some(2));
+        assert_eq!(table_ncol("a,b|c|d\n1,2|3|4\n5,6|7|8\n", '|'), Some(3));
+        assert_eq!(table_ncol("a,b|c|d\n1,2|3|4\n5,6|7|8\n", '\t'), Some(1));
+        // The count is of the header's fields, whether or not rows are named.
+        assert_eq!(table_ncol("name,val\n1,x,1.5\n", ','), Some(2));
+        assert_eq!(table_ncol("a,b\n", ','), None);
+        assert_eq!(table_ncol("a,b\n1,2\n3\n", ','), None);
+    }
+
+    /// A fixed run of numbers, so that a table that fails can be made again.
+    struct Dice(u64);
+
+    impl Dice {
+        fn roll(&mut self) -> u64 {
+            self.0 = self.0.wrapping_add(0x9e37_79b9_7f4a_7c15);
+            let mut z = self.0;
+            z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+            z ^ (z >> 31)
+        }
+        fn below(&mut self, n: usize) -> usize {
+            (self.roll() % n as u64) as usize
+        }
+        fn one_in(&mut self, n: usize) -> bool {
+            self.below(n) == 0
+        }
+        fn pick<'a>(&mut self, of: &[&'a [u8]]) -> &'a [u8] {
+            of[self.below(of.len())]
+        }
+    }
+
+    /// A table put together at random from what the rules are about: rows of
+    /// the wrong width, quotes closed and left open, separators inside
+    /// quotes, comments, each line ending, empty cells, each spelling of a
+    /// missing value, each column type, and bytes that are not text. Also
+    /// says whether its rows are named.
+    fn a_table(dice: &mut Dice) -> (Vec<u8>, bool) {
+        const BETWEEN: [&[u8]; 7] = [b",", b";", b"\t", b"|", b" ", b"  ", b" \t"];
+        const ENDS: [&[u8]; 3] = [b"\n", b"\r\n", b"\r"];
+        const NAMES: [&[u8]; 12] = [
+            b"id", b"name", b"val", b"1st", b"_x", b"a-b.c", b"", b"\"two words\"",
+            b"caf\xc3\xa9", b"V2", b".5", b"'q'",
+        ];
+        const MISSING: [&[u8]; 6] = [b"NA", b"na", b"N/A", b".", b"", b"Na"];
+        const WHOLE: [&[u8]; 6] = [b"1", b"-3", b"007", b"2147483647", b"-2147483648", b"+4"];
+        const LOGICAL: [&[u8]; 6] = [b"TRUE", b"FALSE", b"T", b"F", b"true", b"false"];
+        const REAL: [&[u8]; 8] = [b"1.5", b"-2", b"1e3", b"inf", b"NaN", b"1.", b"2147483648", b".5"];
+        const WORD: [&[u8]; 14] = [
+            b"a", b"b c", b"\"q,s\"", b"'q;s'", b"\"t\tu|v\"", b"it's", b"\"open", b"x#cut",
+            b"caf\xc3\xa9", b"\xc2\xa0", b"\"x\ry\"", b"\xff\xfe", b"\"\"", b" pad ",
+        ];
+        const ROW_NAMES: [&[u8]; 4] = [b"r1", b"r2", b"7", b"\"a row\""];
+        // A line that holds no row.
+        const STRAY: [&[u8]; 6] = [b"", b"  ", b"\t", b"# a comment", b"\xc2\xa0\xe2\x80\x83", b" # another"];
+
+        let between = dice.pick(&BETWEEN);
+        let end = dice.pick(&ENDS);
+        let mixed_ends = dice.one_in(8);
+        let ncol = 1 + dice.below(5);
+        let nrow = dice.below(7);
+        let kinds: Vec<usize> = (0..ncol).map(|_| dice.below(5)).collect();
+        let named_rows = dice.one_in(5);
+        // In some tables one row is a field short or a field long.
+        let odd_row = if nrow > 0 && dice.one_in(6) {
+            Some((dice.below(nrow), dice.one_in(2)))
+        } else {
+            None
+        };
+
+        let mut out = Vec::new();
+        let mut line = |dice: &mut Dice, fields: &[&[u8]], last: bool| {
+            if dice.one_in(6) {
+                out.extend_from_slice(dice.pick(&STRAY));
+                out.extend_from_slice(if mixed_ends { dice.pick(&ENDS) } else { end });
+            }
+            out.extend_from_slice(&fields.join(between));
+            if dice.one_in(10) {
+                out.extend_from_slice(b" # and a comment");
+            }
+            if !(last && dice.one_in(5)) {
+                out.extend_from_slice(if mixed_ends { dice.pick(&ENDS) } else { end });
+            }
+        };
+
+        let mut header: Vec<&[u8]> = (0..ncol).map(|_| dice.pick(&NAMES)).collect();
+        if dice.one_in(12) {
+            header[0] = b"#id";
+        }
+        line(dice, &header, nrow == 0);
+        for i in 0..nrow {
+            let mut row: Vec<&[u8]> = Vec::new();
+            if named_rows {
+                row.push(dice.pick(&ROW_NAMES));
+            }
+            for kind in &kinds {
+                row.push(if dice.one_in(6) {
+                    dice.pick(&MISSING)
+                } else {
+                    match kind {
+                        0 => dice.pick(&WHOLE),
+                        1 => dice.pick(&LOGICAL),
+                        2 => dice.pick(&REAL),
+                        3 => dice.pick(&WORD),
+                        _ => dice.pick(&[&WHOLE[..], &LOGICAL[..], &REAL[..], &WORD[..]].concat()),
+                    }
+                });
+            }
+            match odd_row {
+                Some((at, true)) if at == i => row.push(b"more"),
+                Some((at, false)) if at == i => {
+                    row.pop();
+                }
+                _ => {}
+            }
+            line(dice, &row, i + 1 == nrow);
+        }
+        (out, named_rows)
+    }
+
+    #[test]
+    fn a_generated_table_reads_as_the_table_by_row_read_it() {
+        let mut dice = Dice(20260);
+        let mut seen = Tables::default();
+        let (mut named, mut not_text, mut returns) = (0, 0, 0);
+        for i in 0..20_000 {
+            let (bytes, named_rows) = a_table(&mut dice);
+            let what = format!("table {i}");
+            let text = text_of(&what, &bytes);
+            not_text += std::str::from_utf8(&bytes).is_err() as usize;
+            returns += bytes.contains(&b'\r') as usize;
+            let mut read = false;
+            for sep in SEPS {
+                read |= seen.add_under(&what, &text, sep);
+            }
+            named += (read && named_rows) as usize;
+        }
+        assert!(seen.read >= 20_000 && seen.wide >= 5_000, "the tables read: {} {}", seen.read, seen.wide);
+        assert!(seen.refused >= 20_000, "and the rest do not: {}", seen.refused);
+        assert!(
+            seen.whole >= 2_000 && seen.logical >= 2_000 && seen.real >= 2_000 && seen.text >= 2_000,
+            "columns of every type: {} {} {} {}",
+            seen.whole,
+            seen.logical,
+            seen.real,
+            seen.text
+        );
+        assert!(seen.missing >= 5_000, "missing values: {}", seen.missing);
+        assert!(named >= 500, "tables whose rows are named: {named}");
+        assert!(not_text >= 500, "tables with bytes that are not text: {not_text}");
+        assert!(returns >= 5_000, "tables with a carriage return: {returns}");
+    }
+
+    /// The cells go into one run of bytes, a row after a row, and what is
+    /// kept beside them is where each one ends.
+    #[test]
+    fn the_cells_of_a_table_are_kept_once() {
+        let mut cells = Cells::new(ROW_MAX);
+        let (header, nrow) = table_shape("k,v\nr1,ab,c\n\nr2,,def\n", ',', |row| cells.push_row(row))
+            .expect("a table");
+        assert_eq!((header, nrow), (vec!["k".to_string(), "v".into()], 2));
+        // The field that names a row is not a cell.
+        assert_eq!(cells.bytes, "abcdef");
+        // An end is counted from where its row starts, and takes four bytes.
+        assert_eq!(cells.ends, [2u32, 3, 0, 3]);
+        assert_eq!(cells.rows, [0, 3]);
+        assert!(!cells.over);
+        assert_eq!(cells.column(0).collect::<Vec<_>>(), ["ab", ""]);
+        assert_eq!(cells.column(1).collect::<Vec<_>>(), ["c", "def"]);
+    }
+
+    /// An offset of four bytes cannot say where a cell ends in a row longer
+    /// than it counts. Such a table is read by keeping every row.
+    #[test]
+    fn a_row_too_long_for_its_offsets_is_read_by_row() {
+        assert_eq!(ROW_MAX, u32::MAX as usize, "as far as four bytes count");
+        let text = "a,b\n1,2\n333,4444\n5,6\n";
+        let fits = |row_max| {
+            let mut cells = Cells::new(row_max);
+            table_shape(text, ',', |row| cells.push_row(row)).expect("a table");
+            // What was kept of a table that does not fit is let go.
+            assert_eq!(cells.over, cells.bytes.is_empty() && cells.ends.is_empty() && cells.rows.is_empty());
+            !cells.over
+        };
+        assert!(fits(7), "the longest row is seven bytes");
+        assert!(!fits(6));
+        let by_row = parse_table_by_row(text, ',');
+        assert!(by_row.is_some());
+        for row_max in [6, 7] {
+            let read = parse_table_within(text, ',', row_max);
+            assert_eq!(table_difference(&read, &by_row), None, "rows of at most {row_max} bytes");
+        }
+    }
+
+    /// The row that settles a file is no table is the last one looked at, so
+    /// no row after it is handed on to be kept.
+    #[test]
+    fn no_row_is_kept_past_the_first_of_the_wrong_width() {
+        let handed = |text: &str| {
+            let mut rows = 0;
+            assert!(table_shape(text, ',', |_| rows += 1).is_none(), "{text:?}");
+            rows
+        };
+        assert_eq!(handed("a,b\n1,2\n3,4\n5\n6,7\n8,9\n"), 2);
+        assert_eq!(handed("a,b\nr,1,2\ns,3,4\n5,6\nt,7,8\n"), 2);
+        // A first row that fits neither the header nor a header and a name.
+        assert_eq!(handed("a,b\n1,2,3,4\n5,6\n7,8\n"), 0);
+        assert_eq!(handed("a,b\n1\n5,6\n7,8\n"), 0);
+        // A header and nothing under it is found out at the end.
+        assert_eq!(handed("a,b\n\n# only this\n"), 0);
+    }
+
+    /// Bytes that are valid text become the text. They are not copied.
+    #[test]
+    fn text_that_is_valid_is_taken_as_it_is() {
+        let raw = b"a,b\n1,2\n".to_vec();
+        let at = raw.as_ptr();
+        let (text, comp) = decompress_text(raw).expect("a text");
+        assert_eq!((text.as_str(), comp), ("a,b\n1,2\n", "none"));
+        assert_eq!(text.as_ptr(), at, "the bytes that were read are the text");
+        // Bytes that are not valid are replaced as they were.
+        assert_eq!(text_of("not text", b"a,b\n\xff,caf\xe9\n"), "a,b\n\u{fffd},caf\u{fffd}\n");
+        assert_eq!(text_of("both line ends", b"a\r\nb\rc\n"), "a\nb\rc\n");
+        assert_eq!(text_of("carriage returns alone", b"a\rb\xff\r"), "a\nb\u{fffd}\n");
     }
 }
