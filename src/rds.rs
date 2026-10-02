@@ -2519,7 +2519,9 @@ fn profile_columns(cols: &[&Node], names: &[String]) -> Option<Profile> {
         _ => Vec::with_capacity(cols.len()),
     };
     let mut col_fp_bytes: Vec<u8> = Vec::new();
-    let mut cell_hashes: Vec<Vec<u64>> = Vec::with_capacity(cols.len());
+    // One hash to a row, folded a column at a time in the order of the
+    // columns. A hash to every cell of every column was held to the end.
+    let mut row_hashes: Vec<u64> = vec![FNV_OFFSET; n];
     let mut n_missing_total = 0u64;
     // Whether any column produced one. A frame of nothing but complex columns
     // has no total to report, only a sum over counts nobody took.
@@ -2557,7 +2559,6 @@ fn profile_columns(cols: &[&Node], names: &[String]) -> Option<Profile> {
         hasher.update(ty.as_bytes());
         let mut n_missing = 0u64;
         let mut uniq: HashSet<u64> = HashSet::new();
-        let mut ch = Vec::with_capacity(n);
         let mut min: Option<f64> = None;
         let mut max: Option<f64> = None;
         let mut buf = Vec::with_capacity(16);
@@ -2622,7 +2623,7 @@ fn profile_columns(cols: &[&Node], names: &[String]) -> Option<Profile> {
             let h = fnv(&buf);
             if i < n {
                 hasher.update(&buf);
-                ch.push(h);
+                row_hashes[i] = (row_hashes[i] ^ h).wrapping_mul(FNV_PRIME);
             }
             // Distinct values, not counting the absence of one. How many are
             // missing is its own field, and counting them here as well made a
@@ -3031,7 +3032,6 @@ fn profile_columns(cols: &[&Node], names: &[String]) -> Option<Profile> {
         }
         col_fp_bytes.extend_from_slice(fp.as_bytes());
         col_fp_bytes.push(b'|');
-        cell_hashes.push(ch);
     }
 
     let schema_fp = hex128(&blake3::hash(schema_src.as_bytes()));
@@ -3039,19 +3039,13 @@ fn profile_columns(cols: &[&Node], names: &[String]) -> Option<Profile> {
     let content_fp = hex128(&blake3::hash(&col_fp_bytes));
 
     // Bottom-k sketch of per-row hashes for row-level similarity.
-    let mut row_hashes: Vec<u64> = Vec::with_capacity(n);
-    for i in 0..n {
-        let mut h = FNV_OFFSET;
-        for col in &cell_hashes {
-            h ^= col[i];
-            h = h.wrapping_mul(FNV_PRIME);
-        }
-        row_hashes.push(h);
-    }
     row_hashes.sort_unstable();
     row_hashes.dedup();
     row_hashes.truncate(SKETCH_K);
-    let row_sketch = row_hashes.iter().map(|h| format!("{h:016x}")).collect();
+    let row_sketch: Vec<String> = row_hashes.iter().map(|h| format!("{h:016x}")).collect();
+    // Under test, every sketch is held to the one its cell hashes give.
+    #[cfg(test)]
+    tests::sketch_made(cols, &row_sketch);
 
     Some(Profile {
         detail,
@@ -10312,5 +10306,181 @@ mod tests {
         assert_eq!(text_of("not text", b"a,b\n\xff,caf\xe9\n"), "a,b\n\u{fffd},caf\u{fffd}\n");
         assert_eq!(text_of("both line ends", b"a\r\nb\rc\n"), "a\nb\rc\n");
         assert_eq!(text_of("carriage returns alone", b"a\rb\xff\r"), "a\nb\u{fffd}\n");
+    }
+
+    // ---- the row sketch, held to the one made from a hash for every cell ----
+
+    thread_local! {
+        /// How many profiles this thread has had their sketch checked.
+        static SKETCHES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    /// The row sketch as it was made: a hash for every cell of every column,
+    /// all of them held until the last column was done, and folded then.
+    fn sketch_by_cell(cols: &[&Node]) -> Vec<String> {
+        let n = cols.iter().map(|c| col_len(c)).min().unwrap_or(0);
+        let mut cell_hashes: Vec<Vec<u64>> = Vec::with_capacity(cols.len());
+        let mut buf = Vec::new();
+        for col in cols {
+            let (_, is_factor, _) = base_type(col);
+            let pairs = attr_pairs(col);
+            let levels: Vec<Option<String>> = if is_factor {
+                attr(&pairs, "levels").map(opt_str_vec).unwrap_or_default()
+            } else {
+                Vec::new()
+            };
+            let mut ch = Vec::with_capacity(n);
+            for i in 0..n {
+                buf.clear();
+                push_cell(&mut buf, col, i, if is_factor { Some(&levels) } else { None });
+                ch.push(fnv(&buf));
+            }
+            cell_hashes.push(ch);
+        }
+        let mut row_hashes: Vec<u64> = Vec::with_capacity(n);
+        for i in 0..n {
+            let mut h = FNV_OFFSET;
+            for col in &cell_hashes {
+                h ^= col[i];
+                h = h.wrapping_mul(FNV_PRIME);
+            }
+            row_hashes.push(h);
+        }
+        row_hashes.sort_unstable();
+        row_hashes.dedup();
+        row_hashes.truncate(SKETCH_K);
+        row_hashes.iter().map(|h| format!("{h:016x}")).collect()
+    }
+
+    /// Every profile made while a test runs is handed over here, so each one
+    /// is held to the sketch its cell hashes give, whichever test asked for it.
+    pub(super) fn sketch_made(cols: &[&Node], sketch: &[String]) {
+        assert_eq!(sketch, sketch_by_cell(cols), "the row sketch of {} columns", cols.len());
+        SKETCHES.with(|n| n.set(n.get() + 1));
+    }
+
+    fn sketches_checked() -> usize {
+        SKETCHES.with(|n| n.get())
+    }
+
+    #[test]
+    fn every_fixture_has_the_sketch_its_cell_hashes_give() {
+        let before = sketches_checked();
+        let recs = records();
+        let checked = sketches_checked() - before;
+        let sketched = recs
+            .iter()
+            .filter(|r| r["row_sketch"].as_array().is_some_and(|s| !s.is_empty()))
+            .count();
+        assert_eq!(sketched, 81, "the fixtures that carry a sketch");
+        assert!(checked >= sketched, "and each was checked: {checked}");
+    }
+
+    /// The sketch of one fixture, as it was made from a hash for every cell.
+    const NA_AND_NAN: [&str; 12] = [
+        "1a546808ac0fe3d1", "264352cca17fad11", "2dd237e8ededc6ad", "43cc90c1ad50b617",
+        "4415fb36025ff4e7", "4c5f6c73520d796a", "5905c096881acf57", "5ddc4dcf14291d43",
+        "611dfd9518ad13b9", "d26fb7ff9826d4bb", "d45ec69fd21738a3", "e98e47dd461006b8",
+    ];
+
+    /// One hash over the sketch of every fixture, made the same way.
+    const EVERY_FIXTURE_SKETCH: &str =
+        "d34353c4260f1f5736954c52df10cb6c68a8377ba2ba181eff492f9b48624420";
+
+    /// The sketches of the fixtures are the ones they had, to the last digit.
+    #[test]
+    fn the_sketch_of_a_fixture_is_the_one_it_had() {
+        let recs = records();
+        let sketch = |name: &str| -> Vec<String> {
+            let r = recs.iter().find(|r| r["name"] == name).expect("the fixture");
+            let s = r["row_sketch"].as_array().expect("a sketch");
+            s.iter().map(|h| h.as_str().expect("a hash").to_string()).collect()
+        };
+        // Four columns, two of them with values missing.
+        assert_eq!(sketch("na_and_nan"), NA_AND_NAN);
+        // A hundred rows, of which the 32 smallest hashes are kept.
+        assert_eq!(sketch("real_datatable").len(), SKETCH_K);
+        // A hundred rows and seven different ones.
+        assert_eq!(sketch("shape_kinds").len(), 7);
+        let mut all = blake3::Hasher::new();
+        for r in &recs {
+            if let Some(s) = r["row_sketch"].as_array() {
+                all.update(r["name"].as_str().unwrap_or_default().as_bytes());
+                for h in s {
+                    all.update(h.as_str().expect("a hash").as_bytes());
+                }
+                all.update(b"\n");
+            }
+        }
+        assert_eq!(all.finalize().to_hex().as_str(), EVERY_FIXTURE_SKETCH);
+    }
+
+    /// Frames no fixture has: no rows, one row, rows that repeat, a factor,
+    /// a column of each type with values missing, and a column longer than
+    /// the frame is tall.
+    #[test]
+    fn a_frame_built_by_hand_has_the_sketch_its_cell_hashes_give() {
+        let ints = |v: &[i32]| Node { val: Val::Ints { len: v.len(), vals: v.to_vec(), logical: false }, attr: None };
+        let reals = |v: &[f64]| Node { val: Val::Reals { len: v.len(), vals: v.to_vec() }, attr: None };
+        let strs = |v: &[Option<&str>]| Node {
+            val: Val::Str(v.iter().map(|s| s.map(str::to_string)).collect()),
+            attr: None,
+        };
+        let name = |j: usize| format!("c{j}");
+        let profiled = |cols: &[Node]| -> Vec<String> {
+            let refs: Vec<&Node> = cols.iter().collect();
+            let names: Vec<String> = (0..cols.len()).map(name).collect();
+            let before = sketches_checked();
+            let p = profile_columns(&refs, &names).expect("a profile");
+            assert_eq!(sketches_checked(), before + 1, "the sketch was checked");
+            p.row_sketch
+        };
+
+        assert!(profiled(&[ints(&[]), strs(&[])]).is_empty(), "no rows, no sketch");
+        assert_eq!(profiled(&[ints(&[7])]).len(), 1);
+        // Rows that are the same hash the same, and are kept once.
+        let twice = [ints(&[1, 2, 1, 2, 1]), strs(&[Some("a"), Some("b"), Some("a"), Some("b"), Some("a")])];
+        assert_eq!(profiled(&twice).len(), 2);
+        // The same cells in other columns are other rows.
+        let a = profiled(&[ints(&[1, 2]), ints(&[3, 4])]);
+        let b = profiled(&[ints(&[3, 4]), ints(&[1, 2])]);
+        assert_ne!(a, b, "the order of the columns is part of a row");
+        // A missing value in each type, a NaN, and both zeros.
+        let gaps = [
+            ints(&[1, NA_INT, 3, 4]),
+            reals(&[0.0, -0.0, f64::NAN, 2.5]),
+            strs(&[Some("x"), None, Some(""), Some("y")]),
+        ];
+        assert_eq!(profiled(&gaps).len(), 4);
+        // A column of six cells in a frame of three rows.
+        let tall = [ints(&[1, 2, 3]), reals(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0])];
+        assert_eq!(profiled(&tall).len(), 3);
+        // More rows than the sketch keeps.
+        let long: Vec<i32> = (0..500).collect();
+        let halves: Vec<f64> = long.iter().map(|v| *v as f64 / 2.0).collect();
+        assert_eq!(profiled(&[ints(&long), reals(&halves)]).len(), SKETCH_K);
+    }
+
+    /// Tables made at random, each profiled under every separator it reads
+    /// under, which checks the sketch of each.
+    #[test]
+    fn a_generated_table_has_the_sketch_its_cell_hashes_give() {
+        let mut dice = Dice(1954);
+        let before = sketches_checked();
+        let mut rows = 0;
+        for _ in 0..4_000 {
+            let (bytes, _) = a_table(&mut dice);
+            let text = text_by_copy(&bytes);
+            for sep in SEPS {
+                let Some((cols, names, nrow)) = parse_table(&text, sep) else { continue };
+                let refs: Vec<&Node> = cols.iter().collect();
+                let p = profile_columns(&refs, &names).expect("a table profiles");
+                assert!(p.row_sketch.len() <= nrow.min(SKETCH_K));
+                rows += nrow;
+            }
+        }
+        let checked = sketches_checked() - before;
+        assert!(checked >= 10_000, "the tables profiled: {checked}");
+        assert!(rows >= 30_000, "and their rows: {rows}");
     }
 }
