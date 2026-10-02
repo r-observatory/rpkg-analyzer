@@ -3990,14 +3990,96 @@ fn describe(
     rec
 }
 
+/// One bzip2 stream, read the way the bzip2 crate's reader reads it, except
+/// that a decoder with no memory ends the run. The crate hands that back as
+/// progress and reads on, and the file then looks damaged.
+struct Bzip2<'a> {
+    from: std::io::BufReader<&'a [u8]>,
+    data: bzip2::Decompress,
+    done: bool,
+}
+
+impl<'a> Bzip2<'a> {
+    fn over(raw: &'a [u8]) -> Self {
+        Bzip2 {
+            from: std::io::BufReader::new(raw),
+            data: bzip2::Decompress::new(false),
+            done: false,
+        }
+    }
+}
+
+impl std::io::Read for Bzip2<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        use std::io::{BufRead, Error, ErrorKind};
+        loop {
+            if self.done {
+                return Ok(0);
+            }
+            let input = self.from.fill_buf()?;
+            let (before_in, before_out) = (self.data.total_in(), self.data.total_out());
+            let status = self.data.decompress(input, buf);
+            let read = (self.data.total_out() - before_out) as usize;
+            let consumed = (self.data.total_in() - before_in) as usize;
+            let remaining = input.len() - consumed;
+            self.from.consume(consumed);
+            match status.map_err(|e| Error::new(ErrorKind::InvalidInput, e))? {
+                bzip2::Status::MemNeeded => crate::memory::out_of_memory("in the bzip2 decoder"),
+                bzip2::Status::StreamEnd => self.done = true,
+                _ if consumed == 0 && remaining == 0 && read == 0 => {
+                    return Err(Error::new(
+                        ErrorKind::UnexpectedEof,
+                        "decompression not finished but EOF reached",
+                    ));
+                }
+                _ => {}
+            }
+            if read > 0 || buf.is_empty() {
+                return Ok(read);
+            }
+        }
+    }
+}
+
+/// An xz stream, read by the xz2 crate's reader, except that a decoder with
+/// no memory ends the run, whether it is being made or read.
+struct Xz<R>(R);
+
+impl<'a> Xz<xz2::read::XzDecoder<&'a [u8]>> {
+    fn over(raw: &'a [u8]) -> Self {
+        // The crate's reader makes the same decoder and takes it for granted.
+        let made = match xz2::stream::Stream::new_stream_decoder(u64::MAX, 0) {
+            Err(xz2::stream::Error::Mem) => crate::memory::out_of_memory("in the xz decoder"),
+            made => made.expect("an xz decoder"),
+        };
+        Xz(xz2::read::XzDecoder::new_stream(raw, made))
+    }
+}
+
+impl<R: std::io::Read> std::io::Read for Xz<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let got = self.0.read(buf);
+        if got.as_ref().is_err_and(xz_has_no_memory) {
+            crate::memory::out_of_memory("in the xz decoder");
+        }
+        got
+    }
+}
+
+/// Whether an error is the xz decoder saying it has no memory.
+fn xz_has_no_memory(e: &std::io::Error) -> bool {
+    let said = e.get_ref().and_then(|e| e.downcast_ref());
+    matches!(said, Some(xz2::stream::Error::Mem))
+}
+
 /// The decoder a file's first bytes ask for, with nothing read from it yet.
 fn decoder(raw: &[u8]) -> (Box<dyn std::io::Read + '_>, &'static str) {
     if raw.len() >= 2 && raw[0] == 0x1f && raw[1] == 0x8b {
         (Box::new(flate2::read::GzDecoder::new(raw)), "gzip")
     } else if raw.len() >= 3 && &raw[0..3] == b"BZh" {
-        (Box::new(bzip2::read::BzDecoder::new(raw)), "bzip2")
+        (Box::new(Bzip2::over(raw)), "bzip2")
     } else if raw.len() >= 6 && raw[0..6] == [0xfd, b'7', b'z', b'X', b'Z', 0x00] {
-        (Box::new(xz2::read::XzDecoder::new(raw)), "xz")
+        (Box::new(Xz::over(raw)), "xz")
     } else {
         (Box::new(raw), "none")
     }
@@ -4514,11 +4596,11 @@ fn decompress_text(raw: Vec<u8>) -> Option<(String, &'static str)> {
         (o, "gzip")
     } else if raw.starts_with(b"BZh") {
         let mut o = Vec::new();
-        bzip2::read::BzDecoder::new(&raw[..]).read_to_end(&mut o).ok()?;
+        Bzip2::over(&raw).read_to_end(&mut o).ok()?;
         (o, "bzip2")
     } else if raw.starts_with(&[0xfd, b'7', b'z', b'X', b'Z', 0x00]) {
         let mut o = Vec::new();
-        xz2::read::XzDecoder::new(&raw[..]).read_to_end(&mut o).ok()?;
+        Xz::over(&raw).read_to_end(&mut o).ok()?;
         (o, "xz")
     } else {
         (raw, "none")
@@ -4670,7 +4752,7 @@ pub fn scan_package(root: &Path, excluded: &BTreeSet<String>) -> Vec<Value> {
     let mut out = Vec::new();
     let mut targets: Vec<(std::path::PathBuf, bool)> = Vec::new();
     let docs = rd_dataset_docs(root, excluded);
-    if let Ok(rd) = std::fs::read_dir(root.join("data")) {
+    if let Ok(rd) = crate::memory::read_dir(root.join("data")) {
         let mut paths: Vec<_> = rd.flatten().map(|e| e.path()).collect();
         paths.sort();
         // One dataset name, one file. A package may carry the same dataset as
@@ -4943,7 +5025,7 @@ const RD_SOURCE_CAP: usize = 4096;
 
 fn rd_dataset_docs(root: &Path, excluded: &BTreeSet<String>) -> std::collections::HashMap<String, RdDatasetDoc> {
     let mut out = std::collections::HashMap::new();
-    let Ok(rd) = std::fs::read_dir(root.join("man")) else { return out };
+    let Ok(rd) = crate::memory::read_dir(root.join("man")) else { return out };
     // Pages the build leaves out go before the cap, so they cannot fill it ahead of kept ones.
     let mut paths: Vec<_> = rd
         .flatten()
@@ -5283,7 +5365,7 @@ fn walk_extdata(
     if depth == 0 || out.len() >= EXTDATA_FILE_CAP {
         return;
     }
-    let Ok(rd) = std::fs::read_dir(dir) else { return };
+    let Ok(rd) = crate::memory::read_dir(dir) else { return };
     let mut paths: Vec<_> = rd.flatten().map(|e| e.path()).collect();
     paths.sort();
     for p in paths {
@@ -9214,5 +9296,338 @@ mod tests {
         deep.expect("a thread")
             .join()
             .expect("the deep read finished");
+    }
+
+    /// What a decoder answers when it is read `step` bytes at a time: the
+    /// bytes it hands over, how many at each read, and the error it stops on.
+    type Reads = (Vec<u8>, Vec<usize>, Option<(std::io::ErrorKind, String)>);
+
+    fn reads(mut from: impl std::io::Read, step: usize) -> Reads {
+        let mut buf = vec![0; step];
+        let (mut out, mut sizes) = (Vec::new(), Vec::new());
+        let mut ended = false;
+        loop {
+            match from.read(&mut buf) {
+                // The end is asked for twice, and has to be the end both times.
+                Ok(0) if ended => return (out, sizes, None),
+                Ok(0) => ended = true,
+                Ok(n) => {
+                    out.extend_from_slice(&buf[..n]);
+                    sizes.push(n);
+                }
+                Err(e) => return (out, sizes, Some((e.kind(), e.to_string()))),
+            }
+        }
+    }
+
+    /// This crate's reader of one compression, and the library's own.
+    fn ours_and_theirs<'a>(
+        how: &str,
+        bytes: &'a [u8],
+    ) -> (Box<dyn std::io::Read + 'a>, Box<dyn std::io::Read + 'a>) {
+        match how {
+            "bzip2" => (
+                Box::new(Bzip2::over(bytes)),
+                Box::new(bzip2::read::BzDecoder::new(bytes)),
+            ),
+            "xz" => (
+                Box::new(Xz::over(bytes)),
+                Box::new(xz2::read::XzDecoder::new(bytes)),
+            ),
+            _ => panic!("no reader of {how} to compare"),
+        }
+    }
+
+    /// How a run of files ended, so a test can show it met every ending.
+    #[derive(Default)]
+    struct Ends {
+        whole: usize,
+        errors: std::collections::BTreeMap<String, usize>,
+    }
+
+    impl Ends {
+        fn saw(&self, text: &str) -> bool {
+            self.errors.contains_key(text)
+        }
+    }
+
+    /// Holds this crate's reader to the library's on one file, read for read:
+    /// the same bytes in the same pieces, and the same error of the same kind.
+    fn same_reads(what: &str, how: &str, bytes: &[u8], steps: &[usize], ends: &mut Ends) {
+        use std::io::Read;
+        let outcome = |r: std::io::Result<usize>| r.map_err(|e| (e.kind(), e.to_string()));
+        let (mut ours, mut theirs) = ours_and_theirs(how, bytes);
+        assert_eq!(
+            outcome(ours.read(&mut [])),
+            outcome(theirs.read(&mut [])),
+            "{how} {what}: a read into no room"
+        );
+        let mut last = None;
+        for &step in steps {
+            let (ours, theirs) = ours_and_theirs(how, bytes);
+            let (got, want) = (reads(ours, step), reads(theirs, step));
+            assert_eq!(got.2, want.2, "{how} {what}, {step} at a time: the error");
+            assert!(
+                got.1 == want.1,
+                "{how} {what}, {step} at a time: {} reads against {}",
+                got.1.len(),
+                want.1.len()
+            );
+            assert!(
+                got.0 == want.0,
+                "{how} {what}, {step} at a time: the bytes differ"
+            );
+            last = Some(want.2);
+        }
+        match last.expect("at least one step") {
+            None => ends.whole += 1,
+            Some((_, text)) => *ends.errors.entry(text).or_default() += 1,
+        }
+    }
+
+    /// One file whole, cut short and with a bit flipped at each position.
+    fn same_reads_damaged(
+        what: &str,
+        how: &str,
+        bytes: &[u8],
+        at: &[usize],
+        steps: &[usize],
+        ends: &mut Ends,
+    ) {
+        same_reads(what, how, bytes, steps, ends);
+        each_damaged(bytes, at, |damage, damaged| {
+            same_reads(&format!("{what} {damage}"), how, damaged, steps, ends)
+        });
+    }
+
+    /// Enough bytes to fill several blocks of a compressed stream: text that
+    /// packs well around a stretch that does not pack at all.
+    fn several_blocks() -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut x = 1u32;
+        for part in 0..3 {
+            for i in 0..3_000 {
+                out.extend_from_slice(format!("row {i} of part {part}\t{}\n", i * 37 % 1009).as_bytes());
+            }
+            for _ in 0..30_000 {
+                x = x.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                out.push((x >> 24) as u8);
+            }
+        }
+        out
+    }
+
+    /// The files both decoder tests read: the one fixture written under this
+    /// compression at every byte and bit, every serialized fixture packed
+    /// under it, a stream of several blocks at two block sizes, and a stream
+    /// with something after it.
+    fn each_compressed_file(how: &str, fixture: &str, strong: Vec<u8>, ends: &mut Ends) {
+        let raw = std::fs::read(fixture).expect("the fixture");
+        same_reads("the fixture", how, &raw, &[1, 7, WINDOW], ends);
+        for i in 0..raw.len() {
+            same_reads(&format!("the fixture cut at {i}"), how, &raw[..i], &[1, WINDOW], ends);
+            for bit in 0..8 {
+                let mut flipped = raw.clone();
+                flipped[i] ^= 1 << bit;
+                let what = format!("the fixture with bit {bit} of byte {i} flipped");
+                same_reads(&what, how, &flipped, &[1, WINDOW], ends);
+            }
+        }
+
+        for (name, stream) in fixture_streams() {
+            let packed = pack(&stream, how);
+            let small = stream.len() < WINDOW;
+            same_reads(&name, how, &packed, if small { &[1, 4096] } else { &[4096] }, ends);
+            let at = spread_and_tail(packed.len(), 8);
+            same_reads_damaged(&name, how, &packed, &at, &[WINDOW], ends);
+        }
+
+        let long = several_blocks();
+        for (level, packed) in [("fast", pack(&long, how)), ("strong", strong)] {
+            let what = format!("several blocks, {level}");
+            same_reads(&what, how, &packed, &[100, 4096, 8191], ends);
+            let at = spread_and_tail(packed.len(), 8);
+            same_reads_damaged(&what, how, &packed, &at, &[WINDOW], ends);
+        }
+
+        let packed = pack(b"one stream and no more", how);
+        for (what, tail) in [
+            ("zeros", vec![0u8; 4]),
+            ("many zeros", vec![0u8; 3 * 8192]),
+            ("text", b"not a compressed stream".to_vec()),
+            ("itself again", packed.clone()),
+        ] {
+            let mut bytes = packed.clone();
+            bytes.extend_from_slice(&tail);
+            same_reads(&format!("a stream then {what}"), how, &bytes, &[1, WINDOW], ends);
+        }
+        for head in 0..packed.len().min(12) {
+            same_reads(&format!("the first {head} bytes"), how, &packed[..head], &[1, WINDOW], ends);
+        }
+    }
+
+    /// The bzip2 reader is this crate's own, written after the library's so
+    /// that it can stop where the library reads on. The library's stays here
+    /// as the measure of it.
+    #[test]
+    fn a_bzip2_file_reads_as_the_library_reads_it() {
+        use std::io::Write;
+        let mut strong = bzip2::write::BzEncoder::new(Vec::new(), bzip2::Compression::best());
+        strong.write_all(&several_blocks()).expect("bzip2");
+        let strong = strong.finish().expect("bzip2");
+
+        let mut ends = Ends::default();
+        each_compressed_file(
+            "bzip2",
+            "tests/fixtures/pkg/data/txt_bz2.txt.bz2",
+            strong,
+            &mut ends,
+        );
+        assert!(ends.whole >= 100, "the sound files read: {}", ends.whole);
+        for text in [
+            "bzip2: invalid data",
+            "bzip2: bz2 header missing",
+            "decompression not finished but EOF reached",
+        ] {
+            assert!(
+                ends.saw(text),
+                "no damaged file gave {text:?}: {:?}",
+                ends.errors.keys()
+            );
+        }
+    }
+
+    #[test]
+    fn an_xz_file_reads_as_the_library_reads_it() {
+        use std::io::Write;
+        let mut strong = xz2::write::XzEncoder::new(Vec::new(), 6);
+        strong.write_all(&several_blocks()).expect("xz");
+        let strong = strong.finish().expect("xz");
+
+        let mut ends = Ends::default();
+        each_compressed_file(
+            "xz",
+            "tests/fixtures/pkg/data/txt_xz.txt.xz",
+            strong,
+            &mut ends,
+        );
+        assert!(ends.whole >= 100, "the sound files read: {}", ends.whole);
+        for text in [
+            "lzma data error",
+            "stream/file format not recognized",
+            "premature eof",
+            "corrupt xz stream",
+        ] {
+            assert!(
+                ends.saw(text),
+                "no damaged file gave {text:?}: {:?}",
+                ends.errors.keys()
+            );
+        }
+    }
+
+    /// Of everything a decoder can say, only that it has no memory ends the
+    /// run. Damage is still an error the reader reports.
+    #[test]
+    fn only_a_decoder_with_no_memory_is_told_apart() {
+        use xz2::stream::Error;
+        assert!(xz_has_no_memory(&Error::Mem.into()));
+        for other in [
+            Error::Data,
+            Error::Options,
+            Error::Format,
+            Error::MemLimit,
+            Error::Program,
+            Error::NoCheck,
+            Error::UnsupportedCheck,
+        ] {
+            assert!(!xz_has_no_memory(&other.clone().into()), "{other:?}");
+        }
+        assert!(!xz_has_no_memory(&std::io::Error::other(
+            "can't allocate memory"
+        )));
+        assert!(!xz_has_no_memory(&std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            bzip2::Error::Data
+        )));
+        assert!(!xz_has_no_memory(
+            &std::io::ErrorKind::UnexpectedEof.into()
+        ));
+    }
+
+    /// Fails every read the way the xz decoder does when it has no memory.
+    struct NoMemory;
+
+    impl std::io::Read for NoMemory {
+        fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+            Err(xz2::stream::Error::Mem.into())
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_xz_decoder_with_no_memory_ends_the_run() {
+        use crate::memory::child;
+        const ME: &str = "rds::tests::an_xz_decoder_with_no_memory_ends_the_run";
+        if child::is(ME) {
+            let got = std::io::Read::read(&mut Xz(NoMemory), &mut [0; 8]);
+            println!("the read came back: {got:?}");
+            return;
+        }
+        let said = child::aborted(ME);
+        assert!(
+            said.contains("memory allocation failed in the xz decoder"),
+            "{said}"
+        );
+    }
+
+    /// A table under each compression is the text it was, and a damaged one
+    /// is no table, as when the libraries' own readers decoded it.
+    #[test]
+    fn a_compressed_table_is_decoded_as_it_was() {
+        let was = |raw: &[u8]| {
+            whole_buffer::decompress(raw)
+                .ok()
+                .map(|(bytes, comp)| (String::from_utf8_lossy(&bytes).into_owned(), comp))
+        };
+        let (mut tables, mut refused) = (0, 0);
+        let mut same = |what: String, raw: &[u8]| match was(raw) {
+            None => {
+                assert_eq!(decompress_text(raw.to_vec()), None, "{what}");
+                refused += 1;
+            }
+            // A carriage return is folded afterwards, by a rule of its own.
+            Some((text, comp)) if text.contains('\r') => {
+                assert_eq!(decompress_text(raw.to_vec()).map(|t| t.1), Some(comp), "{what}");
+            }
+            Some(text) => {
+                assert_eq!(decompress_text(raw.to_vec()), Some(text), "{what}");
+                tables += 1;
+            }
+        };
+        for name in ["txt_gz.txt.gz", "txt_bz2.txt.bz2", "txt_xz.txt.xz"] {
+            let raw = std::fs::read(format!("tests/fixtures/pkg/data/{name}")).expect("the fixture");
+            same(name.to_string(), &raw);
+            for i in 0..raw.len() {
+                same(format!("{name} cut at {i}"), &raw[..i]);
+                for bit in 0..8 {
+                    let mut flipped = raw.clone();
+                    flipped[i] ^= 1 << bit;
+                    same(format!("{name} with bit {bit} of byte {i} flipped"), &flipped);
+                }
+            }
+        }
+        let long: String = (0..60_000)
+            .map(|i| format!("{i}\t{}\n", i * 37 % 1009))
+            .collect();
+        for how in ["gzip", "bzip2", "xz"] {
+            let packed = pack(long.as_bytes(), how);
+            same(format!("a long table, {how}"), &packed);
+            each_damaged(&packed, &spread_and_tail(packed.len(), 12), |what, bytes| {
+                same(format!("a long table, {how}, {what}"), bytes)
+            });
+        }
+        assert!(tables >= 6, "the sound tables read: {tables}");
+        assert!(refused >= 1000, "and the damaged ones do not: {refused}");
     }
 }

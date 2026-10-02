@@ -22,6 +22,8 @@ directory is a built release (a CRAN tarball, or the github.com/cran mirror of o
 means it is a git branch that R CMD build has not filtered yet (a Bioconductor release branch).
 A missing flag, or any other value, exits with status 2, a usage line on stderr and no records.
 
+A run that cannot get the memory it asks for stops there. It ends with a status that is not 0, in most cases 134 (aborted), and writes no statistics line, so the records printed before it stopped are not a whole result.
+
 ## Environment
 
 None of these changes a record. Each is read only in the analysis mode, and an older build ignores it.

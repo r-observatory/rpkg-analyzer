@@ -15,6 +15,7 @@ mod build_id;
 mod cache;
 mod citation;
 mod cli;
+mod memory;
 mod news;
 mod rd_pages;
 mod rds;
@@ -23,6 +24,9 @@ mod repo_practices;
 mod test_suite;
 mod vignettes;
 
+#[global_allocator]
+static ALLOCATOR: memory::EndsRun = memory::EndsRun;
+
 // ---- file walking -----------------------------------------------------------
 
 /// All files under `root`, relative to it, excluding the .git directory.
@@ -30,7 +34,7 @@ mod vignettes;
 fn list_files(root: &Path) -> Vec<String> {
     let mut out = Vec::new();
     fn rec(dir: &Path, root: &Path, out: &mut Vec<String>) {
-        let Ok(rd) = std::fs::read_dir(dir) else { return };
+        let Ok(rd) = memory::read_dir(dir) else { return };
         for e in rd.flatten() {
             let name = e.file_name();
             if name == ".git" {
