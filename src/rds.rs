@@ -7692,7 +7692,7 @@ mod tests {
     /// data.
     #[test]
     fn a_value_the_cap_skipped_is_still_told_apart_from_another() {
-        let dir = std::env::temp_dir().join("rpkg-analyzer-skipped-identity");
+        let dir = std::env::temp_dir().join(format!("rpkg-analyzer-skipped-identity-{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("a directory to write into");
         let n = CELL_CAP + 1;
         let read_back = |stem: &str, name: &str| -> Value {
@@ -7728,6 +7728,7 @@ mod tests {
         for stem in ["a", "c"] {
             let _ = std::fs::remove_file(dir.join(format!("{stem}.rds")));
         }
+        let _ = std::fs::remove_dir(&dir);
     }
 
     /// An integer vector serialized the way `save(compress = FALSE)` writes
