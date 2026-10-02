@@ -4433,6 +4433,8 @@ fn is_na_text(s: &str) -> bool {
 // Infer a column type from delimited-text cells, building the same Node the
 // binary path produces so the value profile and fingerprints are shared (and a
 // text dataset can match a serialized one with the same data).
+//
+// This is the typing of the table read by row. `infer_cells` is held to it.
 fn infer_column<S: AsRef<str>>(cells: &[S]) -> Node {
     let cells = cells.iter().map(|c| c.as_ref());
     let non_na: Vec<&str> = cells.clone().filter(|c| !is_na_text(c)).collect();
@@ -4462,6 +4464,54 @@ fn infer_column<S: AsRef<str>>(cells: &[S]) -> Node {
             .collect::<Vec<_>>();
         Node { val: Val::Ints { len: vals.len(), vals, logical: true }, attr: None }
     } else if all_num {
+        let vals = cells
+            .map(|c| if is_na_text(c) { f64::NAN } else { c.parse().unwrap_or(f64::NAN) })
+            .collect::<Vec<_>>();
+        Node { val: Val::Reals { len: vals.len(), vals }, attr: None }
+    } else {
+        let vals = cells
+            .map(|c| if is_na_text(c) { None } else { Some(c.to_string()) })
+            .collect::<Vec<_>>();
+        Node { val: Val::Str(vals), attr: None }
+    }
+}
+
+/// A column typed as `infer_column` types it, from cells that are walked
+/// and not held: once to settle the type, each rule asked of each cell until
+/// one says no, and once to make the values. `infer_column` wants the cells
+/// in a list and makes a second list of the ones that are not missing,
+/// sixteen bytes a row each, which on a long narrow table is more than the
+/// table.
+fn infer_cells<'a>(cells: impl Iterator<Item = &'a str> + Clone) -> Node {
+    let (mut any, mut all_int, mut all_logical, mut all_num) = (false, true, true, true);
+    for c in cells.clone().filter(|c| !is_na_text(c)) {
+        any = true;
+        all_int = all_int && !c.contains('.') && c.parse::<i32>().is_ok();
+        all_logical = all_logical && matches!(c, "TRUE" | "FALSE" | "T" | "F" | "true" | "false");
+        all_num = all_num && c.parse::<f64>().is_ok();
+        if !(all_int || all_logical || all_num) {
+            break;
+        }
+    }
+    if any && all_int {
+        let vals = cells
+            .map(|c| if is_na_text(c) { NA_INT } else { c.parse().unwrap_or(NA_INT) })
+            .collect::<Vec<_>>();
+        Node { val: Val::Ints { len: vals.len(), vals, logical: false }, attr: None }
+    } else if any && all_logical {
+        let vals = cells
+            .map(|c| {
+                if is_na_text(c) {
+                    NA_INT
+                } else if c.eq_ignore_ascii_case("true") || c == "T" {
+                    1
+                } else {
+                    0
+                }
+            })
+            .collect::<Vec<_>>();
+        Node { val: Val::Ints { len: vals.len(), vals, logical: true }, attr: None }
+    } else if any && all_num {
         let vals = cells
             .map(|c| if is_na_text(c) { f64::NAN } else { c.parse().unwrap_or(f64::NAN) })
             .collect::<Vec<_>>();
@@ -4635,9 +4685,29 @@ fn parse_table(text: &str, sep: char) -> Option<(Vec<Node>, Vec<String>, usize)>
 /// The most bytes the cells of one row can hold, where an end takes four.
 const ROW_MAX: usize = u32::MAX as usize;
 
+/// The widest table whose columns are typed where their cells lie. In a
+/// wider one the cells of a column are far apart, a row of the table between
+/// each two, and going down them twice, once for the type and once for the
+/// values, took HMP16SData 3.23 and its 2,912 columns from 12.8 s to 16.5
+/// on macOS arm64. A wider table has a column's cells listed first, as every
+/// table had: that is sixteen bytes a row, which is little beside the cells
+/// of a row that wide and was more than the cells of a row of two.
+const IN_PLACE: usize = 32;
+
 /// `parse_table`, for rows of at most `row_max` bytes. A table with a longer
 /// row is read by `parse_table_by_row`.
 fn parse_table_within(text: &str, sep: char, row_max: usize) -> Option<(Vec<Node>, Vec<String>, usize)> {
+    parse_table_typing(text, sep, row_max, IN_PLACE)
+}
+
+/// `parse_table_within`, typing columns in place in a table of at most
+/// `in_place` of them.
+fn parse_table_typing(
+    text: &str,
+    sep: char,
+    row_max: usize,
+    in_place: usize,
+) -> Option<(Vec<Node>, Vec<String>, usize)> {
     let mut cells = Cells::new(row_max);
     let (header, nrow) = table_shape(text, sep, |row| cells.push_row(row))?;
     if cells.over {
@@ -4650,14 +4720,18 @@ fn parse_table_within(text: &str, sep: char, row_max: usize) -> Option<(Vec<Node
         }
     }
     // One column at a time, borrowed from where the cells are kept.
-    let mut column: Vec<&str> = Vec::with_capacity(nrow);
-    let cols = (0..names.len())
-        .map(|j| {
-            column.clear();
-            column.extend(cells.column(j));
-            infer_column(&column)
-        })
-        .collect();
+    let cols = if names.len() <= in_place {
+        (0..names.len()).map(|j| infer_cells(cells.column(j))).collect()
+    } else {
+        let mut column: Vec<&str> = Vec::with_capacity(nrow);
+        (0..names.len())
+            .map(|j| {
+                column.clear();
+                column.extend(cells.column(j));
+                infer_cells(column.iter().copied())
+            })
+            .collect()
+    };
     Some((cols, names, nrow))
 }
 
@@ -4749,7 +4823,7 @@ impl Cells {
     }
 
     /// The cells of column `j`, from the first row to the last.
-    fn column(&self, j: usize) -> impl Iterator<Item = &str> {
+    fn column(&self, j: usize) -> impl Iterator<Item = &str> + Clone {
         let rows = self.rows.iter().zip(self.ends.chunks_exact(self.width.max(1)));
         rows.map(move |(start, ends)| {
             let from = if j == 0 { 0 } else { ends[j - 1] as usize };
@@ -9984,6 +10058,14 @@ mod tests {
             let short = parse_table_within(text, sep, row_max);
             if let Some(d) = table_difference(&short, &old) {
                 panic!("{what}, separator {sep:?}, rows of at most {row_max} bytes: {d}\n{text:?}");
+            }
+        }
+        // Its columns typed where they lie whatever its width, and listed
+        // first whatever its width.
+        for (how, in_place) in [("in place", usize::MAX), ("from a list", 0)] {
+            let typed = parse_table_typing(text, sep, ROW_MAX, in_place);
+            if let Some(d) = table_difference(&typed, &old) {
+                panic!("{what}, separator {sep:?}, columns typed {how}: {d}\n{text:?}");
             }
         }
         old
