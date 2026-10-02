@@ -256,6 +256,23 @@ impl<'a> Reader<'a> {
         self.p += n;
         Ok(())
     }
+    /// The `n` bytes of a string, as text. Out of line, so that what it holds
+    /// on the stack is not held again at every level of a nested object.
+    #[inline(never)]
+    fn text(&mut self, n: usize, latin1: bool) -> Result<String, String> {
+        self.need(n)?;
+        let raw = &self.b[self.p..self.p + n];
+        // Latin-1 is not UTF-8, and reading it as though it were replaces
+        // every accented character with a marker: the text is wrong, and so
+        // is the fingerprint taken over it.
+        let s = if latin1 {
+            raw.iter().map(|b| *b as char).collect::<String>()
+        } else {
+            String::from_utf8_lossy(raw).into_owned()
+        };
+        self.p += n;
+        Ok(s)
+    }
     /// Code vector then constant pool.
     fn bc_body(&mut self) -> Result<(), String> {
         self.item()?;
@@ -353,19 +370,7 @@ impl<'a> Reader<'a> {
                 let val = if n < 0 {
                     Val::Char(None)
                 } else {
-                    let n = n as usize;
-                    self.need(n)?;
-                    let raw = &self.b[self.p..self.p + n];
-                    // Latin-1 is not UTF-8, and reading it as though it were
-                    // replaces every accented character with a marker: the
-                    // text is wrong, and so is the fingerprint taken over it.
-                    let s = if levs & LATIN1_MASK != 0 {
-                        raw.iter().map(|b| *b as char).collect::<String>()
-                    } else {
-                        String::from_utf8_lossy(raw).into_owned()
-                    };
-                    self.p += n;
-                    Val::Char(Some(s))
+                    Val::Char(Some(self.text(n as usize, levs & LATIN1_MASK != 0)?))
                 };
                 // A string carries no attributes of its own, but an older file
                 // can still have written one, and it has to be consumed or
@@ -567,7 +572,7 @@ impl<'a> Reader<'a> {
             }
             ALTREP_SXP => {
                 let info = self.item()?;
-                let state = self.item()?;
+                let mut state = self.item()?;
                 let attr_node = self.item()?;
                 let attr = match attr_node.val {
                     Val::Nil => None,
@@ -581,11 +586,11 @@ impl<'a> Reader<'a> {
                     "compact_realseq" => expand_seq(&state, false),
                     // A wrapper carries the real vector as the first element of
                     // its state and adds only metadata, so unwrap to it.
-                    _ if cls.starts_with("wrap_") => first_element(&state).map(|n| n.val.clone()),
+                    _ if cls.starts_with("wrap_") => first_element(&mut state),
                     // Anything else: the state is usually the materialized data
                     // (deferred_string, and the expanded form of any compact
                     // class), so prefer it over failing the file.
-                    _ => Some(state.val.clone()),
+                    _ => None,
                 };
                 match val {
                     Some(v) => Ok(Node { val: v, attr }),
@@ -995,11 +1000,12 @@ fn altrep_class(info: &Node) -> Option<String> {
 }
 
 /// First element of a state container, for the wrap_* classes whose payload is
-/// the wrapped vector followed by metadata.
-fn first_element(state: &Node) -> Option<&Node> {
-    match &state.val {
-        Val::Vec(items) => items.first(),
-        Val::List { car, .. } => Some(car.as_ref()),
+/// the wrapped vector followed by metadata. Taken out of the state rather than
+/// copied.
+fn first_element(state: &mut Node) -> Option<Val> {
+    match &mut state.val {
+        Val::Vec(items) if !items.is_empty() => Some(items.swap_remove(0).val),
+        Val::List { car, .. } => Some(std::mem::replace(&mut car.val, Val::Nil)),
         _ => None,
     }
 }
@@ -4060,9 +4066,17 @@ fn v1_build(
     Node { val, attr }
 }
 
-fn read_file(path: &Path) -> Result<Vec<(String, Node, String, i32, String)>, String> {
+/// One object out of a data file: its name, the object, the container format,
+/// the serialization version and the compression.
+type Loaded = (String, Node, String, i32, String);
+
+fn read_file(path: &Path) -> Result<Vec<Loaded>, String> {
     let raw = std::fs::read(path).map_err(|e| e.to_string())?;
-    let (bytes, comp) = decompress(&raw)?;
+    read_bytes(&raw)
+}
+
+fn read_bytes(raw: &[u8]) -> Result<Vec<Loaded>, String> {
+    let (bytes, comp) = decompress(raw)?;
     let is_rda = bytes.len() >= 5
         && (&bytes[0..3] == b"RDX" || &bytes[0..3] == b"RDA" || &bytes[0..3] == b"RDB");
     let mut p = 0usize;
@@ -4104,22 +4118,22 @@ fn read_file(path: &Path) -> Result<Vec<(String, Node, String, i32, String)>, St
     }
     let fmt = if is_rda { "rda" } else { "rds" }.to_string();
     let top = r.item()?;
+    // Nothing reads the reference table past this point.
+    drop(r);
 
+    // Each object is moved out of the list that holds it. A copy would be a
+    // second tree the size of the first, alive beside it.
     let mut out = Vec::new();
     if let Val::List { .. } = top.val {
-        let mut cur = Some(&top);
-        while let Some(nd) = cur {
-            if let Val::List { tag, car, cdr } = &nd.val {
-                let nm = if let Val::Sym(s) = &tag.val {
-                    s.clone()
-                } else {
-                    String::new()
-                };
-                out.push((nm, car.as_ref().clone(), fmt.clone(), ver, comp.to_string()));
-                cur = Some(cdr.as_ref());
+        let mut cur = top;
+        while let Val::List { tag, car, cdr } = cur.val {
+            let nm = if let Val::Sym(s) = tag.val {
+                s
             } else {
-                break;
-            }
+                String::new()
+            };
+            out.push((nm, *car, fmt.clone(), ver, comp.to_string()));
+            cur = *cdr;
         }
     } else {
         out.push((String::new(), top, fmt, ver, comp.to_string()));
@@ -7360,5 +7374,1108 @@ mod tests {
                 "the README does not state {what}: no \"{phrase}\" in it"
             );
         }
+    }
+
+    /// The reader as it stood when it decompressed a whole file before parsing
+    /// any of it and copied each object out of the tree it had parsed. Kept,
+    /// comments aside, so the reader above can be held to it on every file:
+    /// the same objects or the same error.
+    mod whole_buffer {
+        use super::super::*;
+
+        struct Reader<'a> {
+            b: &'a [u8],
+            p: usize,
+            ver: i32,
+            refs: Vec<Node>,
+            budget: u32,
+        }
+
+        impl<'a> Reader<'a> {
+            fn need(&self, n: usize) -> Result<(), String> {
+                if self.p.checked_add(n).map_or(true, |e| e > self.b.len()) {
+                    Err("truncated stream".into())
+                } else {
+                    Ok(())
+                }
+            }
+            fn i32(&mut self) -> Result<i32, String> {
+                self.need(4)?;
+                let v = i32::from_be_bytes(self.b[self.p..self.p + 4].try_into().unwrap());
+                self.p += 4;
+                Ok(v)
+            }
+            fn f64(&mut self) -> Result<f64, String> {
+                self.need(8)?;
+                let v = f64::from_be_bytes(self.b[self.p..self.p + 8].try_into().unwrap());
+                self.p += 8;
+                Ok(v)
+            }
+            fn vlen(&mut self) -> Result<usize, String> {
+                let n = self.i32()?;
+                if n == -1 {
+                    let hi = self.i32()? as i64;
+                    let lo = self.i32()? as i64;
+                    Ok(((hi << 32) | (lo & 0xffff_ffff)) as usize)
+                } else if n < 0 {
+                    Err("negative length".into())
+                } else {
+                    Ok(n as usize)
+                }
+            }
+            fn digest_span(&mut self, n: usize) -> Result<u64, String> {
+                self.need(n)?;
+                Ok(fnv(&self.b[self.p..self.p + n]))
+            }
+
+            fn skip(&mut self, n: usize) -> Result<(), String> {
+                self.need(n)?;
+                self.p += n;
+                Ok(())
+            }
+            fn bc_body(&mut self) -> Result<(), String> {
+                self.item()?;
+                let n = self.i32()?;
+                for _ in 0..n.max(0) {
+                    let t = self.i32()?;
+                    match t {
+                        t if t == BCODESXP as i32 => self.bc_body()?,
+                        BCREPDEF | BCREPREF | ATTRLANGSXP | ATTRLISTSXP => self.bc_lang(t)?,
+                        t if t == LANGSXP as i32 || t == LISTSXP as i32 => self.bc_lang(t)?,
+                        _ => {
+                            self.item()?;
+                        }
+                    }
+                }
+                Ok(())
+            }
+
+            fn bc_lang(&mut self, t: i32) -> Result<(), String> {
+                if t == BCREPREF {
+                    self.i32()?;
+                    return Ok(());
+                }
+                let mut t = t;
+                if t == BCREPDEF {
+                    self.i32()?;
+                    t = self.i32()?;
+                }
+                if t == ATTRLANGSXP
+                    || t == ATTRLISTSXP
+                    || t == LANGSXP as i32
+                    || t == LISTSXP as i32
+                {
+                    if t == ATTRLANGSXP || t == ATTRLISTSXP {
+                        self.item()?;
+                    }
+                    self.item()?;
+                    let car = self.i32()?;
+                    self.bc_lang(car)?;
+                    let cdr = self.i32()?;
+                    self.bc_lang(cdr)?;
+                    return Ok(());
+                }
+                self.item()?;
+                Ok(())
+            }
+
+            fn maybe_attr(&mut self, ha: bool) -> Result<Option<Box<Node>>, String> {
+                if ha {
+                    Ok(Some(Box::new(self.item()?)))
+                } else {
+                    Ok(None)
+                }
+            }
+            fn item(&mut self) -> Result<Node, String> {
+                if self.budget == 0 {
+                    return Err("item budget exceeded".into());
+                }
+                self.budget -= 1;
+                let f = self.i32()?;
+                let t = (f & 0xFF) as u8;
+                let ha = f & (1 << 9) != 0;
+                let hg = f & (1 << 10) != 0;
+                let levs = f >> 12;
+                match t {
+                    0 | NILVALUE | GLOBALENV_SXP | UNBOUNDVALUE_SXP | MISSINGARG_SXP
+                    | BASENAMESPACE_SXP | EMPTYENV_SXP | BASEENV_SXP => Ok(Node {
+                        val: Val::Nil,
+                        attr: None,
+                    }),
+                    REFSXP => {
+                        let mut idx = (f >> 8) as usize;
+                        if idx == 0 {
+                            idx = self.i32()? as usize;
+                        }
+                        idx.checked_sub(1)
+                            .and_then(|i| self.refs.get(i))
+                            .cloned()
+                            .ok_or_else(|| "bad reference index".to_string())
+                    }
+                    SYMSXP => {
+                        let name = self.item()?;
+                        let s = match name.val {
+                            Val::Char(Some(x)) => x,
+                            _ => String::new(),
+                        };
+                        let node = Node {
+                            val: Val::Sym(s),
+                            attr: None,
+                        };
+                        self.refs.push(node.clone());
+                        Ok(node)
+                    }
+                    CHARSXP => {
+                        let n = self.i32()?;
+                        let val = if n < 0 {
+                            Val::Char(None)
+                        } else {
+                            let n = n as usize;
+                            self.need(n)?;
+                            let raw = &self.b[self.p..self.p + n];
+                            let s = if levs & LATIN1_MASK != 0 {
+                                raw.iter().map(|b| *b as char).collect::<String>()
+                            } else {
+                                String::from_utf8_lossy(raw).into_owned()
+                            };
+                            self.p += n;
+                            Val::Char(Some(s))
+                        };
+                        if ha {
+                            self.item()?;
+                        }
+                        Ok(Node { val, attr: None })
+                    }
+                    SPECIALSXP | BUILTINSXP => {
+                        let n = self.i32()?;
+                        if n < 0 {
+                            return Err("negative builtin name length".into());
+                        }
+                        self.skip(n as usize)?;
+                        let attr = self.maybe_attr(ha)?;
+                        Ok(Node {
+                            val: Val::Nil,
+                            attr,
+                        })
+                    }
+                    WEAKREFSXP => {
+                        self.refs.push(Node {
+                            val: Val::Nil,
+                            attr: None,
+                        });
+                        let attr = self.maybe_attr(ha)?;
+                        Ok(Node {
+                            val: Val::Nil,
+                            attr,
+                        })
+                    }
+                    STRSXP => {
+                        let n = self.vlen()?;
+                        let mut v = Vec::with_capacity(n.min(1 << 16));
+                        for _ in 0..n {
+                            let e = self.item()?;
+                            v.push(match e.val {
+                                Val::Char(x) => x,
+                                _ => None,
+                            });
+                        }
+                        let attr = self.maybe_attr(ha)?;
+                        Ok(Node {
+                            val: Val::Str(v),
+                            attr,
+                        })
+                    }
+                    LGLSXP | INTSXP => {
+                        let n = self.vlen()?;
+                        if n > CELL_CAP {
+                            let digest = self.digest_span(4 * n)?;
+                            self.skip(4 * n)?;
+                            let attr = self.maybe_attr(ha)?;
+                            let of = if t == LGLSXP { "logical" } else { "integer" };
+                            return Ok(Node {
+                                val: Val::Blob {
+                                    len: n,
+                                    of,
+                                    digest: Some(digest),
+                                },
+                                attr,
+                            });
+                        }
+                        let mut vals = Vec::with_capacity(n);
+                        for _ in 0..n {
+                            vals.push(self.i32()?);
+                        }
+                        let attr = self.maybe_attr(ha)?;
+                        Ok(Node {
+                            val: Val::Ints {
+                                len: n,
+                                vals,
+                                logical: t == LGLSXP,
+                            },
+                            attr,
+                        })
+                    }
+                    REALSXP => {
+                        let n = self.vlen()?;
+                        if n > CELL_CAP {
+                            let digest = self.digest_span(8 * n)?;
+                            self.skip(8 * n)?;
+                            let attr = self.maybe_attr(ha)?;
+                            return Ok(Node {
+                                val: Val::Blob {
+                                    len: n,
+                                    of: "numeric",
+                                    digest: Some(digest),
+                                },
+                                attr,
+                            });
+                        }
+                        let mut vals = Vec::with_capacity(n);
+                        for _ in 0..n {
+                            vals.push(self.f64()?);
+                        }
+                        let attr = self.maybe_attr(ha)?;
+                        Ok(Node {
+                            val: Val::Reals { len: n, vals },
+                            attr,
+                        })
+                    }
+                    CPLXSXP => {
+                        let n = self.vlen()?;
+                        let digest = self.digest_span(16 * n)?;
+                        self.skip(16 * n)?;
+                        let attr = self.maybe_attr(ha)?;
+                        Ok(Node {
+                            val: Val::Blob {
+                                len: n,
+                                of: "complex",
+                                digest: Some(digest),
+                            },
+                            attr,
+                        })
+                    }
+                    RAWSXP => {
+                        let n = self.vlen()?;
+                        let digest = self.digest_span(n)?;
+                        self.skip(n)?;
+                        let attr = self.maybe_attr(ha)?;
+                        Ok(Node {
+                            val: Val::Blob {
+                                len: n,
+                                of: "raw",
+                                digest: Some(digest),
+                            },
+                            attr,
+                        })
+                    }
+                    VECSXP | EXPRSXP => {
+                        let n = self.vlen()?;
+                        let mut els = Vec::with_capacity(n.min(1 << 16));
+                        for _ in 0..n {
+                            els.push(self.item()?);
+                        }
+                        let attr = self.maybe_attr(ha)?;
+                        Ok(Node {
+                            val: Val::Vec(els),
+                            attr,
+                        })
+                    }
+                    LISTSXP | LANGSXP | CLOSXP | PROMSXP | DOTSXP => {
+                        let attr = self.maybe_attr(ha)?;
+                        let tag = if hg {
+                            Box::new(self.item()?)
+                        } else {
+                            Box::new(Node {
+                                val: Val::Nil,
+                                attr: None,
+                            })
+                        };
+                        let car = Box::new(self.item()?);
+                        let cdr = Box::new(self.item()?);
+                        Ok(Node {
+                            val: Val::List { tag, car, cdr },
+                            attr,
+                        })
+                    }
+                    S4SXP => {
+                        let attr = self.maybe_attr(ha)?;
+                        Ok(Node { val: Val::S4, attr })
+                    }
+                    NAMESPACESXP | PACKAGESXP | PERSISTSXP => {
+                        let _zero = self.i32()?;
+                        let n = self.i32()?;
+                        let mut parts = Vec::new();
+                        for _ in 0..n.max(0) {
+                            if let Val::Char(Some(t)) = self.item()?.val {
+                                parts.push(t);
+                            }
+                        }
+                        let node = Node {
+                            val: Val::Sym(parts.join("::")),
+                            attr: None,
+                        };
+                        self.refs.push(node.clone());
+                        Ok(node)
+                    }
+                    BCODESXP => {
+                        let _nreps = self.i32()?;
+                        self.bc_body()?;
+                        Ok(Node {
+                            val: Val::Nil,
+                            attr: None,
+                        })
+                    }
+                    EXTPTRSXP => {
+                        let slot = self.refs.len();
+                        self.refs.push(Node {
+                            val: Val::Nil,
+                            attr: None,
+                        });
+                        let _prot = self.item()?;
+                        let _tag = self.item()?;
+                        let attr = self.maybe_attr(ha)?;
+                        let node = Node {
+                            val: Val::Nil,
+                            attr,
+                        };
+                        self.refs[slot] = node.clone();
+                        Ok(node)
+                    }
+                    ENVSXP => {
+                        let slot = self.refs.len();
+                        self.refs.push(Node {
+                            val: Val::S4,
+                            attr: None,
+                        });
+                        let _locked = self.i32()?;
+                        let _enclos = self.item()?;
+                        let _frame = self.item()?;
+                        let _hashtab = self.item()?;
+                        let attr_node = self.item()?;
+                        let attr = match attr_node.val {
+                            Val::Nil => None,
+                            _ => Some(Box::new(attr_node)),
+                        };
+                        let node = Node { val: Val::S4, attr };
+                        self.refs[slot] = node.clone();
+                        Ok(node)
+                    }
+                    ALTREP_SXP => {
+                        let info = self.item()?;
+                        let state = self.item()?;
+                        let attr_node = self.item()?;
+                        let attr = match attr_node.val {
+                            Val::Nil => None,
+                            _ => Some(Box::new(attr_node)),
+                        };
+                        let cls = altrep_class(&info).unwrap_or_default();
+                        let val = match cls.as_str() {
+                            "compact_intseq" => expand_seq(&state, true),
+                            "compact_realseq" => expand_seq(&state, false),
+                            _ if cls.starts_with("wrap_") => {
+                                first_element(&state).map(|n| n.val.clone())
+                            }
+                            _ => Some(state.val.clone()),
+                        };
+                        match val {
+                            Some(v) => Ok(Node { val: v, attr }),
+                            None => Ok(Node {
+                                val: state.val,
+                                attr,
+                            }),
+                        }
+                    }
+                    other => Err(format!("unhandled SEXPTYPE {other}")),
+                }
+            }
+        }
+
+        fn first_element(state: &Node) -> Option<&Node> {
+            match &state.val {
+                Val::Vec(items) => items.first(),
+                Val::List { car, .. } => Some(car.as_ref()),
+                _ => None,
+            }
+        }
+
+        pub(super) fn decompress(raw: &[u8]) -> Result<(Vec<u8>, &'static str), String> {
+            use std::io::Read;
+            if raw.len() >= 2 && raw[0] == 0x1f && raw[1] == 0x8b {
+                let mut d = flate2::read::GzDecoder::new(raw);
+                let mut out = Vec::new();
+                d.read_to_end(&mut out).map_err(|e| e.to_string())?;
+                Ok((out, "gzip"))
+            } else if raw.len() >= 3 && &raw[0..3] == b"BZh" {
+                let mut d = bzip2::read::BzDecoder::new(raw);
+                let mut out = Vec::new();
+                d.read_to_end(&mut out).map_err(|e| e.to_string())?;
+                Ok((out, "bzip2"))
+            } else if raw.len() >= 6 && raw[0..6] == [0xfd, b'7', b'z', b'X', b'Z', 0x00] {
+                let mut d = xz2::read::XzDecoder::new(raw);
+                let mut out = Vec::new();
+                d.read_to_end(&mut out).map_err(|e| e.to_string())?;
+                Ok((out, "xz"))
+            } else {
+                Ok((raw.to_vec(), "none"))
+            }
+        }
+
+        pub(super) fn read_bytes(raw: &[u8]) -> Result<Vec<Loaded>, String> {
+            let (bytes, comp) = decompress(raw)?;
+            let is_rda = bytes.len() >= 5
+                && (&bytes[0..3] == b"RDX" || &bytes[0..3] == b"RDA" || &bytes[0..3] == b"RDB");
+            let mut p = 0usize;
+            if is_rda {
+                p = bytes
+                    .iter()
+                    .position(|&c| c == b'\n')
+                    .ok_or("missing container magic newline")?
+                    + 1;
+            }
+            if p + 2 > bytes.len() {
+                return Err("truncated header".into());
+            }
+            if bytes.len() >= 5 && &bytes[0..4] == b"1976" {
+                let text = String::from_utf8_lossy(&bytes);
+                let objs = read_ascii_v1(&text)?;
+                return Ok(objs
+                    .into_iter()
+                    .map(|(nm, node)| (nm, node, "rda".to_string(), 1, comp.to_string()))
+                    .collect());
+            }
+            let sel = bytes[p];
+            if sel != b'X' {
+                return Err(format!("non-XDR encoding '{}'", sel as char));
+            }
+            p += 2; // 'X' '\n'
+            let mut r = Reader {
+                b: &bytes,
+                p,
+                ver: 0,
+                refs: Vec::new(),
+                budget: ITEM_BUDGET,
+            };
+            let ver = r.i32()?;
+            r.ver = ver;
+            let _writer = r.i32()?;
+            let _min = r.i32()?;
+            if ver >= 3 {
+                let enclen = r.i32()?;
+                if enclen > 0 {
+                    r.skip(enclen as usize)?;
+                }
+            }
+            let fmt = if is_rda { "rda" } else { "rds" }.to_string();
+            let top = r.item()?;
+
+            let mut out = Vec::new();
+            if let Val::List { .. } = top.val {
+                let mut cur = Some(&top);
+                while let Some(nd) = cur {
+                    if let Val::List { tag, car, cdr } = &nd.val {
+                        let nm = if let Val::Sym(s) = &tag.val {
+                            s.clone()
+                        } else {
+                            String::new()
+                        };
+                        out.push((nm, car.as_ref().clone(), fmt.clone(), ver, comp.to_string()));
+                        cur = Some(cdr.as_ref());
+                    } else {
+                        break;
+                    }
+                }
+            } else {
+                out.push((String::new(), top, fmt, ver, comp.to_string()));
+            }
+            Ok(out)
+        }
+    }
+
+    /// Where two parsed values part, or nothing when they are the same.
+    /// Numbers are compared by their bits, so one missing value is not another.
+    fn node_difference(a: &Node, b: &Node) -> Option<String> {
+        match (&a.attr, &b.attr) {
+            (None, None) => {}
+            (Some(x), Some(y)) => {
+                if let Some(d) = node_difference(x, y) {
+                    return Some(format!(" attributes{d}"));
+                }
+            }
+            _ => return Some(": attributes on one only".into()),
+        }
+        let same = match (&a.val, &b.val) {
+            (Val::Nil, Val::Nil) | (Val::S4, Val::S4) => true,
+            (Val::Sym(x), Val::Sym(y)) => x == y,
+            (Val::Char(x), Val::Char(y)) => x == y,
+            (Val::Str(x), Val::Str(y)) => x == y,
+            (
+                Val::Ints {
+                    len: l1,
+                    vals: v1,
+                    logical: g1,
+                },
+                Val::Ints {
+                    len: l2,
+                    vals: v2,
+                    logical: g2,
+                },
+            ) => l1 == l2 && v1 == v2 && g1 == g2,
+            (Val::Reals { len: l1, vals: v1 }, Val::Reals { len: l2, vals: v2 }) => {
+                l1 == l2
+                    && v1.len() == v2.len()
+                    && v1.iter().zip(v2).all(|(p, q)| p.to_bits() == q.to_bits())
+            }
+            (
+                Val::Blob {
+                    len: l1,
+                    of: o1,
+                    digest: d1,
+                },
+                Val::Blob {
+                    len: l2,
+                    of: o2,
+                    digest: d2,
+                },
+            ) => l1 == l2 && o1 == o2 && d1 == d2,
+            (Val::Vec(x), Val::Vec(y)) => {
+                if x.len() != y.len() {
+                    return Some(format!(": {} elements against {}", x.len(), y.len()));
+                }
+                return x.iter().zip(y).enumerate().find_map(|(i, (p, q))| {
+                    node_difference(p, q).map(|d| format!(" element {i}{d}"))
+                });
+            }
+            (
+                Val::List {
+                    tag: t1,
+                    car: a1,
+                    cdr: d1,
+                },
+                Val::List {
+                    tag: t2,
+                    car: a2,
+                    cdr: d2,
+                },
+            ) => {
+                return node_difference(t1, t2)
+                    .map(|d| format!(" tag{d}"))
+                    .or_else(|| node_difference(a1, a2).map(|d| format!(" value{d}")))
+                    .or_else(|| node_difference(d1, d2).map(|d| format!(" rest{d}")));
+            }
+            _ => false,
+        };
+        if same {
+            None
+        } else {
+            Some(": values differ".into())
+        }
+    }
+
+    fn outcome_difference(
+        new: &Result<Vec<Loaded>, String>,
+        old: &Result<Vec<Loaded>, String>,
+    ) -> Option<String> {
+        match (new, old) {
+            (Err(a), Err(b)) if a == b => None,
+            (Err(a), Err(b)) => Some(format!("the error is {a:?} and was {b:?}")),
+            (Err(a), Ok(_)) => Some(format!("the error is {a:?} and the file used to read")),
+            (Ok(_), Err(b)) => Some(format!("the file reads and the error was {b:?}")),
+            (Ok(a), Ok(b)) => {
+                if a.len() != b.len() {
+                    return Some(format!("{} objects against {}", a.len(), b.len()));
+                }
+                a.iter().zip(b).enumerate().find_map(|(i, (x, y))| {
+                    if (&x.0, &x.2, x.3, &x.4) != (&y.0, &y.2, y.3, &y.4) {
+                        return Some(format!("object {i} is labelled differently"));
+                    }
+                    node_difference(&x.1, &y.1).map(|d| format!("object {i}{d}"))
+                })
+            }
+        }
+    }
+
+    /// What both readers make of one file: how many objects, or the error.
+    /// Any difference between the two fails the test that asked.
+    fn agreed(what: &str, raw: &[u8]) -> Result<usize, String> {
+        let new = read_bytes(raw);
+        let old = whole_buffer::read_bytes(raw);
+        if let Some(d) = outcome_difference(&new, &old) {
+            panic!("{what}: {d}");
+        }
+        old.map(|objs| objs.len())
+    }
+
+    /// How a run of comparisons came out, so a test can show it compared more
+    /// than one kind of outcome.
+    #[derive(Default)]
+    struct Agreed {
+        read: usize,
+        errors: std::collections::BTreeMap<String, usize>,
+    }
+
+    impl Agreed {
+        fn add(&mut self, what: &str, raw: &[u8]) {
+            match agreed(what, raw) {
+                Ok(_) => self.read += 1,
+                Err(e) => *self.errors.entry(e).or_default() += 1,
+            }
+        }
+        fn failed(&self) -> usize {
+            self.errors.values().sum()
+        }
+        fn saw(&self, text: &str) -> bool {
+            self.errors.keys().any(|e| e.contains(text))
+        }
+    }
+
+    /// Every file of the fixture package, in a fixed order.
+    fn fixture_files() -> Vec<(String, Vec<u8>)> {
+        fn walk(dir: &Path, out: &mut Vec<std::path::PathBuf>) {
+            for e in std::fs::read_dir(dir)
+                .expect("list the fixture package")
+                .flatten()
+            {
+                let p = e.path();
+                if p.is_dir() {
+                    walk(&p, out)
+                } else {
+                    out.push(p)
+                }
+            }
+        }
+        let mut paths = Vec::new();
+        walk(Path::new("tests/fixtures/pkg"), &mut paths);
+        paths.sort();
+        paths
+            .into_iter()
+            .map(|p| {
+                (
+                    p.display().to_string(),
+                    std::fs::read(&p).expect("read a fixture"),
+                )
+            })
+            .collect()
+    }
+
+    /// The fixtures that hold serialized objects, each as its decoded stream.
+    fn fixture_streams() -> Vec<(String, Vec<u8>)> {
+        fixture_files()
+            .into_iter()
+            .filter(|(_, raw)| read_bytes(raw).is_ok())
+            .map(|(name, raw)| {
+                let (stream, _) = whole_buffer::decompress(&raw).expect("a fixture decodes");
+                (name, stream)
+            })
+            .collect()
+    }
+
+    /// Up to `n` positions spread evenly over `len` bytes.
+    fn spread(len: usize, n: usize) -> Vec<usize> {
+        let n = n.min(len);
+        (0..n).map(|i| i * len / n).collect()
+    }
+
+    /// The same, and each of the last sixteen bytes, where a compressed file
+    /// keeps its checksum.
+    fn spread_and_tail(len: usize, n: usize) -> Vec<usize> {
+        let mut at = spread(len, n);
+        at.extend(len.saturating_sub(16)..len);
+        at.sort_unstable();
+        at.dedup();
+        at
+    }
+
+    /// `bytes` cut short at each position, and with one bit flipped there.
+    fn each_damaged(bytes: &[u8], at: &[usize], mut f: impl FnMut(String, &[u8])) {
+        let mut flipped = bytes.to_vec();
+        for &i in at {
+            f(format!("cut at {i}"), &bytes[..i]);
+            flipped[i] ^= 1 << (i % 8);
+            f(format!("bit flipped at {i}"), &flipped);
+            flipped[i] = bytes[i];
+        }
+    }
+
+    const PACKINGS: [&str; 4] = ["none", "gzip", "bzip2", "xz"];
+
+    fn pack(stream: &[u8], how: &str) -> Vec<u8> {
+        use std::io::Write;
+        match how {
+            "gzip" => {
+                let mut e = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+                e.write_all(stream).expect("gzip");
+                e.finish().expect("gzip")
+            }
+            "bzip2" => {
+                let mut e = bzip2::write::BzEncoder::new(Vec::new(), bzip2::Compression::fast());
+                e.write_all(stream).expect("bzip2");
+                e.finish().expect("bzip2")
+            }
+            "xz" => {
+                let mut e = xz2::write::XzEncoder::new(Vec::new(), 0);
+                e.write_all(stream).expect("xz");
+                e.finish().expect("xz")
+            }
+            _ => stream.to_vec(),
+        }
+    }
+
+    /// A serialized stream written out by hand, for the shapes no fixture has.
+    struct Wire(Vec<u8>);
+
+    impl Wire {
+        /// One object, the way `saveRDS(compress = FALSE)` starts it.
+        fn rds() -> Self {
+            let mut w = Wire(b"X\n".to_vec());
+            w.int(2).int(0x0004_0400).int(0x0002_0300);
+            w
+        }
+        /// A saved image, whose objects are the cells of one pairlist.
+        fn image() -> Self {
+            let mut w = Wire(b"RDX2\nX\n".to_vec());
+            w.int(2).int(0x0004_0400).int(0x0002_0300);
+            w
+        }
+        fn int(&mut self, v: i32) -> &mut Self {
+            self.0.extend_from_slice(&v.to_be_bytes());
+            self
+        }
+        fn head(&mut self, ty: u8) -> &mut Self {
+            self.int(ty as i32)
+        }
+        fn nil(&mut self) -> &mut Self {
+            self.head(NILVALUE)
+        }
+        fn chars(&mut self, s: &[u8]) -> &mut Self {
+            self.head(CHARSXP).int(s.len() as i32);
+            self.0.extend_from_slice(s);
+            self
+        }
+        fn sym(&mut self, name: &str) -> &mut Self {
+            self.head(SYMSXP).chars(name.as_bytes())
+        }
+        fn ints(&mut self, v: &[i32]) -> &mut Self {
+            self.head(INTSXP).int(v.len() as i32);
+            for x in v {
+                self.int(*x);
+            }
+            self
+        }
+        fn reals(&mut self, v: &[f64]) -> &mut Self {
+            self.head(REALSXP).int(v.len() as i32);
+            for x in v {
+                self.0.extend_from_slice(&x.to_be_bytes());
+            }
+            self
+        }
+        /// A pairlist cell with a tag. Its value and the rest of the list follow.
+        fn tagged(&mut self, name: &str) -> &mut Self {
+            self.int(LISTSXP as i32 | 1 << 10).sym(name)
+        }
+        /// A pairlist cell without one.
+        fn untagged(&mut self) -> &mut Self {
+            self.head(LISTSXP)
+        }
+        /// A compact or wrapped vector of class `class`. Its state and its
+        /// attributes follow.
+        fn altrep(&mut self, class: &str) -> &mut Self {
+            self.head(ALTREP_SXP);
+            self.untagged()
+                .sym(class)
+                .untagged()
+                .sym("base")
+                .untagged()
+                .ints(&[INTSXP as i32])
+                .nil()
+        }
+    }
+
+    #[test]
+    fn every_fixture_reads_as_the_whole_buffer_reader_read_it() {
+        let mut seen = Agreed::default();
+        for (name, raw) in fixture_files() {
+            seen.add(&name, &raw);
+        }
+        assert!(
+            seen.read >= 100,
+            "the serialized fixtures read: {}",
+            seen.read
+        );
+        assert!(
+            seen.failed() >= 10,
+            "and the files that are not serialized do not"
+        );
+    }
+
+    /// Damage to the file itself, which is mostly damage the decoder reports.
+    #[test]
+    fn a_damaged_file_reads_as_the_whole_buffer_reader_read_it() {
+        let mut seen = Agreed::default();
+        for (name, raw) in fixture_files() {
+            let at = spread_and_tail(raw.len(), 96);
+            each_damaged(&raw, &at, |how, bytes| {
+                seen.add(&format!("{name} {how}"), bytes)
+            });
+        }
+        assert!(seen.read > 0, "some damage is harmless");
+        for text in [
+            "corrupt deflate stream",
+            "corrupt gzip stream does not have a matching checksum",
+            "invalid gzip header",
+            "unexpected end of file",
+            "truncated header",
+            "truncated stream",
+        ] {
+            assert!(
+                seen.saw(text),
+                "no damaged file gave {text:?}: {:?}",
+                seen.errors.keys()
+            );
+        }
+    }
+
+    /// Damage to the serialized stream under each compression, which the
+    /// decoder passes and the parse has to report.
+    #[test]
+    fn a_damaged_stream_reads_the_same_under_every_compression() {
+        let mut seen = Agreed::default();
+        for (name, stream) in fixture_streams() {
+            for how in PACKINGS {
+                let n = if how == "none" || how == "gzip" {
+                    32
+                } else {
+                    4
+                };
+                each_damaged(&stream, &spread(stream.len(), n), |what, bytes| {
+                    seen.add(&format!("{name} {what} then {how}"), &pack(bytes, how));
+                });
+            }
+        }
+        assert!(seen.read > 0, "some damage is harmless");
+        for text in [
+            "truncated header",
+            "truncated stream",
+            "unhandled SEXPTYPE",
+            "bad reference index",
+            "non-XDR encoding",
+            "negative length",
+        ] {
+            assert!(
+                seen.saw(text),
+                "no damaged stream gave {text:?}: {:?}",
+                seen.errors.keys()
+            );
+        }
+    }
+
+    /// A damaged compressed file is an error whatever its objects parse to.
+    #[test]
+    fn a_decoder_error_outranks_a_stream_that_parses() {
+        let stream = {
+            let mut w = Wire::rds();
+            w.ints(&[1, 2, 3]);
+            w.0
+        };
+        for how in ["gzip", "bzip2", "xz"] {
+            let packed = pack(&stream, how);
+            assert_eq!(agreed(how, &packed), Ok(1), "{how}: the file reads whole");
+            let mut seen = Agreed::default();
+            each_damaged(
+                &packed,
+                &spread(packed.len(), packed.len()),
+                |what, bytes| seen.add(&format!("{how} {what}"), bytes),
+            );
+            assert!(seen.failed() > seen.read, "{how}: most damage is an error");
+        }
+        // The last eight bytes of a gzip file are a checksum and a length. Every
+        // byte before them decodes and parses.
+        let mut gz = pack(&stream, "gzip");
+        let at = gz.len() - 6;
+        gz[at] ^= 0x10;
+        assert_eq!(
+            agreed("gzip checksum", &gz),
+            Err("corrupt gzip stream does not have a matching checksum".to_string())
+        );
+        // An xz file followed by bytes that are not one.
+        let mut xz = pack(&stream, "xz");
+        xz.extend_from_slice(&[0u8; 5]);
+        assert_eq!(
+            agreed("xz then padding", &xz),
+            Err("corrupt xz stream".to_string())
+        );
+    }
+
+    /// A saved image hands back its objects in the order it holds them, each
+    /// under its own name.
+    #[test]
+    fn an_image_gives_each_object_once_and_in_order() {
+        let mut w = Wire::image();
+        w.tagged("first").ints(&[1, 2, 3]);
+        w.tagged("second").reals(&[0.5, f64::NAN]);
+        w.untagged().chars(b"unnamed");
+        w.tagged("last").nil().nil();
+        for how in PACKINGS {
+            let raw = pack(&w.0, how);
+            assert_eq!(agreed(how, &raw), Ok(4));
+            let objs = read_bytes(&raw).expect("the image reads");
+            let labels: Vec<_> = objs
+                .iter()
+                .map(|(nm, _, fmt, ver, comp)| (nm.as_str(), fmt.as_str(), *ver, comp.as_str()))
+                .collect();
+            assert_eq!(
+                labels,
+                [
+                    ("first", "rda", 2, how),
+                    ("second", "rda", 2, how),
+                    ("", "rda", 2, how),
+                    ("last", "rda", 2, how)
+                ]
+            );
+            assert!(matches!(&objs[0].1.val, Val::Ints { vals, .. } if vals == &[1, 2, 3]));
+            assert!(matches!(&objs[2].1.val, Val::Char(Some(t)) if t == "unnamed"));
+            assert!(matches!(objs[3].1.val, Val::Nil));
+        }
+    }
+
+    /// A list that does not end in nil stops where the list stops, and a file
+    /// whose one object is not a list is that object.
+    #[test]
+    fn a_list_is_walked_to_its_end_and_no_further() {
+        let mut w = Wire::image();
+        w.tagged("a").ints(&[1]).tagged("b").ints(&[2]).ints(&[3]);
+        assert_eq!(agreed("a list ending in a vector", &w.0), Ok(2));
+
+        let mut w = Wire::rds();
+        w.ints(&[7, 8]);
+        assert_eq!(agreed("one vector", &w.0), Ok(1));
+        let objs = read_bytes(&w.0).expect("the vector reads");
+        assert_eq!((objs[0].0.as_str(), objs[0].2.as_str()), ("", "rds"));
+    }
+
+    /// A wrapper stands for the first element of its state, whether the state
+    /// is a list or a pairlist, and a state with no first element gives none.
+    #[test]
+    fn a_wrapped_vector_is_the_vector_it_wraps() {
+        let ints = |v: &[i32]| Node {
+            val: Val::Ints {
+                len: v.len(),
+                vals: v.to_vec(),
+                logical: false,
+            },
+            attr: None,
+        };
+        let nil = || Node {
+            val: Val::Nil,
+            attr: None,
+        };
+
+        let mut in_list = Node {
+            val: Val::Vec(vec![ints(&[4, 5]), ints(&[0, 0])]),
+            attr: None,
+        };
+        assert!(matches!(
+            first_element(&mut in_list),
+            Some(Val::Ints { vals, .. }) if vals == [4, 5]
+        ));
+
+        let mut in_pairlist = Node {
+            val: Val::List {
+                tag: Box::new(nil()),
+                car: Box::new(ints(&[6])),
+                cdr: Box::new(nil()),
+            },
+            attr: None,
+        };
+        assert!(matches!(
+            first_element(&mut in_pairlist),
+            Some(Val::Ints { vals, .. }) if vals == [6]
+        ));
+
+        let mut empty = Node {
+            val: Val::Vec(Vec::new()),
+            attr: None,
+        };
+        assert!(first_element(&mut empty).is_none());
+        assert!(first_element(&mut ints(&[9])).is_none());
+    }
+
+    /// Every way a compact or wrapped vector can be written, including the
+    /// ones R does not write: a state of the wrong shape and a class nobody
+    /// has heard of.
+    #[test]
+    fn a_compact_vector_reads_as_the_whole_buffer_reader_read_it() {
+        let mut cases: Vec<(&str, Wire)> = Vec::new();
+        let mut w = Wire::rds();
+        w.altrep("wrap_integer")
+            .head(VECSXP)
+            .int(2)
+            .ints(&[3, 1, 2])
+            .ints(&[0, 0])
+            .nil();
+        cases.push(("a wrapper over a list", w));
+        let mut w = Wire::rds();
+        w.altrep("wrap_real")
+            .untagged()
+            .reals(&[1.5, 2.5])
+            .untagged()
+            .ints(&[0, 0])
+            .nil()
+            .nil();
+        cases.push(("a wrapper over a pairlist", w));
+        let mut w = Wire::rds();
+        w.altrep("wrap_integer").head(VECSXP).int(0).nil();
+        cases.push(("a wrapper over an empty list", w));
+        let mut w = Wire::rds();
+        w.altrep("wrap_string").ints(&[1, 2]).nil();
+        cases.push(("a wrapper over a bare vector", w));
+        let mut w = Wire::rds();
+        w.altrep("compact_intseq").reals(&[4.0, 1.0, 1.0]).nil();
+        cases.push(("a sequence", w));
+        let mut w = Wire::rds();
+        w.altrep("compact_realseq").ints(&[3, 10, 2]).nil();
+        cases.push(("a sequence with an integer state", w));
+        let mut w = Wire::rds();
+        w.altrep("compact_intseq").reals(&[4.0]).nil();
+        cases.push(("a sequence with a short state", w));
+        let mut w = Wire::rds();
+        w.altrep("compact_intseq")
+            .reals(&[(CELL_CAP + 1) as f64, 1.0, 1.0])
+            .nil();
+        cases.push(("a sequence past the cell cap", w));
+        let mut w = Wire::rds();
+        w.altrep("deferred_string")
+            .head(STRSXP)
+            .int(2)
+            .chars(b"a")
+            .chars(b"b")
+            .nil();
+        cases.push(("an unknown class", w));
+        let mut w = Wire::rds();
+        w.altrep("wrap_integer").head(VECSXP).int(1).ints(&[1, 2]);
+        w.tagged("names")
+            .head(STRSXP)
+            .int(2)
+            .chars(b"x")
+            .chars(b"y")
+            .nil();
+        cases.push(("a wrapper with attributes", w));
+
+        for (what, w) in &cases {
+            assert_eq!(agreed(what, &w.0), Ok(1), "{what}");
+            each_damaged(&w.0, &spread(w.0.len(), w.0.len()), |how, bytes| {
+                let _ = agreed(&format!("{what} {how}"), bytes);
+            });
+        }
+        let read = |i: usize| read_bytes(&cases[i].1.0).expect("it reads").remove(0).1;
+        assert!(matches!(read(0).val, Val::Ints { vals, .. } if vals == [3, 1, 2]));
+        assert!(matches!(read(1).val, Val::Reals { vals, .. } if vals == [1.5, 2.5]));
+        assert!(matches!(read(2).val, Val::Vec(v) if v.is_empty()));
+        assert!(matches!(read(4).val, Val::Ints { vals, .. } if vals == [1, 2, 3, 4]));
+        assert!(matches!(read(6).val, Val::Reals { vals, .. } if vals == [4.0]));
+        assert!(matches!(read(8).val, Val::Str(v) if v.len() == 2));
+        assert!(
+            read(9).attr.is_some(),
+            "the attributes are the wrapper's own"
+        );
     }
 }
