@@ -163,7 +163,11 @@ const SKETCH_K: usize = 32;
 const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
 const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
 fn fnv(bytes: &[u8]) -> u64 {
-    let mut h = FNV_OFFSET;
+    fnv_more(FNV_OFFSET, bytes)
+}
+/// The same hash carried on from `h`, for bytes that arrive in pieces.
+#[inline]
+fn fnv_more(mut h: u64, bytes: &[u8]) -> u64 {
     for &b in bytes {
         h ^= b as u64;
         h = h.wrapping_mul(FNV_PRIME);
@@ -202,33 +206,192 @@ struct Node {
     attr: Option<Box<Node>>,
 }
 
+/// How much of a decoded data file is held at a time.
+const WINDOW: usize = 256 * 1024;
+
+/// How much stack the parse may use on a stream whose decoder has not reached
+/// its end. The bytes of a damaged file can nest as deep as the file is long,
+/// and they used never to be parsed at all.
+const UNVERIFIED_STACK: usize = 1024 * 1024;
+
+/// Whereabouts the stack is.
+#[inline(always)]
+fn stack_here() -> usize {
+    let mark = 0u8;
+    &mark as *const u8 as usize
+}
+
+/// A data file's decoded bytes, seen through a window and never held whole.
+///
+/// A file used to be decoded to its end before any of it was parsed, so a
+/// decoder error anywhere in it was the outcome whatever the parse would have
+/// said. `failed` keeps that rule: it is what the decoder said, and the caller
+/// reads the stream to its end and looks here before it believes the parse.
+struct Window<'a> {
+    from: Box<dyn std::io::Read + 'a>,
+    buf: Vec<u8>,
+    lo: usize,
+    hi: usize,
+    ended: bool,
+    failed: Option<String>,
+}
+
+impl<'a> Window<'a> {
+    fn over(from: Box<dyn std::io::Read + 'a>) -> Self {
+        Window {
+            from,
+            buf: vec![0; WINDOW],
+            lo: 0,
+            hi: 0,
+            ended: false,
+            failed: None,
+        }
+    }
+    /// The bytes held and not yet read.
+    fn held(&self) -> &[u8] {
+        &self.buf[self.lo..self.hi]
+    }
+    /// One more read from the decoder, behind whatever is still unread, which
+    /// has to be less than a window. False once the stream has ended or failed.
+    fn more(&mut self) -> bool {
+        use std::io::Read;
+        if self.ended {
+            return false;
+        }
+        if self.lo > 0 {
+            self.buf.copy_within(self.lo..self.hi, 0);
+            self.hi -= self.lo;
+            self.lo = 0;
+        }
+        debug_assert!(self.hi < self.buf.len());
+        loop {
+            match self.from.read(&mut self.buf[self.hi..]) {
+                Ok(0) => break,
+                Ok(n) => {
+                    self.hi += n;
+                    return true;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(e) => {
+                    self.failed = Some(e.to_string());
+                    break;
+                }
+            }
+        }
+        self.ended = true;
+        false
+    }
+    /// Holds `n` unread bytes, `n` no more than a window, if the stream has
+    /// them.
+    #[inline(never)]
+    fn hold(&mut self, n: usize) -> bool {
+        debug_assert!(n <= WINDOW);
+        while self.hi - self.lo < n {
+            if !self.more() {
+                return false;
+            }
+        }
+        true
+    }
+    /// The next `N` bytes, which are a number.
+    #[inline]
+    fn array<const N: usize>(&mut self) -> Result<[u8; N], String> {
+        if self.hi - self.lo < N && !self.hold(N) {
+            return Err("truncated stream".into());
+        }
+        let at = self.lo;
+        self.lo += N;
+        Ok(self.buf[at..at + N].try_into().unwrap())
+    }
+    /// The next `n` bytes in one piece: where they lie when a window can hold
+    /// them, and gathered into `long` when it cannot.
+    fn bytes<'b>(&'b mut self, n: usize, long: &'b mut Vec<u8>) -> Result<&'b [u8], String> {
+        if n > WINDOW {
+            self.pass(n, |part| long.extend_from_slice(part))?;
+            return Ok(long);
+        }
+        if self.hi - self.lo < n && !self.hold(n) {
+            return Err("truncated stream".into());
+        }
+        let at = self.lo;
+        self.lo += n;
+        Ok(&self.buf[at..at + n])
+    }
+    /// The next `n` bytes, handed to `f` a piece at a time and not kept.
+    fn pass(&mut self, mut n: usize, mut f: impl FnMut(&[u8])) -> Result<(), String> {
+        while n > 0 {
+            if self.lo == self.hi && !self.more() {
+                return Err("truncated stream".into());
+            }
+            let k = n.min(self.hi - self.lo);
+            f(&self.buf[self.lo..self.lo + k]);
+            self.lo += k;
+            n -= k;
+        }
+        Ok(())
+    }
+    /// Steps past the first newline. False if the stream ends without one.
+    fn past_newline(&mut self) -> bool {
+        loop {
+            if let Some(i) = self.held().iter().position(|&c| c == b'\n') {
+                self.lo += i + 1;
+                return true;
+            }
+            self.lo = self.hi;
+            if !self.more() {
+                return false;
+            }
+        }
+    }
+    /// Everything not yet read, whole.
+    fn rest(&mut self) -> Vec<u8> {
+        let mut out = Vec::new();
+        loop {
+            out.extend_from_slice(self.held());
+            self.lo = self.hi;
+            if !self.more() {
+                return out;
+            }
+        }
+    }
+    /// Takes the rest of the stream into the window, however long it is. The
+    /// decoder has then said all it has to say.
+    fn hold_rest(&mut self) {
+        if !self.ended {
+            self.buf = self.rest();
+            self.lo = 0;
+            self.hi = self.buf.len();
+        }
+    }
+    /// Reads to the end of the stream and keeps none of it, so that a fault
+    /// the decoder finds after the parse has stopped is still found.
+    fn run_out(&mut self) {
+        loop {
+            self.lo = self.hi;
+            if !self.more() {
+                return;
+            }
+        }
+    }
+}
+
 struct Reader<'a> {
-    b: &'a [u8],
-    p: usize,
+    s: Window<'a>,
     ver: i32,
     refs: Vec<Node>,
     budget: u32,
+    /// Where the stack was when the read began.
+    base: usize,
+    /// Whether the decoder may still have an error to report.
+    unverified: bool,
 }
 
 impl<'a> Reader<'a> {
-    fn need(&self, n: usize) -> Result<(), String> {
-        if self.p.checked_add(n).map_or(true, |e| e > self.b.len()) {
-            Err("truncated stream".into())
-        } else {
-            Ok(())
-        }
-    }
     fn i32(&mut self) -> Result<i32, String> {
-        self.need(4)?;
-        let v = i32::from_be_bytes(self.b[self.p..self.p + 4].try_into().unwrap());
-        self.p += 4;
-        Ok(v)
+        Ok(i32::from_be_bytes(self.s.array()?))
     }
     fn f64(&mut self) -> Result<f64, String> {
-        self.need(8)?;
-        let v = f64::from_be_bytes(self.b[self.p..self.p + 8].try_into().unwrap());
-        self.p += 8;
-        Ok(v)
+        Ok(f64::from_be_bytes(self.s.array()?))
     }
     fn vlen(&mut self) -> Result<usize, String> {
         let n = self.i32()?;
@@ -242,36 +405,73 @@ impl<'a> Reader<'a> {
             Ok(n as usize)
         }
     }
-    /// Hash a span without keeping it. Complex and raw values are read for
-    /// their size rather than their contents, but a dataset with no
-    /// fingerprint is dropped before it reaches anywhere, so what cannot be
-    /// held can at least be identified.
+    /// Hash a span without keeping it, in the one pass that steps over it.
+    /// Complex and raw values are read for their size rather than their
+    /// contents, but a dataset with no fingerprint is dropped before it
+    /// reaches anywhere, so what cannot be held can at least be identified.
     fn digest_span(&mut self, n: usize) -> Result<u64, String> {
-        self.need(n)?;
-        Ok(fnv(&self.b[self.p..self.p + n]))
+        let mut h = FNV_OFFSET;
+        self.s.pass(n, |part| h = fnv_more(h, part))?;
+        Ok(h)
     }
 
     fn skip(&mut self, n: usize) -> Result<(), String> {
-        self.need(n)?;
-        self.p += n;
-        Ok(())
+        self.s.pass(n, |_| {})
     }
     /// The `n` bytes of a string, as text. Out of line, so that what it holds
     /// on the stack is not held again at every level of a nested object.
     #[inline(never)]
     fn text(&mut self, n: usize, latin1: bool) -> Result<String, String> {
-        self.need(n)?;
-        let raw = &self.b[self.p..self.p + n];
+        let mut long = Vec::new();
+        let raw = self.s.bytes(n, &mut long)?;
         // Latin-1 is not UTF-8, and reading it as though it were replaces
         // every accented character with a marker: the text is wrong, and so
         // is the fingerprint taken over it.
-        let s = if latin1 {
+        Ok(if latin1 {
             raw.iter().map(|b| *b as char).collect::<String>()
         } else {
             String::from_utf8_lossy(raw).into_owned()
-        };
-        self.p += n;
-        Ok(s)
+        })
+    }
+    /// The headers of a data file and the one object after them.
+    fn file(&mut self) -> Result<Parsed, String> {
+        // The first five bytes say which container this is, if the stream is
+        // that long.
+        let long = self.s.hold(5);
+        let head = self.s.held();
+        let is_rda =
+            long && (&head[0..3] == b"RDX" || &head[0..3] == b"RDA" || &head[0..3] == b"RDB");
+        let is_v1 = long && &head[0..4] == b"1976";
+        if is_rda && !self.s.past_newline() {
+            return Err("missing container magic newline".into());
+        }
+        if !self.s.hold(2) {
+            return Err("truncated header".into());
+        }
+        // R before 1.4.0 wrote a different format entirely, and a package whose
+        // last release predates 2002 has all of its data in it. It is not a
+        // stream, so all of it is taken at once.
+        if is_v1 {
+            let bytes = self.s.rest();
+            let text = String::from_utf8_lossy(&bytes);
+            return Ok(Parsed::Text(read_ascii_v1(&text)?));
+        }
+        let sel = self.s.held()[0];
+        if sel != b'X' {
+            return Err(format!("non-XDR encoding '{}'", sel as char));
+        }
+        self.s.lo += 2; // 'X' '\n'
+        let ver = self.i32()?;
+        self.ver = ver;
+        let _writer = self.i32()?;
+        let _min = self.i32()?;
+        if ver >= 3 {
+            let enclen = self.i32()?;
+            if enclen > 0 {
+                self.skip(enclen as usize)?;
+            }
+        }
+        Ok(Parsed::Xdr(self.item()?, is_rda, ver))
     }
     /// Code vector then constant pool.
     fn bc_body(&mut self) -> Result<(), String> {
@@ -330,6 +530,17 @@ impl<'a> Reader<'a> {
             return Err("item budget exceeded".into());
         }
         self.budget -= 1;
+        // Before going deeper than this, find out whether the decoder passes
+        // the file. If it does, the rest is read as it always was, at any
+        // depth. If it does not, its error is the outcome and nothing more is
+        // parsed.
+        if self.unverified && self.base.abs_diff(stack_here()) > UNVERIFIED_STACK {
+            self.unverified = false;
+            self.s.hold_rest();
+            if let Some(e) = &self.s.failed {
+                return Err(e.clone());
+            }
+        }
         let f = self.i32()?;
         let t = (f & 0xFF) as u8;
         let ha = f & (1 << 9) != 0;
@@ -421,7 +632,6 @@ impl<'a> Reader<'a> {
                 // fingerprint is dropped rather than stored.
                 if n > CELL_CAP {
                     let digest = self.digest_span(4 * n)?;
-                    self.skip(4 * n)?;
                     let attr = self.maybe_attr(ha)?;
                     let of = if t == LGLSXP { "logical" } else { "integer" };
                     return Ok(Node { val: Val::Blob { len: n, of, digest: Some(digest) }, attr });
@@ -440,7 +650,6 @@ impl<'a> Reader<'a> {
                 let n = self.vlen()?;
                 if n > CELL_CAP {
                     let digest = self.digest_span(8 * n)?;
-                    self.skip(8 * n)?;
                     let attr = self.maybe_attr(ha)?;
                     return Ok(Node {
                         val: Val::Blob { len: n, of: "numeric", digest: Some(digest) },
@@ -457,14 +666,12 @@ impl<'a> Reader<'a> {
             CPLXSXP => {
                 let n = self.vlen()?;
                 let digest = self.digest_span(16 * n)?;
-                self.skip(16 * n)?;
                 let attr = self.maybe_attr(ha)?;
                 Ok(Node { val: Val::Blob { len: n, of: "complex", digest: Some(digest) }, attr })
             }
             RAWSXP => {
                 let n = self.vlen()?;
                 let digest = self.digest_span(n)?;
-                self.skip(n)?;
                 let attr = self.maybe_attr(ha)?;
                 Ok(Node { val: Val::Blob { len: n, of: "raw", digest: Some(digest) }, attr })
             }
@@ -3783,25 +3990,16 @@ fn describe(
     rec
 }
 
-fn decompress(raw: &[u8]) -> Result<(Vec<u8>, &'static str), String> {
-    use std::io::Read;
+/// The decoder a file's first bytes ask for, with nothing read from it yet.
+fn decoder(raw: &[u8]) -> (Box<dyn std::io::Read + '_>, &'static str) {
     if raw.len() >= 2 && raw[0] == 0x1f && raw[1] == 0x8b {
-        let mut d = flate2::read::GzDecoder::new(raw);
-        let mut out = Vec::new();
-        d.read_to_end(&mut out).map_err(|e| e.to_string())?;
-        Ok((out, "gzip"))
+        (Box::new(flate2::read::GzDecoder::new(raw)), "gzip")
     } else if raw.len() >= 3 && &raw[0..3] == b"BZh" {
-        let mut d = bzip2::read::BzDecoder::new(raw);
-        let mut out = Vec::new();
-        d.read_to_end(&mut out).map_err(|e| e.to_string())?;
-        Ok((out, "bzip2"))
+        (Box::new(bzip2::read::BzDecoder::new(raw)), "bzip2")
     } else if raw.len() >= 6 && raw[0..6] == [0xfd, b'7', b'z', b'X', b'Z', 0x00] {
-        let mut d = xz2::read::XzDecoder::new(raw);
-        let mut out = Vec::new();
-        d.read_to_end(&mut out).map_err(|e| e.to_string())?;
-        Ok((out, "xz"))
+        (Box::new(xz2::read::XzDecoder::new(raw)), "xz")
     } else {
-        Ok((raw.to_vec(), "none"))
+        (Box::new(raw), "none")
     }
 }
 
@@ -4075,51 +4273,50 @@ fn read_file(path: &Path) -> Result<Vec<Loaded>, String> {
     read_bytes(&raw)
 }
 
+/// What a data file parsed to, before its objects are told apart.
+enum Parsed {
+    /// The format from before R 1.4.0: its named objects.
+    Text(Vec<(String, Node)>),
+    /// One serialized object, whether a saved image holds it, and the
+    /// serialization version.
+    Xdr(Node, bool, i32),
+}
+
 fn read_bytes(raw: &[u8]) -> Result<Vec<Loaded>, String> {
-    let (bytes, comp) = decompress(raw)?;
-    let is_rda = bytes.len() >= 5
-        && (&bytes[0..3] == b"RDX" || &bytes[0..3] == b"RDA" || &bytes[0..3] == b"RDB");
-    let mut p = 0usize;
-    if is_rda {
-        p = bytes
-            .iter()
-            .position(|&c| c == b'\n')
-            .ok_or("missing container magic newline")?
-            + 1;
-    }
-    if p + 2 > bytes.len() {
-        return Err("truncated header".into());
-    }
-    // R before 1.4.0 wrote a different format entirely, and a package whose
-    // last release predates 2002 has all of its data in it.
-    if bytes.len() >= 5 && &bytes[0..4] == b"1976" {
-        let text = String::from_utf8_lossy(&bytes);
-        let objs = read_ascii_v1(&text)?;
-        return Ok(objs
-            .into_iter()
-            .map(|(nm, node)| (nm, node, "rda".to_string(), 1, comp.to_string()))
-            .collect());
-    }
-    let sel = bytes[p];
-    if sel != b'X' {
-        return Err(format!("non-XDR encoding '{}'", sel as char));
-    }
-    p += 2; // 'X' '\n'
-    let mut r = Reader { b: &bytes, p, ver: 0, refs: Vec::new(), budget: ITEM_BUDGET };
-    let ver = r.i32()?;
-    r.ver = ver;
-    let _writer = r.i32()?;
-    let _min = r.i32()?;
-    if ver >= 3 {
-        let enclen = r.i32()?;
-        if enclen > 0 {
-            r.skip(enclen as usize)?;
-        }
-    }
-    let fmt = if is_rda { "rda" } else { "rds" }.to_string();
-    let top = r.item()?;
+    let (from, comp) = decoder(raw);
+    read_stream(from, comp)
+}
+
+fn read_stream(from: Box<dyn std::io::Read + '_>, comp: &str) -> Result<Vec<Loaded>, String> {
+    let mut r = Reader {
+        s: Window::over(from),
+        ver: 0,
+        refs: Vec::new(),
+        budget: ITEM_BUDGET,
+        base: stack_here(),
+        unverified: true,
+    };
+    let parsed = r.file();
+    // Wherever the parse stopped and whatever it said, the decoder is read to
+    // its end, and an error from it is the outcome. Some faults are only found
+    // there: a checksum that does not match is the last thing a decoder says.
+    r.s.run_out();
+    let failed = r.s.failed.take();
     // Nothing reads the reference table past this point.
     drop(r);
+    if let Some(e) = failed {
+        return Err(e);
+    }
+    let (top, is_rda, ver) = match parsed? {
+        Parsed::Text(objs) => {
+            return Ok(objs
+                .into_iter()
+                .map(|(nm, node)| (nm, node, "rda".to_string(), 1, comp.to_string()))
+                .collect());
+        }
+        Parsed::Xdr(top, is_rda, ver) => (top, is_rda, ver),
+    };
+    let fmt = if is_rda { "rda" } else { "rds" }.to_string();
 
     // Each object is moved out of the list that holds it. A copy would be a
     // second tree the size of the first, alive beside it.
@@ -8477,5 +8674,545 @@ mod tests {
             read(9).attr.is_some(),
             "the attributes are the wrapper's own"
         );
+    }
+
+    /// What the windowed reader makes of a decoder, against what the
+    /// whole-buffer reader makes of the bytes that decoder hands over.
+    fn agreed_through(
+        what: &str,
+        from: Box<dyn std::io::Read + '_>,
+        stream: &[u8],
+    ) -> Result<usize, String> {
+        let new = read_stream(from, "none");
+        let old = whole_buffer::read_bytes(stream);
+        if let Some(d) = outcome_difference(&new, &old) {
+            panic!("{what}: {d}");
+        }
+        old.map(|objs| objs.len())
+    }
+
+    /// Hands over at most `step` bytes at a time.
+    struct Dribble<'a> {
+        left: &'a [u8],
+        step: usize,
+    }
+
+    impl std::io::Read for Dribble<'_> {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let n = self.step.min(buf.len()).min(self.left.len());
+            buf[..n].copy_from_slice(&self.left[..n]);
+            self.left = &self.left[n..];
+            Ok(n)
+        }
+    }
+
+    /// Hands over its bytes and then fails, and must not be asked again.
+    struct Failing<'a> {
+        left: &'a [u8],
+        failed: bool,
+    }
+
+    impl std::io::Read for Failing<'_> {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if self.left.is_empty() {
+                assert!(!self.failed, "a decoder that failed was read again");
+                self.failed = true;
+                return Err(std::io::Error::other("the decoder gave up"));
+            }
+            let n = buf.len().min(self.left.len());
+            buf[..n].copy_from_slice(&self.left[..n]);
+            self.left = &self.left[n..];
+            Ok(n)
+        }
+    }
+
+    /// Is interrupted before every read that hands anything over.
+    struct Interrupted<'a> {
+        left: &'a [u8],
+        ready: bool,
+    }
+
+    impl std::io::Read for Interrupted<'_> {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            self.ready = !self.ready;
+            if self.ready {
+                return Err(std::io::ErrorKind::Interrupted.into());
+            }
+            let n = buf.len().min(self.left.len());
+            buf[..n].copy_from_slice(&self.left[..n]);
+            self.left = &self.left[n..];
+            Ok(n)
+        }
+    }
+
+    /// Counts what is taken from it.
+    struct Counted<'a> {
+        left: &'a [u8],
+        taken: &'a std::cell::Cell<usize>,
+    }
+
+    impl std::io::Read for Counted<'_> {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let n = buf.len().min(self.left.len());
+            buf[..n].copy_from_slice(&self.left[..n]);
+            self.left = &self.left[n..];
+            self.taken.set(self.taken.get() + n);
+            Ok(n)
+        }
+    }
+
+    /// An image several windows long, laid out so that numbers, strings and
+    /// hashed spans all fall across the edge of a window.
+    fn long_stream() -> Vec<u8> {
+        let mut w = Wire::image();
+        // Three bytes, so nothing after them starts on a multiple of four.
+        w.tagged("odd").chars(b"abc");
+        let reals: Vec<f64> = (0..100_000).map(|i| i as f64 * 0.25 - 7.0).collect();
+        w.tagged("reals").reals(&reals);
+        let ints: Vec<i32> = (0..150_001).map(|i| i * 7 - 3).collect();
+        w.tagged("ints").ints(&ints);
+        // A string longer than two windows, not all of it valid UTF-8, once
+        // as UTF-8 and once marked Latin-1.
+        let mut text: Vec<u8> = (0..2 * WINDOW + 5).map(|i| b'a' + (i % 26) as u8).collect();
+        text[WINDOW - 1] = 0xe9;
+        text[WINDOW] = 0xff;
+        w.tagged("text").chars(&text);
+        w.tagged("latin")
+            .int(CHARSXP as i32 | LATIN1_MASK << 12)
+            .int(text.len() as i32);
+        w.0.extend_from_slice(&text);
+        w.tagged("strings").head(STRSXP).int(40_000);
+        for i in 0..40_000 {
+            w.chars(format!("s{i}").as_bytes());
+        }
+        // Raw and complex values are hashed and not kept.
+        let bytes: Vec<u8> = (0..1_000_003).map(|i| (i % 251) as u8).collect();
+        w.tagged("raw").head(RAWSXP).int(bytes.len() as i32);
+        w.0.extend_from_slice(&bytes);
+        w.tagged("complex").head(CPLXSXP).int(40_001);
+        w.0.extend_from_slice(&bytes[..16 * 40_001]);
+        // A builtin is its name, which is stepped over.
+        w.tagged("builtin")
+            .head(BUILTINSXP)
+            .int((WINDOW + 17) as i32);
+        w.0.extend_from_slice(&bytes[..WINDOW + 17]);
+        w.nil();
+        w.0
+    }
+
+    #[test]
+    fn a_stream_longer_than_the_window_reads_as_the_whole_buffer_reader_read_it() {
+        let stream = long_stream();
+        assert!(stream.len() > 16 * WINDOW, "the stream spans many windows");
+        let mut seen = Agreed::default();
+        for how in PACKINGS {
+            let packed = pack(&stream, how);
+            assert_eq!(agreed(how, &packed), Ok(9), "{how}");
+            each_damaged(
+                &packed,
+                &spread_and_tail(packed.len(), 24),
+                |what, bytes| seen.add(&format!("{how} {what}"), bytes),
+            );
+        }
+        // Damage at and beside the first few edges of the window.
+        let mut at = Vec::new();
+        for edge in (WINDOW..=4 * WINDOW).step_by(WINDOW) {
+            at.extend(edge - 5..edge + 5);
+        }
+        each_damaged(&stream, &at, |what, bytes| seen.add(&what, bytes));
+        assert!(seen.read > 0, "some damage is harmless");
+        assert!(seen.saw("truncated stream"));
+
+        let objs = read_bytes(&stream).expect("the long stream reads");
+        let text = |i: usize| match &objs[i].1.val {
+            Val::Char(Some(t)) => t.clone(),
+            _ => panic!("object {i} is not a string"),
+        };
+        assert_eq!(
+            text(3).chars().count(),
+            2 * WINDOW + 5,
+            "one mark for each bad byte"
+        );
+        assert!(text(3).contains('\u{fffd}'), "what is not UTF-8 is marked");
+        assert!(text(4).contains('\u{e9}'), "and Latin-1 is read as Latin-1");
+        assert!(matches!(
+            objs[6].1.val,
+            Val::Blob {
+                len: 1_000_003,
+                of: "raw",
+                digest: Some(_)
+            }
+        ));
+    }
+
+    /// A decoder may hand over as little as it likes at a time.
+    #[test]
+    fn a_decoder_that_dribbles_changes_nothing() {
+        let long = long_stream();
+        for step in [1, 5, 8191, WINDOW - 3] {
+            let from = Dribble { left: &long, step };
+            assert_eq!(
+                agreed_through("the long stream", Box::new(from), &long),
+                Ok(9)
+            );
+        }
+        let mut read = 0;
+        for (name, stream) in fixture_streams() {
+            for step in [1, 3, 4096] {
+                let from = Dribble {
+                    left: &stream,
+                    step,
+                };
+                read += agreed_through(&name, Box::new(from), &stream).is_ok() as usize;
+                each_damaged(&stream, &spread(stream.len(), 6), |what, bytes| {
+                    let from = Dribble { left: bytes, step };
+                    let _ = agreed_through(&format!("{name} {what}"), Box::new(from), bytes);
+                });
+            }
+        }
+        assert!(read >= 300, "every fixture reads at every step: {read}");
+
+        let from = Interrupted {
+            left: &long,
+            ready: false,
+        };
+        assert_eq!(agreed_through("interrupted", Box::new(from), &long), Ok(9));
+    }
+
+    /// A decoder error is the outcome wherever in the stream it falls: before
+    /// the parse has what it needs, after the parse has failed for a reason of
+    /// its own, and after the parse is done.
+    #[test]
+    fn a_decoder_error_wins_wherever_it_falls() {
+        let long = long_stream();
+        let small = {
+            let mut w = Wire::rds();
+            w.ints(&[1, 2, 3]);
+            w.0
+        };
+        // Not a stream this reader takes, and it says so at the sixth byte.
+        let mut refused = b"RDX2\nA\n".to_vec();
+        refused.resize(3 * WINDOW, b'.');
+        for (what, stream) in [("long", &long), ("small", &small), ("refused", &refused)] {
+            let mut at = spread(stream.len(), 40);
+            at.push(stream.len());
+            for good in at {
+                let from = Failing {
+                    left: &stream[..good],
+                    failed: false,
+                };
+                assert_eq!(
+                    read_stream(Box::new(from), "none").err(),
+                    Some("the decoder gave up".to_string()),
+                    "{what}, failing after {good} bytes"
+                );
+            }
+        }
+    }
+
+    /// The stream is read to its end whatever the parse said and however
+    /// early it said it, since that is where a decoder checks its sums.
+    #[test]
+    fn a_stream_is_read_to_its_end_whatever_the_parse_said() {
+        let taken = std::cell::Cell::new(0);
+        let read = |stream: &[u8]| {
+            taken.set(0);
+            let from = Counted {
+                left: stream,
+                taken: &taken,
+            };
+            let out = read_stream(Box::new(from), "none").map(|objs| objs.len());
+            assert_eq!(taken.get(), stream.len(), "the whole stream was taken");
+            out
+        };
+        let mut refused = b"RDX2\nA\n".to_vec();
+        refused.resize(5 * WINDOW + 3, b'.');
+        assert_eq!(read(&refused), Err("non-XDR encoding 'A'".to_string()));
+
+        let mut w = Wire::rds();
+        w.ints(&[1, 2, 3]);
+        w.0.resize(3 * WINDOW + 1, 0xaa);
+        assert_eq!(read(&w.0), Ok(1), "what follows the object is not parsed");
+
+        assert_eq!(read(&long_stream()), Ok(9));
+        assert_eq!(read(b""), Err("truncated header".to_string()));
+    }
+
+    /// A file that runs out of budget part way still reports a fault its
+    /// decoder finds further on.
+    #[test]
+    fn a_file_past_the_item_budget_still_reports_what_its_decoder_found() {
+        let n = ITEM_BUDGET as usize + ITEM_BUDGET as usize / 4;
+        let mut w = Wire::rds();
+        w.head(VECSXP).int(n as i32);
+        // Eight markers that each read as nothing, in no repeating order, so
+        // that a damaged copy cannot decode to the same bytes.
+        let markers = [
+            NILVALUE,
+            GLOBALENV_SXP,
+            UNBOUNDVALUE_SXP,
+            MISSINGARG_SXP,
+            BASENAMESPACE_SXP,
+            EMPTYENV_SXP,
+            BASEENV_SXP,
+            0,
+        ];
+        let mut x = 1u32;
+        for _ in 0..n {
+            x = x.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            w.head(markers[(x >> 29) as usize]);
+        }
+        let over = Err("item budget exceeded".to_string());
+        assert_eq!(agreed("none", &w.0), over);
+        for how in ["gzip", "bzip2", "xz"] {
+            let packed = pack(&w.0, how);
+            assert_eq!(agreed(how, &packed), over, "{how}");
+            // Both faults are in the last tenth of the file, long after the
+            // budget has run out.
+            let late = packed.len() - packed.len() / 10;
+            let cut = agreed(&format!("{how} cut"), &packed[..late]);
+            assert!(cut.is_err() && cut != over, "{how} cut short: {cut:?}");
+            let mut flipped = packed.clone();
+            flipped[late] ^= 0x04;
+            let flip = agreed(&format!("{how} bit flipped"), &flipped);
+            assert!(
+                flip.is_err() && flip != over,
+                "{how} with a bit flipped: {flip:?}"
+            );
+        }
+    }
+
+    /// A vector past the cell cap is hashed in the pass that steps over it,
+    /// however many windows it fills.
+    #[test]
+    fn a_vector_past_the_cell_cap_is_hashed_as_it_goes_by() {
+        let n = CELL_CAP + 1;
+        let mut w = Wire::image();
+        w.tagged("big").head(INTSXP).int(n as i32);
+        let start = w.0.len();
+        w.0.extend((0..4 * n).map(|i| (i % 251) as u8));
+        let end = w.0.len();
+        w.tagged("after").ints(&[1, 2, 3]).nil();
+
+        for how in ["none", "gzip"] {
+            let packed = pack(&w.0, how);
+            assert_eq!(agreed(how, &packed), Ok(2), "{how}");
+            let objs = read_bytes(&packed).expect("the image reads");
+            let want = fnv(&w.0[start..end]);
+            assert!(matches!(
+                objs[0].1.val,
+                Val::Blob { len, of: "integer", digest: Some(d) } if len == n && d == want
+            ));
+            assert!(matches!(&objs[1].1.val, Val::Ints { vals, .. } if vals == &[1, 2, 3]));
+        }
+        let short = Err("truncated stream".to_string());
+        assert_eq!(
+            agreed("cut inside the vector", &w.0[..start + 2 * n]),
+            short
+        );
+        assert_eq!(agreed("cut at the end of the vector", &w.0[..end]), short);
+        let mut flipped = w.0.clone();
+        flipped[start + 3 * n] ^= 0x80;
+        assert_eq!(agreed("one bit of the vector flipped", &flipped), Ok(2));
+    }
+
+    /// The container's first line ends at its newline, however far off that
+    /// is, and every header too short to be one says so as it did.
+    #[test]
+    fn a_header_is_judged_as_the_whole_buffer_reader_judged_it() {
+        let object = {
+            let mut w = Wire::rds();
+            w.ints(&[1, 2, 3]);
+            w.0
+        };
+        let mut far = b"RDX2".to_vec();
+        far.resize(2 * WINDOW + 100, b'-');
+        far.push(b'\n');
+        far.extend_from_slice(&object);
+        let mut never = b"RDA2".to_vec();
+        never.resize(3 * WINDOW, b'-');
+        for how in PACKINGS {
+            assert_eq!(agreed(how, &pack(&far, how)), Ok(1), "{how}");
+            assert_eq!(
+                agreed(how, &pack(&never, how)),
+                Err("missing container magic newline".to_string()),
+                "{how}"
+            );
+        }
+
+        let mut seen = Agreed::default();
+        let heads: [&[u8]; 16] = [
+            b"",
+            b"R",
+            b"RDX",
+            b"RDX2",
+            b"RDX2\n",
+            b"RDX2\nX",
+            b"RDX2\nX\n",
+            b"RDX2\nA\n",
+            b"RDB2\nX\n\0\0",
+            b"RDX2X",
+            b"X",
+            b"X\n",
+            b"A\n",
+            b"1976",
+            b"1976\n",
+            b"1976 1",
+        ];
+        for head in heads {
+            for how in PACKINGS {
+                seen.add(&format!("{head:?} {how}"), &pack(head, how));
+                let mut whole = head.to_vec();
+                whole.extend_from_slice(&object[2..]);
+                seen.add(
+                    &format!("{head:?} and an object, {how}"),
+                    &pack(&whole, how),
+                );
+            }
+        }
+        assert!(seen.read > 0, "a header with an object after it reads");
+        for text in [
+            "truncated header",
+            "truncated stream",
+            "non-XDR encoding 'A'",
+            "missing container magic newline",
+            "truncated v1 stream",
+        ] {
+            assert!(
+                seen.saw(text),
+                "no header gave {text:?}: {:?}",
+                seen.errors.keys()
+            );
+        }
+    }
+
+    /// The format from before R 1.4.0 is not a stream, so it is still read
+    /// whole, across as many windows as it fills.
+    #[test]
+    fn the_old_text_format_is_read_whole_however_long_it_is() {
+        let text =
+            std::fs::read("tests/fixtures/pkg/data/v1_ascii_frame.rda").expect("the fixture");
+        assert!(text.starts_with(b"1976"));
+        let objects = agreed("as written", &text).expect("the fixture reads");
+        // Blank space between two tokens changes nothing but the length.
+        let mut long = text[..4].to_vec();
+        long.resize(4 + 2 * WINDOW + 11, b' ');
+        long.extend_from_slice(&text[4..]);
+        let mut seen = Agreed::default();
+        for how in PACKINGS {
+            let packed = pack(&long, how);
+            assert_eq!(agreed(how, &packed), Ok(objects), "{how}");
+            each_damaged(
+                &packed,
+                &spread_and_tail(packed.len(), 12),
+                |what, bytes| seen.add(&format!("{how} {what}"), bytes),
+            );
+        }
+        each_damaged(&long, &spread_and_tail(long.len(), 48), |what, bytes| {
+            seen.add(&what, bytes)
+        });
+        assert!(seen.saw("truncated v1 stream"), "{:?}", seen.errors.keys());
+    }
+
+    /// Bytes after the object, and bytes after the compressed stream, count
+    /// for what they counted for before.
+    #[test]
+    fn what_follows_the_stream_is_handled_as_it_was() {
+        let object = {
+            let mut w = Wire::rds();
+            w.reals(&[1.0, 2.0]);
+            w.0
+        };
+        let mut padded = object.clone();
+        padded.resize(2 * WINDOW + 7, 0x5a);
+        let mut seen = Agreed::default();
+        for how in PACKINGS {
+            assert_eq!(
+                agreed(how, &pack(&padded, how)),
+                Ok(1),
+                "{how}: bytes after the object"
+            );
+            let packed = pack(&object, how);
+            for (what, tail) in [
+                ("zeros", vec![0u8; 4]),
+                ("more zeros", vec![0u8; 2 * WINDOW]),
+                ("text", b"not a compressed stream".to_vec()),
+                ("itself again", packed.clone()),
+            ] {
+                let mut bytes = packed.clone();
+                bytes.extend_from_slice(&tail);
+                seen.add(&format!("{how} then {what}"), &bytes);
+            }
+        }
+        assert!(
+            seen.read > 0 && seen.failed() > 0,
+            "some tails matter and some do not"
+        );
+        assert!(seen.saw("corrupt xz stream"), "{:?}", seen.errors.keys());
+    }
+
+    /// `depth` lists, each the only element of the one before it.
+    fn nested(depth: usize) -> Vec<u8> {
+        let mut w = Wire::rds();
+        for _ in 0..depth {
+            w.head(VECSXP).int(1);
+        }
+        w.nil();
+        w.0
+    }
+
+    /// A damaged file was never parsed, so its bytes must not be followed
+    /// down as far as they nest: this is on a test thread's two megabytes.
+    #[test]
+    fn a_damaged_file_is_not_parsed_deep_before_its_decoder_has_passed_it() {
+        let stream = nested(200_000);
+        for how in ["gzip", "bzip2", "xz"] {
+            // The fault is in the last bytes, after every level has been
+            // handed over.
+            let mut packed = pack(&stream, how);
+            packed.truncate(packed.len() - 2);
+            let out = agreed(how, &packed);
+            assert!(out.is_err(), "{how}: {out:?}");
+            assert_ne!(
+                out,
+                Err("truncated stream".to_string()),
+                "{how}: the decoder's own error"
+            );
+        }
+        // The same when the decoder fails early and the parse runs on over
+        // what was already held.
+        let from = Failing {
+            left: &stream[..WINDOW],
+            failed: false,
+        };
+        assert_eq!(
+            read_stream(Box::new(from), "none").err(),
+            Some("the decoder gave up".to_string())
+        );
+    }
+
+    /// A file its decoder passes is read to the bottom, as it always was.
+    #[test]
+    fn a_deep_object_in_a_sound_file_is_read_to_the_bottom() {
+        let deep = std::thread::Builder::new().stack_size(512 << 20).spawn(|| {
+            let levels = 6_000;
+            let stream = nested(levels);
+            for how in PACKINGS {
+                let packed = pack(&stream, how);
+                assert_eq!(agreed(how, &packed), Ok(1), "{how}");
+                let objs = read_bytes(&packed).expect("the nested list reads");
+                let (mut at, mut seen) = (&objs[0].1, 0);
+                while let Val::Vec(inner) = &at.val {
+                    at = &inner[0];
+                    seen += 1;
+                }
+                assert_eq!(seen, levels, "{how}");
+            }
+            let cut = Err("truncated stream".to_string());
+            assert_eq!(agreed("cut short", &stream[..stream.len() - 4]), cut);
+        });
+        deep.expect("a thread")
+            .join()
+            .expect("the deep read finished");
     }
 }
