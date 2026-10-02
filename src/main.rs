@@ -3336,6 +3336,22 @@ fn ms_since(t: std::time::Instant) -> f64 {
     (t.elapsed().as_secs_f64() * 1e6).round() / 1e3
 }
 
+/// The figure in kB on the line of a process status that starts with `key`.
+fn status_kb(status: &str, key: &str) -> Option<u64> {
+    let rest = status.lines().find_map(|l| l.strip_prefix(key))?;
+    rest.split_whitespace().next()?.parse().ok()
+}
+
+/// The most memory this process has had resident and the most address space
+/// it has had, in kB, where the system keeps both: Linux does, in a file. The
+/// file is the process's, whichever thread reads it.
+fn peak_memory_kb() -> (Option<u64>, Option<u64>) {
+    match std::fs::read_to_string("/proc/self/status") {
+        Ok(status) => (status_kb(&status, "VmHWM:"), status_kb(&status, "VmPeak:")),
+        Err(_) => (None, None),
+    }
+}
+
 /// Appends one JSON line to the file RPKG_ANALYZER_STATS names, after the records.
 /// Unset or empty writes nothing, and any error is ignored.
 fn write_run_stats(s: &RunStats, total_ms: f64) {
@@ -3343,6 +3359,7 @@ fn write_run_stats(s: &RunStats, total_ms: f64) {
         return;
     };
     let other = total_ms - s.ms_compiled - s.ms_r - s.ms_tests - s.ms_data;
+    let (peak_rss_kb, peak_vm_kb) = peak_memory_kb();
     let line = serde_json::json!({
         "build": ANALYZER_VERSION,
         "ms": total_ms,
@@ -3357,6 +3374,10 @@ fn write_run_stats(s: &RunStats, total_ms: f64) {
         "data": {"files": s.files_data, "hits": 0},
         "cache_errors": s.cache_errors,
         "verify_mismatch": s.verify_mismatch,
+        // Null where the system keeps no such figure, so the keys are the
+        // same everywhere.
+        "peak_rss_kb": peak_rss_kb,
+        "peak_vm_kb": peak_vm_kb,
     });
     let appended = std::fs::OpenOptions::new().create(true).append(true).open(path);
     if let Ok(mut f) = appended {
@@ -4209,6 +4230,31 @@ fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_peak_is_read_off_its_line_of_the_process_status() {
+        let status = "Name:\trpkg-analyzer\nVmPeak:\t   71520 kB\nVmSize:\t   71456 kB\nVmHWM:\t    3984 kB\nVmRSS:\t    3984 kB\n";
+        assert_eq!(status_kb(status, "VmHWM:"), Some(3984));
+        assert_eq!(status_kb(status, "VmPeak:"), Some(71520));
+        // A kernel thread has neither line, and a line may not hold a number.
+        assert_eq!(status_kb("Name:\tkthreadd\nState:\tS (sleeping)\n", "VmHWM:"), None);
+        assert_eq!(status_kb("VmHWM:\n", "VmHWM:"), None);
+        assert_eq!(status_kb("VmHWM:\tmany kB\n", "VmHWM:"), None);
+        assert_eq!(status_kb("", "VmPeak:"), None);
+    }
+
+    /// Both or neither, and what was resident was never more than the address
+    /// space there was.
+    #[test]
+    fn the_peaks_are_the_systems_or_absent() {
+        let (rss, vm) = peak_memory_kb();
+        if cfg!(target_os = "linux") {
+            let (rss, vm) = (rss.expect("VmHWM"), vm.expect("VmPeak"));
+            assert!(rss > 0 && vm >= rss, "{rss} kB resident, {vm} kB of address space");
+        } else if !Path::new("/proc/self/status").exists() {
+            assert_eq!((rss, vm), (None, None));
+        }
+    }
 
     /// Rule J: a name the viewer treats as junk.
     fn is_junk(p: &Person) -> bool {

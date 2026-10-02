@@ -54,9 +54,20 @@ fn the_stats_line_is_written_only_when_asked_and_changes_nothing_else() {
         keys,
         [
             "build", "cache_errors", "compiled", "data", "ms", "ms_compiled", "ms_data", "ms_other", "ms_r",
-            "ms_tests", "r", "tests", "verify_mismatch"
+            "ms_tests", "peak_rss_kb", "peak_vm_kb", "r", "tests", "verify_mismatch"
         ]
     );
+    // The peaks are the system's where it keeps them, which Linux does, and
+    // null elsewhere. The address space holds the 64 MiB of the run's stack.
+    if cfg!(target_os = "linux") {
+        let kb = |k: &str| s[k].as_u64().unwrap_or_else(|| panic!("{k} is a count: {}", s[k]));
+        assert!(kb("peak_rss_kb") > 0);
+        assert!(kb("peak_vm_kb") >= kb("peak_rss_kb"));
+        assert!(kb("peak_vm_kb") >= 64 << 10, "{} kB of address space", kb("peak_vm_kb"));
+    } else if !Path::new("/proc/self/status").exists() {
+        assert!(s["peak_rss_kb"].is_null(), "{}", s["peak_rss_kb"]);
+        assert!(s["peak_vm_kb"].is_null(), "{}", s["peak_vm_kb"]);
+    }
     assert_eq!(s["build"], env!("CARGO_PKG_VERSION"));
     assert_eq!(s["compiled"]["files"], 1);
     assert_eq!(s["compiled"]["hits"], 0);
