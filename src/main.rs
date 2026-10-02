@@ -3392,6 +3392,11 @@ fn explain(dir: &str, kind: cli::InputKind) {
 }
 
 fn main() {
+    memory::on_a_deep_stack(run);
+}
+
+/// One run of the analyzer, from its arguments to its last record.
+fn run() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mode = match cli::parse_args(&args) {
         Ok(mode) => mode,

@@ -24,6 +24,8 @@ A missing flag, or any other value, exits with status 2, a usage line on stderr 
 
 A run that cannot get the memory it asks for stops there. It ends with a status that is not 0, in most cases 134 (aborted), and writes no statistics line, so the records printed before it stopped are not a whole result.
 
+A run has 64 MiB of stack whatever stack limit it is started under, and reserves the address space for it before it reads anything. That is 64 MiB more address space than the data needs and no more resident memory, since the stack is only touched as far as an object nests. Under an address-space limit with no room for it the run is aborted before it prints anything. The data reader goes one call deeper for each level of a nested object, so the stack is what bounds the depth it reads, and how much a level takes depends on the platform and the compiler. As measured, a list nested about 49,900 deep, a saved image of as many objects and a compiled call of about 232,900 arguments are read on Linux aarch64, and about 74,800 and 322,600 on macOS arm64. A file nested deeper aborts the run with the message of a stack that ran out.
+
 ## Environment
 
 None of these changes a record. Each is read only in the analysis mode, and an older build ignores it.

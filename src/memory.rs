@@ -1,4 +1,5 @@
-// What happens when memory runs out: the run ends, whoever was asking.
+// What happens when memory runs out: the run ends, whoever was asking. And
+// the stack a run has, which is memory it asks for before anything else.
 
 use std::alloc::{GlobalAlloc, Layout, System, handle_alloc_error};
 
@@ -51,6 +52,55 @@ pub fn out_of_memory(whose: &str) -> ! {
     std::process::abort()
 }
 
+/// How much stack a run has. The data reader calls itself once for every
+/// level of a nested object, so the stack decides how deep a file is read,
+/// and on the first thread's 8 MiB that came down to the size of one call,
+/// which moves with every change to the reader and with the compiler.
+pub const STACK: usize = 64 << 20;
+
+/// Runs `body` on a thread of its own with `STACK` bytes of stack and waits
+/// for it. The thread has the first thread's name, so a panic reads as it
+/// did, and ends the run with the status it had.
+pub fn on_a_deep_stack(body: impl FnOnce() + Send + 'static) {
+    on_a_stack_of(STACK, body)
+}
+
+/// The same on a stack of `bytes`. A stack there is no room for ends the run
+/// as any other memory that is not there does.
+fn on_a_stack_of(bytes: usize, body: impl FnOnce() + Send + 'static) {
+    keep_one_heap();
+    let made = std::thread::Builder::new()
+        .name("main".into())
+        .stack_size(bytes)
+        .spawn(body);
+    let run = match made {
+        Ok(run) => run,
+        Err(why) => out_of_memory(&format!("for the stack of the run: {why}")),
+    };
+    // The panic has been reported by the thread it happened on.
+    if run.join().is_err() {
+        std::process::exit(101);
+    }
+}
+
+/// glibc gives every thread but the first a heap of its own and reserves
+/// address space for it 64 MiB at a time, 128 MiB while it finds a place
+/// for it. With one heap for all threads the run allocates where it did on
+/// the first thread, and a small package's address space grows by the stack
+/// and nothing else.
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+fn keep_one_heap() {
+    use std::ffi::c_int;
+    unsafe extern "C" {
+        fn mallopt(param: c_int, value: c_int) -> c_int;
+    }
+    const M_ARENA_MAX: c_int = -8;
+    unsafe { mallopt(M_ARENA_MAX, 1) };
+}
+
+#[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+fn keep_one_heap() {}
+
 /// The entries of a directory. Opening one allocates inside the C library,
 /// and with no memory there the error that comes back reads to every caller
 /// like a directory that does not exist.
@@ -78,15 +128,20 @@ pub mod child {
     }
 
     /// Runs the one test of this name, given by its full path, in a new
-    /// process. That process has to be aborted, which is how a failed
-    /// allocation ends one. Returns what it wrote to stderr.
-    pub fn aborted(test: &str) -> String {
-        use std::os::unix::process::ExitStatusExt;
-        let out = std::process::Command::new(std::env::current_exe().expect("this test binary"))
+    /// process, and returns how it ended and what it wrote.
+    pub fn ran(test: &str) -> std::process::Output {
+        std::process::Command::new(std::env::current_exe().expect("this test binary"))
             .args(["--exact", test, "--nocapture", "--test-threads", "1"])
             .env(KEY, test)
             .output()
-            .expect("run the test again");
+            .expect("run the test again")
+    }
+
+    /// The same for a process that has to be aborted, which is how a failed
+    /// allocation ends one. Returns what it wrote to stderr.
+    pub fn aborted(test: &str) -> String {
+        use std::os::unix::process::ExitStatusExt;
+        let out = ran(test);
         let said = String::from_utf8_lossy(&out.stderr).into_owned();
         assert_eq!(
             out.status.signal(),
@@ -174,6 +229,120 @@ mod tests {
             said.contains("memory allocation failed opening a directory"),
             "{said}"
         );
+    }
+
+    /// Goes down the stack a kilobyte or more at a call until it is `until`
+    /// bytes from `base`, and returns how far that was.
+    #[cfg(unix)]
+    #[inline(never)]
+    fn stack_used(until: usize, base: usize) -> usize {
+        let held = std::hint::black_box([0u8; 1024]);
+        let used = base.abs_diff(held.as_ptr() as usize);
+        if used >= until {
+            return used;
+        }
+        let deeper = stack_used(until, base);
+        // Still needed after the call, so the call cannot reuse this frame.
+        std::hint::black_box(&held);
+        deeper
+    }
+
+    /// The run is on a thread with the first thread's name and far more
+    /// stack than the first thread has, and the caller waits for it.
+    #[cfg(unix)]
+    #[test]
+    fn a_run_has_the_stack_and_the_name_it_is_given() {
+        const ME: &str = "memory::tests::a_run_has_the_stack_and_the_name_it_is_given";
+        if child::is(ME) {
+            on_a_deep_stack(|| {
+                let base = 0u8;
+                // Six times what the first thread has by default.
+                let used = stack_used(48 << 20, &base as *const u8 as usize);
+                let me = std::thread::current();
+                println!("on {:?} with {} MiB used", me.name(), used >> 20);
+            });
+            println!("the run was waited for");
+            return;
+        }
+        let out = child::ran(ME);
+        let said = String::from_utf8_lossy(&out.stdout);
+        assert!(out.status.success(), "{:?}\n{said}", out.status);
+        let on = said.find("on Some(\"main\") with ").expect(&said);
+        let mib: usize = said[on..]
+            .split_whitespace()
+            .nth(3)
+            .and_then(|n| n.parse().ok())
+            .expect(&said);
+        assert!((48..STACK >> 20).contains(&mib), "{mib} MiB of stack used");
+        let waited = said.find("the run was waited for").expect(&said);
+        assert!(on < waited, "{said}");
+    }
+
+    /// A panic says which thread it was on and ends the run with 101. Both
+    /// have to be what they were when the run was on the first thread.
+    #[cfg(unix)]
+    #[test]
+    fn a_panic_on_the_deep_stack_ends_the_run_as_it_did() {
+        const ME: &str = "memory::tests::a_panic_on_the_deep_stack_ends_the_run_as_it_did";
+        if child::is(ME) {
+            on_a_deep_stack(|| panic!("the run gave up"));
+            println!("the run went on");
+            return;
+        }
+        let out = child::ran(ME);
+        let said = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(101), "{said}");
+        let panic = said
+            .lines()
+            .position(|l| l.starts_with("thread 'main' ") && l.contains(" panicked at src/memory.rs:"))
+            .expect(&said);
+        assert_eq!(said.lines().nth(panic + 1), Some("the run gave up"), "{said}");
+        assert!(!String::from_utf8_lossy(&out.stdout).contains("the run went on"));
+    }
+
+    /// More stack than there is address space for.
+    #[cfg(unix)]
+    #[test]
+    fn a_stack_there_is_no_room_for_ends_the_run() {
+        const ME: &str = "memory::tests::a_stack_there_is_no_room_for_ends_the_run";
+        if child::is(ME) {
+            on_a_stack_of(1 << 60, || println!("the run started"));
+            println!("the run went on");
+            return;
+        }
+        let said = child::aborted(ME);
+        assert!(
+            said.contains("memory allocation failed for the stack of the run"),
+            "{said}"
+        );
+    }
+
+    /// On glibc the run allocates from the heap the first thread uses, and
+    /// not from one reserved for its own thread.
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    #[test]
+    fn the_run_allocates_where_the_first_thread_does() {
+        const ME: &str = "memory::tests::the_run_allocates_where_the_first_thread_does";
+        if child::is(ME) {
+            on_a_deep_stack(|| {
+                let small = Box::new([7u8; 64]);
+                let at = small.as_ptr() as usize;
+                let maps = std::fs::read_to_string("/proc/self/maps").expect("the maps");
+                let heap = maps.lines().find(|l| l.ends_with("[heap]")).expect("a heap");
+                let (from, to) = heap
+                    .split_whitespace()
+                    .next()
+                    .and_then(|range| range.split_once('-'))
+                    .expect("a range");
+                let edge = |hex: &str| usize::from_str_radix(hex, 16).expect("an address");
+                println!("in the first heap: {}", (edge(from)..edge(to)).contains(&at));
+            });
+            return;
+        }
+        let out = child::ran(ME);
+        let said = String::from_utf8_lossy(&out.stdout);
+        assert!(out.status.success(), "{:?}\n{said}", out.status);
+        assert!(said.contains("in the first heap: true"), "{said}");
     }
 
     /// Any other answer is the caller's to read, as it was.

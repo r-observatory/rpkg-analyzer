@@ -603,3 +603,21 @@ sv(as.data.frame(matrix(numeric(0), nrow = 0, ncol = 600)), "wide_empty")
 z <- complex(real = 1:10, imaginary = 10:1)
 z[c(2, 5, 9)] <- NA
 sv(data.frame(z = z, r = as.raw(1:10)), "complex_missing")
+
+# Objects near the depth the stack of the first thread could hold, for
+# tests/deep.rs. They are kept out of pkg/, where the unit tests read every
+# file on a test thread's two megabytes.
+deep <- "tests/fixtures/deep"
+dir.create(deep, showWarnings = FALSE)
+nested_list <- 1L
+for (i in seq_len(6000)) nested_list <- list(nested_list)
+save(nested_list, file = file.path(deep, "nested_list.rda"))
+e <- new.env()
+for (i in seq_len(6000)) assign(sprintf("x%04d", i), i, envir = e)
+save(list = ls(e), envir = e, file = file.path(deep, "many_objects.rda"))
+# A compiled function keeps the call it returns among its constants, and the
+# reader goes one call deeper for each argument of it. 40,069 of them were read
+# by 0.5.1 on macOS arm64 and ran a later build of the reader out of stack.
+big <- as.call(c(as.name("list"), rep(list(NULL), 40069)))
+many_nulls <- compiler::cmpfun(eval(call("function", NULL, call("quote", big))))
+save(many_nulls, file = file.path(deep, "many_nulls.rda"))
