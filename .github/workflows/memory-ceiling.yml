@@ -19,7 +19,7 @@ permissions:
 
 env:
   # The published build each peak is compared with, run as often as the candidate.
-  BASELINE: v0.5.1
+  BASELINE: v0.5.2
 
 jobs:
   build:
