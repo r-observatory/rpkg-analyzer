@@ -784,7 +784,7 @@ impl<'a> Reader<'a> {
             // Skipping either by erroring loses every object in the file.
             // An external pointer. data.table puts one on every table as
             // `.internal.selfref`, so rejecting the type lost the whole file for
-            // one of the most widely shipped data classes on CRAN. Like an
+            // one of the most widely used data classes on CRAN. Like an
             // environment it takes a reference-table slot, then two items.
             // A namespace, package or persistent-object reference. All three
             // are written as R's string vector: a zero, a length, then that many
@@ -1787,7 +1787,7 @@ fn lift_value_summary(rec: &mut Value, values: &Node, over: &'static str) {
 /// be read as the single vector they amount to.
 ///
 /// Homogeneity is the test rather than the class, because the class does not
-/// know. WallomicsData ships a 30 by 19,763 data.frame of expression values,
+/// know. WallomicsData provides a 30 by 19,763 data.frame of expression values,
 /// which is a matrix that happened to be saved as a frame, and the per-column
 /// profile of it is the word "numeric" nineteen thousand times. A frame of
 /// mixed types is the opposite case however wide it gets: every column is a
@@ -3623,7 +3623,7 @@ fn describe(
             }
         }
 
-        // terra ships rasters and vectors through wrap(), whose S4 form keeps
+        // terra saves rasters and vectors through wrap(), whose S4 form keeps
         // the whole geometry in a `definition` string. Parsing it is the only
         // way to get the grid: the values slot alone made an 8x12 raster look
         // like a 96x1 matrix.
@@ -5061,7 +5061,7 @@ fn read_text_free(path: &Path) -> Option<(Vec<Node>, Vec<String>, usize, &'stati
     Some((cols, names, nrow, fmt, comp, None))
 }
 
-/// Emit one `dataset` record per dataset shipped under `root`'s data/ directory
+/// Emit one `dataset` record per dataset provided under `root`'s data/ directory
 /// and R/sysdata.rda. Never panics on a bad file; it degrades with a note.
 pub fn scan_package(root: &Path, excluded: &BTreeSet<String>) -> Vec<Value> {
     let mut all = Vec::new();
@@ -7175,7 +7175,7 @@ mod tests {
         assert_eq!(s(&r, "confidence"), "exact");
     }
 
-    /// terra ships rasters through wrap(), which keeps the grid in a definition
+    /// terra saves rasters through wrap(), which keeps the grid in a definition
     /// string. Reading only the values slot made an 8x12 raster a 96x1 matrix.
     #[test]
     fn a_packed_raster_reports_its_grid_not_its_value_vector() {
