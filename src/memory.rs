@@ -83,11 +83,27 @@ fn on_a_stack_of(bytes: usize, body: impl FnOnce() + Send + 'static) {
     }
 }
 
+/// The size from which glibc gives a block a mapping of its own, which goes
+/// back to the system when the block is freed. Above glibc's first 128 KiB,
+/// so the read window and the other blocks under a MiB that come and go many
+/// times a run stay in the heap.
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+const MAPPED_FROM: usize = 1 << 20;
+
 /// glibc gives every thread but the first a heap of its own and reserves
 /// address space for it 64 MiB at a time, 128 MiB while it finds a place
 /// for it. With one heap for all threads the run allocates where it did on
 /// the first thread, and a small package's address space grows by the stack
 /// and nothing else.
+///
+/// glibc also raises the size from which it maps a block each time a mapped
+/// block is freed, up to 32 MiB, and then keeps twice that free in the heap
+/// before it gives any back. After one large buffer was freed, every block
+/// under its size came from the heap and stayed resident once freed, and a
+/// vector that grew there was copied, old and new held at once, where a
+/// mapped one is moved. How much more a run held then turned on where the
+/// blocks before it happened to lie. A fixed size keeps every large block
+/// mapped for the whole run.
 #[cfg(all(target_os = "linux", target_env = "gnu"))]
 fn keep_one_heap() {
     use std::ffi::c_int;
@@ -95,7 +111,11 @@ fn keep_one_heap() {
         fn mallopt(param: c_int, value: c_int) -> c_int;
     }
     const M_ARENA_MAX: c_int = -8;
-    unsafe { mallopt(M_ARENA_MAX, 1) };
+    const M_MMAP_THRESHOLD: c_int = -3;
+    unsafe {
+        mallopt(M_ARENA_MAX, 1);
+        mallopt(M_MMAP_THRESHOLD, MAPPED_FROM as c_int);
+    }
 }
 
 #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
@@ -343,6 +363,37 @@ mod tests {
         let said = String::from_utf8_lossy(&out.stdout);
         assert!(out.status.success(), "{:?}\n{said}", out.status);
         assert!(said.contains("in the first heap: true"), "{said}");
+    }
+
+    /// A block of the mapped size or more is mapped even after a larger one
+    /// was freed, which used to raise the size to that block's.
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    #[test]
+    fn a_large_block_is_mapped_after_a_larger_one_is_freed() {
+        const ME: &str = "memory::tests::a_large_block_is_mapped_after_a_larger_one_is_freed";
+        if child::is(ME) {
+            on_a_deep_stack(|| {
+                drop(std::hint::black_box(vec![7u8; 16 << 20]));
+                let block = std::hint::black_box(vec![7u8; 2 * MAPPED_FROM]);
+                let at = block.as_ptr() as usize;
+                let maps = std::fs::read_to_string("/proc/self/maps").expect("the maps");
+                let edge = |hex: &str| usize::from_str_radix(hex, 16).expect("an address");
+                let in_heap = maps.lines().filter(|l| l.ends_with("[heap]")).any(|l| {
+                    let (from, to) = l
+                        .split_whitespace()
+                        .next()
+                        .and_then(|range| range.split_once('-'))
+                        .expect("a range");
+                    (edge(from)..edge(to)).contains(&at)
+                });
+                println!("in the heap: {in_heap}");
+            });
+            return;
+        }
+        let out = child::ran(ME);
+        let said = String::from_utf8_lossy(&out.stdout);
+        assert!(out.status.success(), "{:?}\n{said}", out.status);
+        assert!(said.contains("in the heap: false"), "{said}");
     }
 
     /// Any other answer is the caller's to read, as it was.
