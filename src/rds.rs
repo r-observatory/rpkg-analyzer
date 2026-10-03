@@ -83,6 +83,50 @@ const CELL_CAP: usize = 8_000_000;
 /// there is no way back to the start of the next object.
 const ITEM_BUDGET: u32 = 5_000_000;
 
+/// What one data file may keep before it is counted as over, by the count the
+/// reader makes as it goes: 48 bytes an object, 4 or 8 a cell that is kept,
+/// a string at `string_kept`. The item budget bounds how many objects a file
+/// holds and the cell cap how long one vector is, and nothing bounds their
+/// sum. This does not either. No read is stopped by it: it is counted, so
+/// that the files a bound would stop are known before there is one.
+const KEPT_BUDGET: u64 = 1536 << 20;
+
+/// The longest text table that is not counted as over, in rows.
+const ROW_BUDGET: usize = 8_000_000;
+
+/// What a string of `n` bytes costs to keep: its place in the vector that
+/// holds it, and the block glibc sets aside for its bytes.
+fn string_kept(n: usize) -> u64 {
+    24 + ((n as u64 + 8 + 15) & !15).max(32)
+}
+
+/// What the data files of a run kept, for its statistics line.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Kept {
+    /// The most any one file kept, in bytes.
+    pub max: u64,
+    /// The files that kept more than `KEPT_BUDGET`, or were a text table of
+    /// more than `ROW_BUDGET` rows.
+    pub over: u64,
+}
+
+thread_local! {
+    static KEPT: std::cell::Cell<Kept> = const { std::cell::Cell::new(Kept { max: 0, over: 0 }) };
+}
+
+/// Counts one file that kept `bytes`, in the `rows` of a text table if it
+/// was one.
+fn file_kept(bytes: u64, rows: usize) {
+    let was = KEPT.get();
+    let over = bytes > KEPT_BUDGET || rows > ROW_BUDGET;
+    KEPT.set(Kept { max: was.max.max(bytes), over: was.over + over as u64 });
+}
+
+/// What the files read on this thread have kept so far.
+pub fn kept() -> Kept {
+    KEPT.get()
+}
+
 /// The width past which describing every column one at a time stops being a
 /// description.
 ///
@@ -163,7 +207,11 @@ const SKETCH_K: usize = 32;
 const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
 const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
 fn fnv(bytes: &[u8]) -> u64 {
-    let mut h = FNV_OFFSET;
+    fnv_more(FNV_OFFSET, bytes)
+}
+/// The same hash carried on from `h`, for bytes that arrive in pieces.
+#[inline]
+fn fnv_more(mut h: u64, bytes: &[u8]) -> u64 {
     for &b in bytes {
         h ^= b as u64;
         h = h.wrapping_mul(FNV_PRIME);
@@ -202,33 +250,194 @@ struct Node {
     attr: Option<Box<Node>>,
 }
 
+/// How much of a decoded data file is held at a time.
+const WINDOW: usize = 256 * 1024;
+
+/// How much stack the parse may use on a stream whose decoder has not reached
+/// its end. The bytes of a damaged file can nest as deep as the file is long,
+/// and they used never to be parsed at all.
+const UNVERIFIED_STACK: usize = 1024 * 1024;
+
+/// Whereabouts the stack is.
+#[inline(always)]
+fn stack_here() -> usize {
+    let mark = 0u8;
+    &mark as *const u8 as usize
+}
+
+/// A data file's decoded bytes, seen through a window and never held whole.
+///
+/// A file used to be decoded to its end before any of it was parsed, so a
+/// decoder error anywhere in it was the outcome whatever the parse would have
+/// said. `failed` keeps that rule: it is what the decoder said, and the caller
+/// reads the stream to its end and looks here before it believes the parse.
+struct Window<'a> {
+    from: Box<dyn std::io::Read + 'a>,
+    buf: Vec<u8>,
+    lo: usize,
+    hi: usize,
+    ended: bool,
+    failed: Option<String>,
+}
+
+impl<'a> Window<'a> {
+    fn over(from: Box<dyn std::io::Read + 'a>) -> Self {
+        Window {
+            from,
+            buf: vec![0; WINDOW],
+            lo: 0,
+            hi: 0,
+            ended: false,
+            failed: None,
+        }
+    }
+    /// The bytes held and not yet read.
+    fn held(&self) -> &[u8] {
+        &self.buf[self.lo..self.hi]
+    }
+    /// One more read from the decoder, behind whatever is still unread, which
+    /// has to be less than a window. False once the stream has ended or failed.
+    fn more(&mut self) -> bool {
+        use std::io::Read;
+        if self.ended {
+            return false;
+        }
+        if self.lo > 0 {
+            self.buf.copy_within(self.lo..self.hi, 0);
+            self.hi -= self.lo;
+            self.lo = 0;
+        }
+        debug_assert!(self.hi < self.buf.len());
+        loop {
+            match self.from.read(&mut self.buf[self.hi..]) {
+                Ok(0) => break,
+                Ok(n) => {
+                    self.hi += n;
+                    return true;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(e) => {
+                    self.failed = Some(e.to_string());
+                    break;
+                }
+            }
+        }
+        self.ended = true;
+        false
+    }
+    /// Holds `n` unread bytes, `n` no more than a window, if the stream has
+    /// them.
+    #[inline(never)]
+    fn hold(&mut self, n: usize) -> bool {
+        debug_assert!(n <= WINDOW);
+        while self.hi - self.lo < n {
+            if !self.more() {
+                return false;
+            }
+        }
+        true
+    }
+    /// The next `N` bytes, which are a number.
+    #[inline]
+    fn array<const N: usize>(&mut self) -> Result<[u8; N], String> {
+        if self.hi - self.lo < N && !self.hold(N) {
+            return Err("truncated stream".into());
+        }
+        let at = self.lo;
+        self.lo += N;
+        Ok(self.buf[at..at + N].try_into().unwrap())
+    }
+    /// The next `n` bytes in one piece: where they lie when a window can hold
+    /// them, and gathered into `long` when it cannot.
+    fn bytes<'b>(&'b mut self, n: usize, long: &'b mut Vec<u8>) -> Result<&'b [u8], String> {
+        if n > WINDOW {
+            self.pass(n, |part| long.extend_from_slice(part))?;
+            return Ok(long);
+        }
+        if self.hi - self.lo < n && !self.hold(n) {
+            return Err("truncated stream".into());
+        }
+        let at = self.lo;
+        self.lo += n;
+        Ok(&self.buf[at..at + n])
+    }
+    /// The next `n` bytes, handed to `f` a piece at a time and not kept.
+    fn pass(&mut self, mut n: usize, mut f: impl FnMut(&[u8])) -> Result<(), String> {
+        while n > 0 {
+            if self.lo == self.hi && !self.more() {
+                return Err("truncated stream".into());
+            }
+            let k = n.min(self.hi - self.lo);
+            f(&self.buf[self.lo..self.lo + k]);
+            self.lo += k;
+            n -= k;
+        }
+        Ok(())
+    }
+    /// Steps past the first newline. False if the stream ends without one.
+    fn past_newline(&mut self) -> bool {
+        loop {
+            if let Some(i) = self.held().iter().position(|&c| c == b'\n') {
+                self.lo += i + 1;
+                return true;
+            }
+            self.lo = self.hi;
+            if !self.more() {
+                return false;
+            }
+        }
+    }
+    /// Everything not yet read, whole.
+    fn rest(&mut self) -> Vec<u8> {
+        let mut out = Vec::new();
+        loop {
+            out.extend_from_slice(self.held());
+            self.lo = self.hi;
+            if !self.more() {
+                return out;
+            }
+        }
+    }
+    /// Takes the rest of the stream into the window, however long it is. The
+    /// decoder has then said all it has to say.
+    fn hold_rest(&mut self) {
+        if !self.ended {
+            self.buf = self.rest();
+            self.lo = 0;
+            self.hi = self.buf.len();
+        }
+    }
+    /// Reads to the end of the stream and keeps none of it, so that a fault
+    /// the decoder finds after the parse has stopped is still found.
+    fn run_out(&mut self) {
+        loop {
+            self.lo = self.hi;
+            if !self.more() {
+                return;
+            }
+        }
+    }
+}
+
 struct Reader<'a> {
-    b: &'a [u8],
-    p: usize,
+    s: Window<'a>,
     ver: i32,
     refs: Vec<Node>,
     budget: u32,
+    /// What the file has kept so far, by the count `KEPT_BUDGET` describes.
+    kept: u64,
+    /// Where the stack was when the read began.
+    base: usize,
+    /// Whether the decoder may still have an error to report.
+    unverified: bool,
 }
 
 impl<'a> Reader<'a> {
-    fn need(&self, n: usize) -> Result<(), String> {
-        if self.p.checked_add(n).map_or(true, |e| e > self.b.len()) {
-            Err("truncated stream".into())
-        } else {
-            Ok(())
-        }
-    }
     fn i32(&mut self) -> Result<i32, String> {
-        self.need(4)?;
-        let v = i32::from_be_bytes(self.b[self.p..self.p + 4].try_into().unwrap());
-        self.p += 4;
-        Ok(v)
+        Ok(i32::from_be_bytes(self.s.array()?))
     }
     fn f64(&mut self) -> Result<f64, String> {
-        self.need(8)?;
-        let v = f64::from_be_bytes(self.b[self.p..self.p + 8].try_into().unwrap());
-        self.p += 8;
-        Ok(v)
+        Ok(f64::from_be_bytes(self.s.array()?))
     }
     fn vlen(&mut self) -> Result<usize, String> {
         let n = self.i32()?;
@@ -242,19 +451,89 @@ impl<'a> Reader<'a> {
             Ok(n as usize)
         }
     }
-    /// Hash a span without keeping it. Complex and raw values are read for
-    /// their size rather than their contents, but a dataset with no
-    /// fingerprint is dropped before it reaches anywhere, so what cannot be
-    /// held can at least be identified.
+    /// Hash a span without keeping it, in the one pass that steps over it.
+    /// Complex and raw values are read for their size rather than their
+    /// contents, but a dataset with no fingerprint is dropped before it
+    /// reaches anywhere, so what cannot be held can at least be identified.
     fn digest_span(&mut self, n: usize) -> Result<u64, String> {
-        self.need(n)?;
-        Ok(fnv(&self.b[self.p..self.p + n]))
+        let mut h = FNV_OFFSET;
+        self.s.pass(n, |part| h = fnv_more(h, part))?;
+        Ok(h)
     }
 
     fn skip(&mut self, n: usize) -> Result<(), String> {
-        self.need(n)?;
-        self.p += n;
-        Ok(())
+        self.s.pass(n, |_| {})
+    }
+    /// The `n` bytes of a string, as text. Out of line, so that what it holds
+    /// on the stack is not held again at every level of a nested object.
+    #[inline(never)]
+    fn text(&mut self, n: usize, latin1: bool) -> Result<String, String> {
+        let mut long = Vec::new();
+        let raw = self.s.bytes(n, &mut long)?;
+        // Latin-1 is not UTF-8, and reading it as though it were replaces
+        // every accented character with a marker: the text is wrong, and so
+        // is the fingerprint taken over it.
+        let text = if latin1 {
+            raw.iter().map(|b| *b as char).collect::<String>()
+        } else {
+            String::from_utf8_lossy(raw).into_owned()
+        };
+        self.kept += string_kept(text.len());
+        Ok(text)
+    }
+    /// A compact sequence written out, counted as the cells it now is. Out
+    /// of line for the same reason.
+    #[inline(never)]
+    fn expanded(&mut self, state: &Node, want_int: bool) -> Option<Val> {
+        let val = expand_seq(state, want_int);
+        match &val {
+            Some(Val::Ints { len, .. }) => self.kept += 4 * *len as u64,
+            Some(Val::Reals { len, .. }) => self.kept += 8 * *len as u64,
+            _ => {}
+        }
+        val
+    }
+    /// The headers of a data file and the one object after them.
+    fn file(&mut self) -> Result<Parsed, String> {
+        // The first five bytes say which container this is, if the stream is
+        // that long.
+        let long = self.s.hold(5);
+        let head = self.s.held();
+        let is_rda =
+            long && (&head[0..3] == b"RDX" || &head[0..3] == b"RDA" || &head[0..3] == b"RDB");
+        let is_v1 = long && &head[0..4] == b"1976";
+        if is_rda && !self.s.past_newline() {
+            return Err("missing container magic newline".into());
+        }
+        if !self.s.hold(2) {
+            return Err("truncated header".into());
+        }
+        // R before 1.4.0 wrote a different format entirely, and a package whose
+        // last release predates 2002 has all of its data in it. It is not a
+        // stream, so all of it is taken at once.
+        if is_v1 {
+            let bytes = self.s.rest();
+            let text = String::from_utf8_lossy(&bytes);
+            let objects = read_ascii_v1(&text)?;
+            self.kept += objects.iter().map(|(_, object)| node_kept(object)).sum::<u64>();
+            return Ok(Parsed::Text(objects));
+        }
+        let sel = self.s.held()[0];
+        if sel != b'X' {
+            return Err(format!("non-XDR encoding '{}'", sel as char));
+        }
+        self.s.lo += 2; // 'X' '\n'
+        let ver = self.i32()?;
+        self.ver = ver;
+        let _writer = self.i32()?;
+        let _min = self.i32()?;
+        if ver >= 3 {
+            let enclen = self.i32()?;
+            if enclen > 0 {
+                self.skip(enclen as usize)?;
+            }
+        }
+        Ok(Parsed::Xdr(self.item()?, is_rda, ver))
     }
     /// Code vector then constant pool.
     fn bc_body(&mut self) -> Result<(), String> {
@@ -313,6 +592,18 @@ impl<'a> Reader<'a> {
             return Err("item budget exceeded".into());
         }
         self.budget -= 1;
+        self.kept += 48;
+        // Before going deeper than this, find out whether the decoder passes
+        // the file. If it does, the rest is read as it always was, at any
+        // depth. If it does not, its error is the outcome and nothing more is
+        // parsed.
+        if self.unverified && self.base.abs_diff(stack_here()) > UNVERIFIED_STACK {
+            self.unverified = false;
+            self.s.hold_rest();
+            if let Some(e) = &self.s.failed {
+                return Err(e.clone());
+            }
+        }
         let f = self.i32()?;
         let t = (f & 0xFF) as u8;
         let ha = f & (1 << 9) != 0;
@@ -353,19 +644,7 @@ impl<'a> Reader<'a> {
                 let val = if n < 0 {
                     Val::Char(None)
                 } else {
-                    let n = n as usize;
-                    self.need(n)?;
-                    let raw = &self.b[self.p..self.p + n];
-                    // Latin-1 is not UTF-8, and reading it as though it were
-                    // replaces every accented character with a marker: the
-                    // text is wrong, and so is the fingerprint taken over it.
-                    let s = if levs & LATIN1_MASK != 0 {
-                        raw.iter().map(|b| *b as char).collect::<String>()
-                    } else {
-                        String::from_utf8_lossy(raw).into_owned()
-                    };
-                    self.p += n;
-                    Val::Char(Some(s))
+                    Val::Char(Some(self.text(n as usize, levs & LATIN1_MASK != 0)?))
                 };
                 // A string carries no attributes of its own, but an older file
                 // can still have written one, and it has to be consumed or
@@ -416,11 +695,11 @@ impl<'a> Reader<'a> {
                 // fingerprint is dropped rather than stored.
                 if n > CELL_CAP {
                     let digest = self.digest_span(4 * n)?;
-                    self.skip(4 * n)?;
                     let attr = self.maybe_attr(ha)?;
                     let of = if t == LGLSXP { "logical" } else { "integer" };
                     return Ok(Node { val: Val::Blob { len: n, of, digest: Some(digest) }, attr });
                 }
+                self.kept += 4 * n as u64;
                 let mut vals = Vec::with_capacity(n);
                 for _ in 0..n {
                     vals.push(self.i32()?);
@@ -435,13 +714,13 @@ impl<'a> Reader<'a> {
                 let n = self.vlen()?;
                 if n > CELL_CAP {
                     let digest = self.digest_span(8 * n)?;
-                    self.skip(8 * n)?;
                     let attr = self.maybe_attr(ha)?;
                     return Ok(Node {
                         val: Val::Blob { len: n, of: "numeric", digest: Some(digest) },
                         attr,
                     });
                 }
+                self.kept += 8 * n as u64;
                 let mut vals = Vec::with_capacity(n);
                 for _ in 0..n {
                     vals.push(self.f64()?);
@@ -452,14 +731,12 @@ impl<'a> Reader<'a> {
             CPLXSXP => {
                 let n = self.vlen()?;
                 let digest = self.digest_span(16 * n)?;
-                self.skip(16 * n)?;
                 let attr = self.maybe_attr(ha)?;
                 Ok(Node { val: Val::Blob { len: n, of: "complex", digest: Some(digest) }, attr })
             }
             RAWSXP => {
                 let n = self.vlen()?;
                 let digest = self.digest_span(n)?;
-                self.skip(n)?;
                 let attr = self.maybe_attr(ha)?;
                 Ok(Node { val: Val::Blob { len: n, of: "raw", digest: Some(digest) }, attr })
             }
@@ -507,7 +784,7 @@ impl<'a> Reader<'a> {
             // Skipping either by erroring loses every object in the file.
             // An external pointer. data.table puts one on every table as
             // `.internal.selfref`, so rejecting the type lost the whole file for
-            // one of the most widely shipped data classes on CRAN. Like an
+            // one of the most widely used data classes on CRAN. Like an
             // environment it takes a reference-table slot, then two items.
             // A namespace, package or persistent-object reference. All three
             // are written as R's string vector: a zero, a length, then that many
@@ -567,7 +844,7 @@ impl<'a> Reader<'a> {
             }
             ALTREP_SXP => {
                 let info = self.item()?;
-                let state = self.item()?;
+                let mut state = self.item()?;
                 let attr_node = self.item()?;
                 let attr = match attr_node.val {
                     Val::Nil => None,
@@ -577,15 +854,15 @@ impl<'a> Reader<'a> {
                 let val = match cls.as_str() {
                     // state is c(length, start, step); expand it back to the
                     // vector R would have materialized on access.
-                    "compact_intseq" => expand_seq(&state, true),
-                    "compact_realseq" => expand_seq(&state, false),
+                    "compact_intseq" => self.expanded(&state, true),
+                    "compact_realseq" => self.expanded(&state, false),
                     // A wrapper carries the real vector as the first element of
                     // its state and adds only metadata, so unwrap to it.
-                    _ if cls.starts_with("wrap_") => first_element(&state).map(|n| n.val.clone()),
+                    _ if cls.starts_with("wrap_") => first_element(&mut state),
                     // Anything else: the state is usually the materialized data
                     // (deferred_string, and the expanded form of any compact
                     // class), so prefer it over failing the file.
-                    _ => Some(state.val.clone()),
+                    _ => None,
                 };
                 match val {
                     Some(v) => Ok(Node { val: v, attr }),
@@ -995,11 +1272,12 @@ fn altrep_class(info: &Node) -> Option<String> {
 }
 
 /// First element of a state container, for the wrap_* classes whose payload is
-/// the wrapped vector followed by metadata.
-fn first_element(state: &Node) -> Option<&Node> {
-    match &state.val {
-        Val::Vec(items) => items.first(),
-        Val::List { car, .. } => Some(car.as_ref()),
+/// the wrapped vector followed by metadata. Taken out of the state rather than
+/// copied.
+fn first_element(state: &mut Node) -> Option<Val> {
+    match &mut state.val {
+        Val::Vec(items) if !items.is_empty() => Some(items.swap_remove(0).val),
+        Val::List { car, .. } => Some(std::mem::replace(&mut car.val, Val::Nil)),
         _ => None,
     }
 }
@@ -1509,7 +1787,7 @@ fn lift_value_summary(rec: &mut Value, values: &Node, over: &'static str) {
 /// be read as the single vector they amount to.
 ///
 /// Homogeneity is the test rather than the class, because the class does not
-/// know. WallomicsData ships a 30 by 19,763 data.frame of expression values,
+/// know. WallomicsData provides a 30 by 19,763 data.frame of expression values,
 /// which is a matrix that happened to be saved as a frame, and the per-column
 /// profile of it is the word "numeric" nineteen thousand times. A frame of
 /// mixed types is the opposite case however wide it gets: every column is a
@@ -2306,7 +2584,9 @@ fn profile_columns(cols: &[&Node], names: &[String]) -> Option<Profile> {
         _ => Vec::with_capacity(cols.len()),
     };
     let mut col_fp_bytes: Vec<u8> = Vec::new();
-    let mut cell_hashes: Vec<Vec<u64>> = Vec::with_capacity(cols.len());
+    // One hash to a row, folded a column at a time in the order of the
+    // columns. A hash to every cell of every column was held to the end.
+    let mut row_hashes: Vec<u64> = vec![FNV_OFFSET; n];
     let mut n_missing_total = 0u64;
     // Whether any column produced one. A frame of nothing but complex columns
     // has no total to report, only a sum over counts nobody took.
@@ -2344,7 +2624,6 @@ fn profile_columns(cols: &[&Node], names: &[String]) -> Option<Profile> {
         hasher.update(ty.as_bytes());
         let mut n_missing = 0u64;
         let mut uniq: HashSet<u64> = HashSet::new();
-        let mut ch = Vec::with_capacity(n);
         let mut min: Option<f64> = None;
         let mut max: Option<f64> = None;
         let mut buf = Vec::with_capacity(16);
@@ -2409,7 +2688,7 @@ fn profile_columns(cols: &[&Node], names: &[String]) -> Option<Profile> {
             let h = fnv(&buf);
             if i < n {
                 hasher.update(&buf);
-                ch.push(h);
+                row_hashes[i] = (row_hashes[i] ^ h).wrapping_mul(FNV_PRIME);
             }
             // Distinct values, not counting the absence of one. How many are
             // missing is its own field, and counting them here as well made a
@@ -2818,7 +3097,6 @@ fn profile_columns(cols: &[&Node], names: &[String]) -> Option<Profile> {
         }
         col_fp_bytes.extend_from_slice(fp.as_bytes());
         col_fp_bytes.push(b'|');
-        cell_hashes.push(ch);
     }
 
     let schema_fp = hex128(&blake3::hash(schema_src.as_bytes()));
@@ -2826,19 +3104,13 @@ fn profile_columns(cols: &[&Node], names: &[String]) -> Option<Profile> {
     let content_fp = hex128(&blake3::hash(&col_fp_bytes));
 
     // Bottom-k sketch of per-row hashes for row-level similarity.
-    let mut row_hashes: Vec<u64> = Vec::with_capacity(n);
-    for i in 0..n {
-        let mut h = FNV_OFFSET;
-        for col in &cell_hashes {
-            h ^= col[i];
-            h = h.wrapping_mul(FNV_PRIME);
-        }
-        row_hashes.push(h);
-    }
     row_hashes.sort_unstable();
     row_hashes.dedup();
     row_hashes.truncate(SKETCH_K);
-    let row_sketch = row_hashes.iter().map(|h| format!("{h:016x}")).collect();
+    let row_sketch: Vec<String> = row_hashes.iter().map(|h| format!("{h:016x}")).collect();
+    // Under test, every sketch is held to the one its cell hashes give.
+    #[cfg(test)]
+    tests::sketch_made(cols, &row_sketch);
 
     Some(Profile {
         detail,
@@ -3351,7 +3623,7 @@ fn describe(
             }
         }
 
-        // terra ships rasters and vectors through wrap(), whose S4 form keeps
+        // terra saves rasters and vectors through wrap(), whose S4 form keeps
         // the whole geometry in a `definition` string. Parsing it is the only
         // way to get the grid: the values slot alone made an 8x12 raster look
         // like a 96x1 matrix.
@@ -3777,25 +4049,98 @@ fn describe(
     rec
 }
 
-fn decompress(raw: &[u8]) -> Result<(Vec<u8>, &'static str), String> {
-    use std::io::Read;
+/// One bzip2 stream, read the way the bzip2 crate's reader reads it, except
+/// that a decoder with no memory ends the run. The crate hands that back as
+/// progress and reads on, and the file then looks damaged.
+struct Bzip2<'a> {
+    from: std::io::BufReader<&'a [u8]>,
+    data: bzip2::Decompress,
+    done: bool,
+}
+
+impl<'a> Bzip2<'a> {
+    fn over(raw: &'a [u8]) -> Self {
+        Bzip2 {
+            from: std::io::BufReader::new(raw),
+            data: bzip2::Decompress::new(false),
+            done: false,
+        }
+    }
+}
+
+impl std::io::Read for Bzip2<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        use std::io::{BufRead, Error, ErrorKind};
+        loop {
+            if self.done {
+                return Ok(0);
+            }
+            let input = self.from.fill_buf()?;
+            let (before_in, before_out) = (self.data.total_in(), self.data.total_out());
+            let status = self.data.decompress(input, buf);
+            let read = (self.data.total_out() - before_out) as usize;
+            let consumed = (self.data.total_in() - before_in) as usize;
+            let remaining = input.len() - consumed;
+            self.from.consume(consumed);
+            match status.map_err(|e| Error::new(ErrorKind::InvalidInput, e))? {
+                bzip2::Status::MemNeeded => crate::memory::out_of_memory("in the bzip2 decoder"),
+                bzip2::Status::StreamEnd => self.done = true,
+                _ if consumed == 0 && remaining == 0 && read == 0 => {
+                    return Err(Error::new(
+                        ErrorKind::UnexpectedEof,
+                        "decompression not finished but EOF reached",
+                    ));
+                }
+                _ => {}
+            }
+            if read > 0 || buf.is_empty() {
+                return Ok(read);
+            }
+        }
+    }
+}
+
+/// An xz stream, read by the xz2 crate's reader, except that a decoder with
+/// no memory ends the run, whether it is being made or read.
+struct Xz<R>(R);
+
+impl<'a> Xz<xz2::read::XzDecoder<&'a [u8]>> {
+    fn over(raw: &'a [u8]) -> Self {
+        // The crate's reader makes the same decoder and takes it for granted.
+        let made = match xz2::stream::Stream::new_stream_decoder(u64::MAX, 0) {
+            Err(xz2::stream::Error::Mem) => crate::memory::out_of_memory("in the xz decoder"),
+            made => made.expect("an xz decoder"),
+        };
+        Xz(xz2::read::XzDecoder::new_stream(raw, made))
+    }
+}
+
+impl<R: std::io::Read> std::io::Read for Xz<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let got = self.0.read(buf);
+        if got.as_ref().is_err_and(xz_has_no_memory) {
+            crate::memory::out_of_memory("in the xz decoder");
+        }
+        got
+    }
+}
+
+/// Whether an error is the xz decoder saying it has no memory.
+fn xz_has_no_memory(e: &std::io::Error) -> bool {
+    let said = e.get_ref().and_then(|e| e.downcast_ref());
+    matches!(said, Some(xz2::stream::Error::Mem))
+}
+
+/// The decoder a file's first bytes ask for, with nothing read from it yet.
+fn decoder(raw: &[u8]) -> (Box<dyn std::io::Read + '_>, &'static str) {
     if raw.len() >= 2 && raw[0] == 0x1f && raw[1] == 0x8b {
-        let mut d = flate2::read::GzDecoder::new(raw);
-        let mut out = Vec::new();
-        d.read_to_end(&mut out).map_err(|e| e.to_string())?;
-        Ok((out, "gzip"))
+        (Box::new(flate2::read::GzDecoder::new(raw)), "gzip")
     } else if raw.len() >= 3 && &raw[0..3] == b"BZh" {
-        let mut d = bzip2::read::BzDecoder::new(raw);
-        let mut out = Vec::new();
-        d.read_to_end(&mut out).map_err(|e| e.to_string())?;
-        Ok((out, "bzip2"))
+        (Box::new(Bzip2::over(raw)), "bzip2")
     } else if raw.len() >= 6 && raw[0..6] == [0xfd, b'7', b'z', b'X', b'Z', 0x00] {
-        let mut d = xz2::read::XzDecoder::new(raw);
-        let mut out = Vec::new();
-        d.read_to_end(&mut out).map_err(|e| e.to_string())?;
-        Ok((out, "xz"))
+        (Box::new(Xz::over(raw)), "xz")
     } else {
-        Ok((raw.to_vec(), "none"))
+        (Box::new(raw), "none")
     }
 }
 
@@ -4060,66 +4405,92 @@ fn v1_build(
     Node { val, attr }
 }
 
-fn read_file(path: &Path) -> Result<Vec<(String, Node, String, i32, String)>, String> {
-    let raw = std::fs::read(path).map_err(|e| e.to_string())?;
-    let (bytes, comp) = decompress(&raw)?;
-    let is_rda = bytes.len() >= 5
-        && (&bytes[0..3] == b"RDX" || &bytes[0..3] == b"RDA" || &bytes[0..3] == b"RDB");
-    let mut p = 0usize;
-    if is_rda {
-        p = bytes
-            .iter()
-            .position(|&c| c == b'\n')
-            .ok_or("missing container magic newline")?
-            + 1;
-    }
-    if p + 2 > bytes.len() {
-        return Err("truncated header".into());
-    }
-    // R before 1.4.0 wrote a different format entirely, and a package whose
-    // last release predates 2002 has all of its data in it.
-    if bytes.len() >= 5 && &bytes[0..4] == b"1976" {
-        let text = String::from_utf8_lossy(&bytes);
-        let objs = read_ascii_v1(&text)?;
-        return Ok(objs
-            .into_iter()
-            .map(|(nm, node)| (nm, node, "rda".to_string(), 1, comp.to_string()))
-            .collect());
-    }
-    let sel = bytes[p];
-    if sel != b'X' {
-        return Err(format!("non-XDR encoding '{}'", sel as char));
-    }
-    p += 2; // 'X' '\n'
-    let mut r = Reader { b: &bytes, p, ver: 0, refs: Vec::new(), budget: ITEM_BUDGET };
-    let ver = r.i32()?;
-    r.ver = ver;
-    let _writer = r.i32()?;
-    let _min = r.i32()?;
-    if ver >= 3 {
-        let enclen = r.i32()?;
-        if enclen > 0 {
-            r.skip(enclen as usize)?;
-        }
-    }
-    let fmt = if is_rda { "rda" } else { "rds" }.to_string();
-    let top = r.item()?;
+/// What an object of the old format keeps, at the sizes the reader of the
+/// newer ones counts by. That format is taken whole and built afterwards, at
+/// most 64 levels deep, so it is counted when it is built.
+fn node_kept(node: &Node) -> u64 {
+    let own = match &node.val {
+        Val::Sym(s) | Val::Char(Some(s)) => string_kept(s.len()),
+        Val::Str(v) => v.iter().map(|s| 48 + s.as_ref().map_or(0, |s| string_kept(s.len()))).sum(),
+        Val::Ints { vals, .. } => 4 * vals.len() as u64,
+        Val::Reals { vals, .. } => 8 * vals.len() as u64,
+        Val::Vec(items) => items.iter().map(node_kept).sum(),
+        Val::List { tag, car, cdr } => node_kept(tag) + node_kept(car) + node_kept(cdr),
+        _ => 0,
+    };
+    48 + own + node.attr.as_deref().map_or(0, node_kept)
+}
 
+/// One object out of a data file: its name, the object, the container format,
+/// the serialization version and the compression.
+type Loaded = (String, Node, String, i32, String);
+
+fn read_file(path: &Path) -> Result<Vec<Loaded>, String> {
+    let raw = std::fs::read(path).map_err(|e| e.to_string())?;
+    read_bytes(&raw)
+}
+
+/// What a data file parsed to, before its objects are told apart.
+enum Parsed {
+    /// The format from before R 1.4.0: its named objects.
+    Text(Vec<(String, Node)>),
+    /// One serialized object, whether a saved image holds it, and the
+    /// serialization version.
+    Xdr(Node, bool, i32),
+}
+
+fn read_bytes(raw: &[u8]) -> Result<Vec<Loaded>, String> {
+    let (from, comp) = decoder(raw);
+    read_stream(from, comp)
+}
+
+fn read_stream(from: Box<dyn std::io::Read + '_>, comp: &str) -> Result<Vec<Loaded>, String> {
+    let mut r = Reader {
+        s: Window::over(from),
+        ver: 0,
+        refs: Vec::new(),
+        budget: ITEM_BUDGET,
+        kept: 0,
+        base: stack_here(),
+        unverified: true,
+    };
+    let parsed = r.file();
+    // Wherever the parse stopped and whatever it said, the decoder is read to
+    // its end, and an error from it is the outcome. Some faults are only found
+    // there: a checksum that does not match is the last thing a decoder says.
+    r.s.run_out();
+    let failed = r.s.failed.take();
+    // What was kept was kept whether or not the file is then refused.
+    file_kept(r.kept, 0);
+    // Nothing reads the reference table past this point.
+    drop(r);
+    if let Some(e) = failed {
+        return Err(e);
+    }
+    let (top, is_rda, ver) = match parsed? {
+        Parsed::Text(objs) => {
+            return Ok(objs
+                .into_iter()
+                .map(|(nm, node)| (nm, node, "rda".to_string(), 1, comp.to_string()))
+                .collect());
+        }
+        Parsed::Xdr(top, is_rda, ver) => (top, is_rda, ver),
+    };
+    let fmt = if is_rda { "rda" } else { "rds" }.to_string();
+
+    // Each object is moved out of the list that holds it. A copy would be a
+    // second tree the size of the first, alive beside it.
     let mut out = Vec::new();
     if let Val::List { .. } = top.val {
-        let mut cur = Some(&top);
-        while let Some(nd) = cur {
-            if let Val::List { tag, car, cdr } = &nd.val {
-                let nm = if let Val::Sym(s) = &tag.val {
-                    s.clone()
-                } else {
-                    String::new()
-                };
-                out.push((nm, car.as_ref().clone(), fmt.clone(), ver, comp.to_string()));
-                cur = Some(cdr.as_ref());
+        let mut cur = top;
+        while let Val::List { tag, car, cdr } = cur.val {
+            let nm = if let Val::Sym(s) = tag.val {
+                s
             } else {
-                break;
-            }
+                String::new()
+            };
+            out.push((nm, *car, fmt.clone(), ver, comp.to_string()));
+            cur = *cdr;
         }
     } else {
         out.push((String::new(), top, fmt, ver, comp.to_string()));
@@ -4146,8 +4517,11 @@ fn is_na_text(s: &str) -> bool {
 // Infer a column type from delimited-text cells, building the same Node the
 // binary path produces so the value profile and fingerprints are shared (and a
 // text dataset can match a serialized one with the same data).
-fn infer_column(cells: &[String]) -> Node {
-    let non_na: Vec<&str> = cells.iter().map(|s| s.as_str()).filter(|c| !is_na_text(c)).collect();
+//
+// This is the typing of the table read by row. `infer_cells` is held to it.
+fn infer_column<S: AsRef<str>>(cells: &[S]) -> Node {
+    let cells = cells.iter().map(|c| c.as_ref());
+    let non_na: Vec<&str> = cells.clone().filter(|c| !is_na_text(c)).collect();
     let all_int = !non_na.is_empty()
         && non_na.iter().all(|c| !c.contains('.') && c.parse::<i32>().is_ok());
     let all_logical = !non_na.is_empty()
@@ -4157,17 +4531,15 @@ fn infer_column(cells: &[String]) -> Node {
     let all_num = !non_na.is_empty() && non_na.iter().all(|c| c.parse::<f64>().is_ok());
     if all_int {
         let vals = cells
-            .iter()
             .map(|c| if is_na_text(c) { NA_INT } else { c.parse().unwrap_or(NA_INT) })
             .collect::<Vec<_>>();
         Node { val: Val::Ints { len: vals.len(), vals, logical: false }, attr: None }
     } else if all_logical {
         let vals = cells
-            .iter()
             .map(|c| {
                 if is_na_text(c) {
                     NA_INT
-                } else if c.eq_ignore_ascii_case("true") || *c == "T" {
+                } else if c.eq_ignore_ascii_case("true") || c == "T" {
                     1
                 } else {
                     0
@@ -4177,14 +4549,60 @@ fn infer_column(cells: &[String]) -> Node {
         Node { val: Val::Ints { len: vals.len(), vals, logical: true }, attr: None }
     } else if all_num {
         let vals = cells
-            .iter()
             .map(|c| if is_na_text(c) { f64::NAN } else { c.parse().unwrap_or(f64::NAN) })
             .collect::<Vec<_>>();
         Node { val: Val::Reals { len: vals.len(), vals }, attr: None }
     } else {
         let vals = cells
-            .iter()
-            .map(|c| if is_na_text(c) { None } else { Some(c.clone()) })
+            .map(|c| if is_na_text(c) { None } else { Some(c.to_string()) })
+            .collect::<Vec<_>>();
+        Node { val: Val::Str(vals), attr: None }
+    }
+}
+
+/// A column typed as `infer_column` types it, from cells that are walked
+/// and not held: once to settle the type, each rule asked of each cell until
+/// one says no, and once to make the values. `infer_column` wants the cells
+/// in a list and makes a second list of the ones that are not missing,
+/// sixteen bytes a row each, which on a long narrow table is more than the
+/// table.
+fn infer_cells<'a>(cells: impl Iterator<Item = &'a str> + Clone) -> Node {
+    let (mut any, mut all_int, mut all_logical, mut all_num) = (false, true, true, true);
+    for c in cells.clone().filter(|c| !is_na_text(c)) {
+        any = true;
+        all_int = all_int && !c.contains('.') && c.parse::<i32>().is_ok();
+        all_logical = all_logical && matches!(c, "TRUE" | "FALSE" | "T" | "F" | "true" | "false");
+        all_num = all_num && c.parse::<f64>().is_ok();
+        if !(all_int || all_logical || all_num) {
+            break;
+        }
+    }
+    if any && all_int {
+        let vals = cells
+            .map(|c| if is_na_text(c) { NA_INT } else { c.parse().unwrap_or(NA_INT) })
+            .collect::<Vec<_>>();
+        Node { val: Val::Ints { len: vals.len(), vals, logical: false }, attr: None }
+    } else if any && all_logical {
+        let vals = cells
+            .map(|c| {
+                if is_na_text(c) {
+                    NA_INT
+                } else if c.eq_ignore_ascii_case("true") || c == "T" {
+                    1
+                } else {
+                    0
+                }
+            })
+            .collect::<Vec<_>>();
+        Node { val: Val::Ints { len: vals.len(), vals, logical: true }, attr: None }
+    } else if any && all_num {
+        let vals = cells
+            .map(|c| if is_na_text(c) { f64::NAN } else { c.parse().unwrap_or(f64::NAN) })
+            .collect::<Vec<_>>();
+        Node { val: Val::Reals { len: vals.len(), vals }, attr: None }
+    } else {
+        let vals = cells
+            .map(|c| if is_na_text(c) { None } else { Some(c.to_string()) })
             .collect::<Vec<_>>();
         Node { val: Val::Str(vals), attr: None }
     }
@@ -4303,11 +4721,11 @@ fn decompress_text(raw: Vec<u8>) -> Option<(String, &'static str)> {
         (o, "gzip")
     } else if raw.starts_with(b"BZh") {
         let mut o = Vec::new();
-        bzip2::read::BzDecoder::new(&raw[..]).read_to_end(&mut o).ok()?;
+        Bzip2::over(&raw).read_to_end(&mut o).ok()?;
         (o, "bzip2")
     } else if raw.starts_with(&[0xfd, b'7', b'z', b'X', b'Z', 0x00]) {
         let mut o = Vec::new();
-        xz2::read::XzDecoder::new(&raw[..]).read_to_end(&mut o).ok()?;
+        Xz::over(&raw).read_to_end(&mut o).ok()?;
         (o, "xz")
     } else {
         (raw, "none")
@@ -4325,19 +4743,207 @@ fn decompress_text(raw: Vec<u8>) -> Option<(String, &'static str)> {
     // is applied within a line: a \r inside a quoted field of an otherwise
     // LF-terminated file is data, and folding it would break the row into two and
     // cost the whole file, since a row of the wrong width is refused.
-    let lossy = String::from_utf8_lossy(&bytes);
+    // Valid bytes are the text as they stand. Only the rest are copied.
+    let lossy = match String::from_utf8(bytes) {
+        Ok(text) => text,
+        Err(not_text) => String::from_utf8_lossy(not_text.as_bytes()).into_owned(),
+    };
     // Most files carry no \r at all, and those pay one scan rather than a rewrite.
     let text = if lossy.contains('\r') {
         let folded = lossy.replace("\r\n", "\n");
         if folded.contains('\n') { folded } else { folded.replace('\r', "\n") }
     } else {
-        lossy.into_owned()
+        lossy
     };
     Some((text, comp))
 }
 
 /// Split a delimited table that has already been read into memory.
+///
+/// Each cell is kept once, in `Cells`, and a column is typed from slices of
+/// what is kept there.
 fn parse_table(text: &str, sep: char) -> Option<(Vec<Node>, Vec<String>, usize)> {
+    parse_table_within(text, sep, ROW_MAX)
+}
+
+/// The most bytes the cells of one row can hold, where an end takes four.
+const ROW_MAX: usize = u32::MAX as usize;
+
+/// The widest table whose columns are typed where their cells lie. In a
+/// wider one the cells of a column are far apart, a row of the table between
+/// each two, and going down them twice, once for the type and once for the
+/// values, took HMP16SData 3.23 and its 2,912 columns from 12.8 s to 16.5
+/// on macOS arm64. A wider table has a column's cells listed first, as every
+/// table had: that is sixteen bytes a row, which is little beside the cells
+/// of a row that wide and was more than the cells of a row of two.
+const IN_PLACE: usize = 32;
+
+/// `parse_table`, for rows of at most `row_max` bytes. A table with a longer
+/// row is read by `parse_table_by_row`.
+fn parse_table_within(text: &str, sep: char, row_max: usize) -> Option<(Vec<Node>, Vec<String>, usize)> {
+    parse_table_typing(text, sep, row_max, IN_PLACE)
+}
+
+/// `parse_table_within`, typing columns in place in a table of at most
+/// `in_place` of them.
+fn parse_table_typing(
+    text: &str,
+    sep: char,
+    row_max: usize,
+    in_place: usize,
+) -> Option<(Vec<Node>, Vec<String>, usize)> {
+    let mut cells = Cells::new(row_max);
+    let (header, nrow) = table_shape(text, sep, |row| cells.push_row(row))?;
+    if cells.over {
+        return parse_table_by_row(text, sep);
+    }
+    let mut names: Vec<String> = header.iter().map(|n| make_names(n)).collect();
+    for (j, n) in names.iter_mut().enumerate() {
+        if n.is_empty() {
+            *n = format!("V{}", j + 1);
+        }
+    }
+    // One column at a time, borrowed from where the cells are kept.
+    let cols = if names.len() <= in_place {
+        (0..names.len()).map(|j| infer_cells(cells.column(j))).collect()
+    } else {
+        let mut column: Vec<&str> = Vec::with_capacity(nrow);
+        (0..names.len())
+            .map(|j| {
+                column.clear();
+                column.extend(cells.column(j));
+                infer_cells(column.iter().copied())
+            })
+            .collect()
+    };
+    Some((cols, names, nrow))
+}
+
+/// A table's header and its row count, or None for what `parse_table_by_row`
+/// refuses, by the same rules. The cells of each row are handed to `keep` as
+/// the row is split, without the field that names the row. A row of the wrong
+/// width ends the read, since no row after it can make the file a table.
+fn table_shape(text: &str, sep: char, mut keep: impl FnMut(&[String])) -> Option<(Vec<String>, usize)> {
+    let mut header: Option<Vec<String>> = None;
+    // The fields every row has to hold, which the first row settles.
+    let mut width = 0;
+    let mut nrow = 0;
+    for line in text.split(['\n', '\r']) {
+        let f = split_fields(line, sep);
+        if f.is_empty() || f.iter().all(|x| x.is_empty()) {
+            continue;
+        }
+        let Some(names) = &header else {
+            header = Some(f);
+            continue;
+        };
+        if nrow == 0 {
+            // A row one field longer than the header starts with its name.
+            if f.len() != names.len() && f.len() != names.len() + 1 {
+                return None;
+            }
+            width = f.len();
+        } else if f.len() != width {
+            return None;
+        }
+        keep(&f[width - names.len()..]);
+        nrow += 1;
+    }
+    // A header with nothing under it is not a table.
+    if nrow == 0 {
+        return None;
+    }
+    Some((header?, nrow))
+}
+
+/// How many columns `parse_table` finds. No cell is kept to find out.
+fn table_ncol(text: &str, sep: char) -> Option<usize> {
+    table_shape(text, sep, |_| {}).map(|(header, _)| header.len())
+}
+
+/// What a table read from text keeps: each column as the vector it was typed
+/// to, an object with a name, and for each row eight bytes for where its
+/// cells start and eight for its hash in the sketch. A table too wide to type
+/// in place also lists a column's cells, sixteen bytes a row. The text and
+/// the cells cut from it are not in the count: they are gone once the columns
+/// are typed.
+fn table_kept(cols: &[Node], names: &[String], nrow: usize) -> u64 {
+    let columns: u64 = cols
+        .iter()
+        .zip(names)
+        .map(|(col, name)| {
+            let cells: u64 = match &col.val {
+                Val::Ints { vals, .. } => 4 * vals.len() as u64,
+                Val::Reals { vals, .. } => 8 * vals.len() as u64,
+                Val::Str(v) => v.iter().map(|s| s.as_ref().map_or(24, |s| string_kept(s.len()))).sum(),
+                _ => 0,
+            };
+            48 + string_kept(name.len()) + cells
+        })
+        .sum();
+    let a_row = if names.len() > IN_PLACE { 32 } else { 16 };
+    columns + a_row * nrow as u64
+}
+
+/// The cells of a table, each kept once: one run of bytes, a row after a
+/// row, and for each cell where it ends, counted from the start of its row.
+/// A string of its own for every cell cost several times the text.
+struct Cells {
+    bytes: String,
+    ends: Vec<u32>,
+    /// Where each row starts in `bytes`.
+    rows: Vec<usize>,
+    /// The cells in a row.
+    width: usize,
+    row_max: usize,
+    /// A row was longer than `row_max`, and nothing is kept.
+    over: bool,
+}
+
+impl Cells {
+    fn new(row_max: usize) -> Self {
+        Cells {
+            bytes: String::new(),
+            ends: Vec::new(),
+            rows: Vec::new(),
+            width: 0,
+            row_max: row_max.min(ROW_MAX),
+            over: false,
+        }
+    }
+
+    fn push_row(&mut self, cells: &[String]) {
+        if self.over {
+            return;
+        }
+        if cells.iter().map(|c| c.len()).sum::<usize>() > self.row_max {
+            *self = Cells { over: true, ..Cells::new(self.row_max) };
+            return;
+        }
+        self.width = cells.len();
+        self.rows.push(self.bytes.len());
+        let mut end = 0;
+        for cell in cells {
+            self.bytes.push_str(cell);
+            end += cell.len();
+            self.ends.push(end as u32);
+        }
+    }
+
+    /// The cells of column `j`, from the first row to the last.
+    fn column(&self, j: usize) -> impl Iterator<Item = &str> + Clone {
+        let rows = self.rows.iter().zip(self.ends.chunks_exact(self.width.max(1)));
+        rows.map(move |(start, ends)| {
+            let from = if j == 0 { 0 } else { ends[j - 1] as usize };
+            &self.bytes[start + from..start + ends[j] as usize]
+        })
+    }
+}
+
+/// The same table, read by holding every row and then every column, a
+/// string to a cell. It is the reader for a row too long for `Cells`, and
+/// what the tests hold `parse_table` to.
+fn parse_table_by_row(text: &str, sep: char) -> Option<(Vec<Node>, Vec<String>, usize)> {
     let mut rows: Vec<Vec<String>> = Vec::new();
     let mut header: Option<Vec<String>> = None;
     // Split on either ending. A file written on a Mac before OS X separates its
@@ -4414,6 +5020,7 @@ fn read_text(
     let (text, comp) = decompress_text(std::fs::read(path).ok()?)?;
     let fmt = if sep == WS { "tab" } else { "csv" };
     let (cols, names, nrow) = parse_table(&text, sep)?;
+    file_kept(table_kept(&cols, &names, nrow), nrow);
     // Only worth asking when the rules produced one column, which is the shape
     // a wrong separator always leaves behind.
     let mut alt = None;
@@ -4422,11 +5029,11 @@ fn read_text(
             if cand == sep {
                 continue;
             }
-            if let Some((_, n2, _)) = parse_table(&text, cand) {
-                if n2.len() > 1 {
+            if let Some(n2) = table_ncol(&text, cand) {
+                if n2 > 1 {
                     match alt {
-                        Some((_, best)) if best >= n2.len() => {}
-                        _ => alt = Some((cand, n2.len())),
+                        Some((_, best)) if best >= n2 => {}
+                        _ => alt = Some((cand, n2)),
                     }
                 }
             }
@@ -4450,16 +5057,24 @@ fn read_text_free(path: &Path) -> Option<(Vec<Node>, Vec<String>, usize, &'stati
         .map(|(c, f, _)| (c, f))
         .unwrap_or((WS, "txt"));
     let (cols, names, nrow) = parse_table(&text, sep)?;
+    file_kept(table_kept(&cols, &names, nrow), nrow);
     Some((cols, names, nrow, fmt, comp, None))
 }
 
-/// Emit one `dataset` record per dataset shipped under `root`'s data/ directory
+/// Emit one `dataset` record per dataset provided under `root`'s data/ directory
 /// and R/sysdata.rda. Never panics on a bad file; it degrades with a note.
 pub fn scan_package(root: &Path, excluded: &BTreeSet<String>) -> Vec<Value> {
-    let mut out = Vec::new();
+    let mut all = Vec::new();
+    scan_package_each(root, excluded, &mut |rec| all.push(rec));
+    all
+}
+
+/// The records of `scan_package` in its order, the ones of a file handed to
+/// `sink` when that file is done, so none is held while the next is read.
+pub fn scan_package_each(root: &Path, excluded: &BTreeSet<String>, sink: &mut dyn FnMut(Value)) {
     let mut targets: Vec<(std::path::PathBuf, bool)> = Vec::new();
     let docs = rd_dataset_docs(root, excluded);
-    if let Ok(rd) = std::fs::read_dir(root.join("data")) {
+    if let Ok(rd) = crate::memory::read_dir(root.join("data")) {
         let mut paths: Vec<_> = rd.flatten().map(|e| e.path()).collect();
         paths.sort();
         // One dataset name, one file. A package may carry the same dataset as
@@ -4561,7 +5176,7 @@ pub fn scan_package(root: &Path, excluded: &BTreeSet<String>) -> Vec<Value> {
             (is_rbin, is_script, is_text)
         };
 
-        let before = out.len();
+        let mut out: Vec<Value> = Vec::new();
         if is_rbin {
             match read_file(&path) {
                 Ok(recs) => {
@@ -4614,7 +5229,7 @@ pub fn scan_package(root: &Path, excluded: &BTreeSet<String>) -> Vec<Value> {
                 })),
             }
         }
-        for r in out[before..].iter_mut() {
+        for r in out.iter_mut() {
             r["origin_dir"] = json!(origin_dir);
             let doc = r.get("name").and_then(|n| n.as_str()).and_then(|n| docs.get(n));
             if let Some(t) = doc.and_then(|d| d.title.as_ref()) {
@@ -4625,8 +5240,10 @@ pub fn scan_package(root: &Path, excluded: &BTreeSet<String>) -> Vec<Value> {
             r["dataset_doc_source"] = json!(doc.filter(|_| loadable).and_then(|d| d.source.clone()));
             r["dataset_doc_format"] = json!(doc.filter(|_| loadable).map(|d| d.has_format as i64));
         }
+        for r in out {
+            sink(r);
+        }
     }
-    out
 }
 
 /// What a package keeps under inst/extdata, counted by extension.
@@ -4732,7 +5349,7 @@ const RD_SOURCE_CAP: usize = 4096;
 
 fn rd_dataset_docs(root: &Path, excluded: &BTreeSet<String>) -> std::collections::HashMap<String, RdDatasetDoc> {
     let mut out = std::collections::HashMap::new();
-    let Ok(rd) = std::fs::read_dir(root.join("man")) else { return out };
+    let Ok(rd) = crate::memory::read_dir(root.join("man")) else { return out };
     // Pages the build leaves out go before the cap, so they cannot fill it ahead of kept ones.
     let mut paths: Vec<_> = rd
         .flatten()
@@ -5072,7 +5689,7 @@ fn walk_extdata(
     if depth == 0 || out.len() >= EXTDATA_FILE_CAP {
         return;
     }
-    let Ok(rd) = std::fs::read_dir(dir) else { return };
+    let Ok(rd) = crate::memory::read_dir(dir) else { return };
     let mut paths: Vec<_> = rd.flatten().map(|e| e.path()).collect();
     paths.sort();
     for p in paths {
@@ -6558,7 +7175,7 @@ mod tests {
         assert_eq!(s(&r, "confidence"), "exact");
     }
 
-    /// terra ships rasters through wrap(), which keeps the grid in a definition
+    /// terra saves rasters through wrap(), which keeps the grid in a definition
     /// string. Reading only the values slot made an 8x12 raster a 96x1 matrix.
     #[test]
     fn a_packed_raster_reports_its_grid_not_its_value_vector() {
@@ -7075,7 +7692,7 @@ mod tests {
     /// data.
     #[test]
     fn a_value_the_cap_skipped_is_still_told_apart_from_another() {
-        let dir = std::env::temp_dir().join("rpkg-analyzer-skipped-identity");
+        let dir = std::env::temp_dir().join(format!("rpkg-analyzer-skipped-identity-{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("a directory to write into");
         let n = CELL_CAP + 1;
         let read_back = |stem: &str, name: &str| -> Value {
@@ -7111,6 +7728,7 @@ mod tests {
         for stem in ["a", "c"] {
             let _ = std::fs::remove_file(dir.join(format!("{stem}.rds")));
         }
+        let _ = std::fs::remove_dir(&dir);
     }
 
     /// An integer vector serialized the way `save(compress = FALSE)` writes
@@ -7360,5 +7978,3402 @@ mod tests {
                 "the README does not state {what}: no \"{phrase}\" in it"
             );
         }
+    }
+
+    /// The reader as it stood when it decompressed a whole file before parsing
+    /// any of it and copied each object out of the tree it had parsed. Kept,
+    /// comments aside, so the reader above can be held to it on every file:
+    /// the same objects or the same error.
+    mod whole_buffer {
+        use super::super::*;
+
+        struct Reader<'a> {
+            b: &'a [u8],
+            p: usize,
+            ver: i32,
+            refs: Vec<Node>,
+            budget: u32,
+        }
+
+        impl<'a> Reader<'a> {
+            fn need(&self, n: usize) -> Result<(), String> {
+                if self.p.checked_add(n).map_or(true, |e| e > self.b.len()) {
+                    Err("truncated stream".into())
+                } else {
+                    Ok(())
+                }
+            }
+            fn i32(&mut self) -> Result<i32, String> {
+                self.need(4)?;
+                let v = i32::from_be_bytes(self.b[self.p..self.p + 4].try_into().unwrap());
+                self.p += 4;
+                Ok(v)
+            }
+            fn f64(&mut self) -> Result<f64, String> {
+                self.need(8)?;
+                let v = f64::from_be_bytes(self.b[self.p..self.p + 8].try_into().unwrap());
+                self.p += 8;
+                Ok(v)
+            }
+            fn vlen(&mut self) -> Result<usize, String> {
+                let n = self.i32()?;
+                if n == -1 {
+                    let hi = self.i32()? as i64;
+                    let lo = self.i32()? as i64;
+                    Ok(((hi << 32) | (lo & 0xffff_ffff)) as usize)
+                } else if n < 0 {
+                    Err("negative length".into())
+                } else {
+                    Ok(n as usize)
+                }
+            }
+            fn digest_span(&mut self, n: usize) -> Result<u64, String> {
+                self.need(n)?;
+                Ok(fnv(&self.b[self.p..self.p + n]))
+            }
+
+            fn skip(&mut self, n: usize) -> Result<(), String> {
+                self.need(n)?;
+                self.p += n;
+                Ok(())
+            }
+            fn bc_body(&mut self) -> Result<(), String> {
+                self.item()?;
+                let n = self.i32()?;
+                for _ in 0..n.max(0) {
+                    let t = self.i32()?;
+                    match t {
+                        t if t == BCODESXP as i32 => self.bc_body()?,
+                        BCREPDEF | BCREPREF | ATTRLANGSXP | ATTRLISTSXP => self.bc_lang(t)?,
+                        t if t == LANGSXP as i32 || t == LISTSXP as i32 => self.bc_lang(t)?,
+                        _ => {
+                            self.item()?;
+                        }
+                    }
+                }
+                Ok(())
+            }
+
+            fn bc_lang(&mut self, t: i32) -> Result<(), String> {
+                if t == BCREPREF {
+                    self.i32()?;
+                    return Ok(());
+                }
+                let mut t = t;
+                if t == BCREPDEF {
+                    self.i32()?;
+                    t = self.i32()?;
+                }
+                if t == ATTRLANGSXP
+                    || t == ATTRLISTSXP
+                    || t == LANGSXP as i32
+                    || t == LISTSXP as i32
+                {
+                    if t == ATTRLANGSXP || t == ATTRLISTSXP {
+                        self.item()?;
+                    }
+                    self.item()?;
+                    let car = self.i32()?;
+                    self.bc_lang(car)?;
+                    let cdr = self.i32()?;
+                    self.bc_lang(cdr)?;
+                    return Ok(());
+                }
+                self.item()?;
+                Ok(())
+            }
+
+            fn maybe_attr(&mut self, ha: bool) -> Result<Option<Box<Node>>, String> {
+                if ha {
+                    Ok(Some(Box::new(self.item()?)))
+                } else {
+                    Ok(None)
+                }
+            }
+            fn item(&mut self) -> Result<Node, String> {
+                if self.budget == 0 {
+                    return Err("item budget exceeded".into());
+                }
+                self.budget -= 1;
+                let f = self.i32()?;
+                let t = (f & 0xFF) as u8;
+                let ha = f & (1 << 9) != 0;
+                let hg = f & (1 << 10) != 0;
+                let levs = f >> 12;
+                match t {
+                    0 | NILVALUE | GLOBALENV_SXP | UNBOUNDVALUE_SXP | MISSINGARG_SXP
+                    | BASENAMESPACE_SXP | EMPTYENV_SXP | BASEENV_SXP => Ok(Node {
+                        val: Val::Nil,
+                        attr: None,
+                    }),
+                    REFSXP => {
+                        let mut idx = (f >> 8) as usize;
+                        if idx == 0 {
+                            idx = self.i32()? as usize;
+                        }
+                        idx.checked_sub(1)
+                            .and_then(|i| self.refs.get(i))
+                            .cloned()
+                            .ok_or_else(|| "bad reference index".to_string())
+                    }
+                    SYMSXP => {
+                        let name = self.item()?;
+                        let s = match name.val {
+                            Val::Char(Some(x)) => x,
+                            _ => String::new(),
+                        };
+                        let node = Node {
+                            val: Val::Sym(s),
+                            attr: None,
+                        };
+                        self.refs.push(node.clone());
+                        Ok(node)
+                    }
+                    CHARSXP => {
+                        let n = self.i32()?;
+                        let val = if n < 0 {
+                            Val::Char(None)
+                        } else {
+                            let n = n as usize;
+                            self.need(n)?;
+                            let raw = &self.b[self.p..self.p + n];
+                            let s = if levs & LATIN1_MASK != 0 {
+                                raw.iter().map(|b| *b as char).collect::<String>()
+                            } else {
+                                String::from_utf8_lossy(raw).into_owned()
+                            };
+                            self.p += n;
+                            Val::Char(Some(s))
+                        };
+                        if ha {
+                            self.item()?;
+                        }
+                        Ok(Node { val, attr: None })
+                    }
+                    SPECIALSXP | BUILTINSXP => {
+                        let n = self.i32()?;
+                        if n < 0 {
+                            return Err("negative builtin name length".into());
+                        }
+                        self.skip(n as usize)?;
+                        let attr = self.maybe_attr(ha)?;
+                        Ok(Node {
+                            val: Val::Nil,
+                            attr,
+                        })
+                    }
+                    WEAKREFSXP => {
+                        self.refs.push(Node {
+                            val: Val::Nil,
+                            attr: None,
+                        });
+                        let attr = self.maybe_attr(ha)?;
+                        Ok(Node {
+                            val: Val::Nil,
+                            attr,
+                        })
+                    }
+                    STRSXP => {
+                        let n = self.vlen()?;
+                        let mut v = Vec::with_capacity(n.min(1 << 16));
+                        for _ in 0..n {
+                            let e = self.item()?;
+                            v.push(match e.val {
+                                Val::Char(x) => x,
+                                _ => None,
+                            });
+                        }
+                        let attr = self.maybe_attr(ha)?;
+                        Ok(Node {
+                            val: Val::Str(v),
+                            attr,
+                        })
+                    }
+                    LGLSXP | INTSXP => {
+                        let n = self.vlen()?;
+                        if n > CELL_CAP {
+                            let digest = self.digest_span(4 * n)?;
+                            self.skip(4 * n)?;
+                            let attr = self.maybe_attr(ha)?;
+                            let of = if t == LGLSXP { "logical" } else { "integer" };
+                            return Ok(Node {
+                                val: Val::Blob {
+                                    len: n,
+                                    of,
+                                    digest: Some(digest),
+                                },
+                                attr,
+                            });
+                        }
+                        let mut vals = Vec::with_capacity(n);
+                        for _ in 0..n {
+                            vals.push(self.i32()?);
+                        }
+                        let attr = self.maybe_attr(ha)?;
+                        Ok(Node {
+                            val: Val::Ints {
+                                len: n,
+                                vals,
+                                logical: t == LGLSXP,
+                            },
+                            attr,
+                        })
+                    }
+                    REALSXP => {
+                        let n = self.vlen()?;
+                        if n > CELL_CAP {
+                            let digest = self.digest_span(8 * n)?;
+                            self.skip(8 * n)?;
+                            let attr = self.maybe_attr(ha)?;
+                            return Ok(Node {
+                                val: Val::Blob {
+                                    len: n,
+                                    of: "numeric",
+                                    digest: Some(digest),
+                                },
+                                attr,
+                            });
+                        }
+                        let mut vals = Vec::with_capacity(n);
+                        for _ in 0..n {
+                            vals.push(self.f64()?);
+                        }
+                        let attr = self.maybe_attr(ha)?;
+                        Ok(Node {
+                            val: Val::Reals { len: n, vals },
+                            attr,
+                        })
+                    }
+                    CPLXSXP => {
+                        let n = self.vlen()?;
+                        let digest = self.digest_span(16 * n)?;
+                        self.skip(16 * n)?;
+                        let attr = self.maybe_attr(ha)?;
+                        Ok(Node {
+                            val: Val::Blob {
+                                len: n,
+                                of: "complex",
+                                digest: Some(digest),
+                            },
+                            attr,
+                        })
+                    }
+                    RAWSXP => {
+                        let n = self.vlen()?;
+                        let digest = self.digest_span(n)?;
+                        self.skip(n)?;
+                        let attr = self.maybe_attr(ha)?;
+                        Ok(Node {
+                            val: Val::Blob {
+                                len: n,
+                                of: "raw",
+                                digest: Some(digest),
+                            },
+                            attr,
+                        })
+                    }
+                    VECSXP | EXPRSXP => {
+                        let n = self.vlen()?;
+                        let mut els = Vec::with_capacity(n.min(1 << 16));
+                        for _ in 0..n {
+                            els.push(self.item()?);
+                        }
+                        let attr = self.maybe_attr(ha)?;
+                        Ok(Node {
+                            val: Val::Vec(els),
+                            attr,
+                        })
+                    }
+                    LISTSXP | LANGSXP | CLOSXP | PROMSXP | DOTSXP => {
+                        let attr = self.maybe_attr(ha)?;
+                        let tag = if hg {
+                            Box::new(self.item()?)
+                        } else {
+                            Box::new(Node {
+                                val: Val::Nil,
+                                attr: None,
+                            })
+                        };
+                        let car = Box::new(self.item()?);
+                        let cdr = Box::new(self.item()?);
+                        Ok(Node {
+                            val: Val::List { tag, car, cdr },
+                            attr,
+                        })
+                    }
+                    S4SXP => {
+                        let attr = self.maybe_attr(ha)?;
+                        Ok(Node { val: Val::S4, attr })
+                    }
+                    NAMESPACESXP | PACKAGESXP | PERSISTSXP => {
+                        let _zero = self.i32()?;
+                        let n = self.i32()?;
+                        let mut parts = Vec::new();
+                        for _ in 0..n.max(0) {
+                            if let Val::Char(Some(t)) = self.item()?.val {
+                                parts.push(t);
+                            }
+                        }
+                        let node = Node {
+                            val: Val::Sym(parts.join("::")),
+                            attr: None,
+                        };
+                        self.refs.push(node.clone());
+                        Ok(node)
+                    }
+                    BCODESXP => {
+                        let _nreps = self.i32()?;
+                        self.bc_body()?;
+                        Ok(Node {
+                            val: Val::Nil,
+                            attr: None,
+                        })
+                    }
+                    EXTPTRSXP => {
+                        let slot = self.refs.len();
+                        self.refs.push(Node {
+                            val: Val::Nil,
+                            attr: None,
+                        });
+                        let _prot = self.item()?;
+                        let _tag = self.item()?;
+                        let attr = self.maybe_attr(ha)?;
+                        let node = Node {
+                            val: Val::Nil,
+                            attr,
+                        };
+                        self.refs[slot] = node.clone();
+                        Ok(node)
+                    }
+                    ENVSXP => {
+                        let slot = self.refs.len();
+                        self.refs.push(Node {
+                            val: Val::S4,
+                            attr: None,
+                        });
+                        let _locked = self.i32()?;
+                        let _enclos = self.item()?;
+                        let _frame = self.item()?;
+                        let _hashtab = self.item()?;
+                        let attr_node = self.item()?;
+                        let attr = match attr_node.val {
+                            Val::Nil => None,
+                            _ => Some(Box::new(attr_node)),
+                        };
+                        let node = Node { val: Val::S4, attr };
+                        self.refs[slot] = node.clone();
+                        Ok(node)
+                    }
+                    ALTREP_SXP => {
+                        let info = self.item()?;
+                        let state = self.item()?;
+                        let attr_node = self.item()?;
+                        let attr = match attr_node.val {
+                            Val::Nil => None,
+                            _ => Some(Box::new(attr_node)),
+                        };
+                        let cls = altrep_class(&info).unwrap_or_default();
+                        let val = match cls.as_str() {
+                            "compact_intseq" => expand_seq(&state, true),
+                            "compact_realseq" => expand_seq(&state, false),
+                            _ if cls.starts_with("wrap_") => {
+                                first_element(&state).map(|n| n.val.clone())
+                            }
+                            _ => Some(state.val.clone()),
+                        };
+                        match val {
+                            Some(v) => Ok(Node { val: v, attr }),
+                            None => Ok(Node {
+                                val: state.val,
+                                attr,
+                            }),
+                        }
+                    }
+                    other => Err(format!("unhandled SEXPTYPE {other}")),
+                }
+            }
+        }
+
+        fn first_element(state: &Node) -> Option<&Node> {
+            match &state.val {
+                Val::Vec(items) => items.first(),
+                Val::List { car, .. } => Some(car.as_ref()),
+                _ => None,
+            }
+        }
+
+        pub(super) fn decompress(raw: &[u8]) -> Result<(Vec<u8>, &'static str), String> {
+            use std::io::Read;
+            if raw.len() >= 2 && raw[0] == 0x1f && raw[1] == 0x8b {
+                let mut d = flate2::read::GzDecoder::new(raw);
+                let mut out = Vec::new();
+                d.read_to_end(&mut out).map_err(|e| e.to_string())?;
+                Ok((out, "gzip"))
+            } else if raw.len() >= 3 && &raw[0..3] == b"BZh" {
+                let mut d = bzip2::read::BzDecoder::new(raw);
+                let mut out = Vec::new();
+                d.read_to_end(&mut out).map_err(|e| e.to_string())?;
+                Ok((out, "bzip2"))
+            } else if raw.len() >= 6 && raw[0..6] == [0xfd, b'7', b'z', b'X', b'Z', 0x00] {
+                let mut d = xz2::read::XzDecoder::new(raw);
+                let mut out = Vec::new();
+                d.read_to_end(&mut out).map_err(|e| e.to_string())?;
+                Ok((out, "xz"))
+            } else {
+                Ok((raw.to_vec(), "none"))
+            }
+        }
+
+        pub(super) fn read_bytes(raw: &[u8]) -> Result<Vec<Loaded>, String> {
+            let (bytes, comp) = decompress(raw)?;
+            let is_rda = bytes.len() >= 5
+                && (&bytes[0..3] == b"RDX" || &bytes[0..3] == b"RDA" || &bytes[0..3] == b"RDB");
+            let mut p = 0usize;
+            if is_rda {
+                p = bytes
+                    .iter()
+                    .position(|&c| c == b'\n')
+                    .ok_or("missing container magic newline")?
+                    + 1;
+            }
+            if p + 2 > bytes.len() {
+                return Err("truncated header".into());
+            }
+            if bytes.len() >= 5 && &bytes[0..4] == b"1976" {
+                let text = String::from_utf8_lossy(&bytes);
+                let objs = read_ascii_v1(&text)?;
+                return Ok(objs
+                    .into_iter()
+                    .map(|(nm, node)| (nm, node, "rda".to_string(), 1, comp.to_string()))
+                    .collect());
+            }
+            let sel = bytes[p];
+            if sel != b'X' {
+                return Err(format!("non-XDR encoding '{}'", sel as char));
+            }
+            p += 2; // 'X' '\n'
+            let mut r = Reader {
+                b: &bytes,
+                p,
+                ver: 0,
+                refs: Vec::new(),
+                budget: ITEM_BUDGET,
+            };
+            let ver = r.i32()?;
+            r.ver = ver;
+            let _writer = r.i32()?;
+            let _min = r.i32()?;
+            if ver >= 3 {
+                let enclen = r.i32()?;
+                if enclen > 0 {
+                    r.skip(enclen as usize)?;
+                }
+            }
+            let fmt = if is_rda { "rda" } else { "rds" }.to_string();
+            let top = r.item()?;
+
+            let mut out = Vec::new();
+            if let Val::List { .. } = top.val {
+                let mut cur = Some(&top);
+                while let Some(nd) = cur {
+                    if let Val::List { tag, car, cdr } = &nd.val {
+                        let nm = if let Val::Sym(s) = &tag.val {
+                            s.clone()
+                        } else {
+                            String::new()
+                        };
+                        out.push((nm, car.as_ref().clone(), fmt.clone(), ver, comp.to_string()));
+                        cur = Some(cdr.as_ref());
+                    } else {
+                        break;
+                    }
+                }
+            } else {
+                out.push((String::new(), top, fmt, ver, comp.to_string()));
+            }
+            Ok(out)
+        }
+    }
+
+    /// Where two parsed values part, or nothing when they are the same.
+    /// Numbers are compared by their bits, so one missing value is not another.
+    fn node_difference(a: &Node, b: &Node) -> Option<String> {
+        match (&a.attr, &b.attr) {
+            (None, None) => {}
+            (Some(x), Some(y)) => {
+                if let Some(d) = node_difference(x, y) {
+                    return Some(format!(" attributes{d}"));
+                }
+            }
+            _ => return Some(": attributes on one only".into()),
+        }
+        let same = match (&a.val, &b.val) {
+            (Val::Nil, Val::Nil) | (Val::S4, Val::S4) => true,
+            (Val::Sym(x), Val::Sym(y)) => x == y,
+            (Val::Char(x), Val::Char(y)) => x == y,
+            (Val::Str(x), Val::Str(y)) => x == y,
+            (
+                Val::Ints {
+                    len: l1,
+                    vals: v1,
+                    logical: g1,
+                },
+                Val::Ints {
+                    len: l2,
+                    vals: v2,
+                    logical: g2,
+                },
+            ) => l1 == l2 && v1 == v2 && g1 == g2,
+            (Val::Reals { len: l1, vals: v1 }, Val::Reals { len: l2, vals: v2 }) => {
+                l1 == l2
+                    && v1.len() == v2.len()
+                    && v1.iter().zip(v2).all(|(p, q)| p.to_bits() == q.to_bits())
+            }
+            (
+                Val::Blob {
+                    len: l1,
+                    of: o1,
+                    digest: d1,
+                },
+                Val::Blob {
+                    len: l2,
+                    of: o2,
+                    digest: d2,
+                },
+            ) => l1 == l2 && o1 == o2 && d1 == d2,
+            (Val::Vec(x), Val::Vec(y)) => {
+                if x.len() != y.len() {
+                    return Some(format!(": {} elements against {}", x.len(), y.len()));
+                }
+                return x.iter().zip(y).enumerate().find_map(|(i, (p, q))| {
+                    node_difference(p, q).map(|d| format!(" element {i}{d}"))
+                });
+            }
+            (
+                Val::List {
+                    tag: t1,
+                    car: a1,
+                    cdr: d1,
+                },
+                Val::List {
+                    tag: t2,
+                    car: a2,
+                    cdr: d2,
+                },
+            ) => {
+                return node_difference(t1, t2)
+                    .map(|d| format!(" tag{d}"))
+                    .or_else(|| node_difference(a1, a2).map(|d| format!(" value{d}")))
+                    .or_else(|| node_difference(d1, d2).map(|d| format!(" rest{d}")));
+            }
+            _ => false,
+        };
+        if same {
+            None
+        } else {
+            Some(": values differ".into())
+        }
+    }
+
+    fn outcome_difference(
+        new: &Result<Vec<Loaded>, String>,
+        old: &Result<Vec<Loaded>, String>,
+    ) -> Option<String> {
+        match (new, old) {
+            (Err(a), Err(b)) if a == b => None,
+            (Err(a), Err(b)) => Some(format!("the error is {a:?} and was {b:?}")),
+            (Err(a), Ok(_)) => Some(format!("the error is {a:?} and the file used to read")),
+            (Ok(_), Err(b)) => Some(format!("the file reads and the error was {b:?}")),
+            (Ok(a), Ok(b)) => {
+                if a.len() != b.len() {
+                    return Some(format!("{} objects against {}", a.len(), b.len()));
+                }
+                a.iter().zip(b).enumerate().find_map(|(i, (x, y))| {
+                    if (&x.0, &x.2, x.3, &x.4) != (&y.0, &y.2, y.3, &y.4) {
+                        return Some(format!("object {i} is labelled differently"));
+                    }
+                    node_difference(&x.1, &y.1).map(|d| format!("object {i}{d}"))
+                })
+            }
+        }
+    }
+
+    /// What both readers make of one file: how many objects, or the error.
+    /// Any difference between the two fails the test that asked.
+    fn agreed(what: &str, raw: &[u8]) -> Result<usize, String> {
+        let new = read_bytes(raw);
+        let old = whole_buffer::read_bytes(raw);
+        if let Some(d) = outcome_difference(&new, &old) {
+            panic!("{what}: {d}");
+        }
+        old.map(|objs| objs.len())
+    }
+
+    /// How a run of comparisons came out, so a test can show it compared more
+    /// than one kind of outcome.
+    #[derive(Default)]
+    struct Agreed {
+        read: usize,
+        errors: std::collections::BTreeMap<String, usize>,
+    }
+
+    impl Agreed {
+        fn add(&mut self, what: &str, raw: &[u8]) {
+            match agreed(what, raw) {
+                Ok(_) => self.read += 1,
+                Err(e) => *self.errors.entry(e).or_default() += 1,
+            }
+        }
+        fn failed(&self) -> usize {
+            self.errors.values().sum()
+        }
+        fn saw(&self, text: &str) -> bool {
+            self.errors.keys().any(|e| e.contains(text))
+        }
+    }
+
+    /// Every file of the fixture package, in a fixed order.
+    fn fixture_files() -> Vec<(String, Vec<u8>)> {
+        fn walk(dir: &Path, out: &mut Vec<std::path::PathBuf>) {
+            for e in std::fs::read_dir(dir)
+                .expect("list the fixture package")
+                .flatten()
+            {
+                let p = e.path();
+                if p.is_dir() {
+                    walk(&p, out)
+                } else {
+                    out.push(p)
+                }
+            }
+        }
+        let mut paths = Vec::new();
+        walk(Path::new("tests/fixtures/pkg"), &mut paths);
+        paths.sort();
+        paths
+            .into_iter()
+            .map(|p| {
+                (
+                    p.display().to_string(),
+                    std::fs::read(&p).expect("read a fixture"),
+                )
+            })
+            .collect()
+    }
+
+    /// The fixtures that hold serialized objects, each as its decoded stream.
+    fn fixture_streams() -> Vec<(String, Vec<u8>)> {
+        fixture_files()
+            .into_iter()
+            .filter(|(_, raw)| read_bytes(raw).is_ok())
+            .map(|(name, raw)| {
+                let (stream, _) = whole_buffer::decompress(&raw).expect("a fixture decodes");
+                (name, stream)
+            })
+            .collect()
+    }
+
+    /// Up to `n` positions spread evenly over `len` bytes.
+    fn spread(len: usize, n: usize) -> Vec<usize> {
+        let n = n.min(len);
+        (0..n).map(|i| i * len / n).collect()
+    }
+
+    /// The same, and each of the last sixteen bytes, where a compressed file
+    /// keeps its checksum.
+    fn spread_and_tail(len: usize, n: usize) -> Vec<usize> {
+        let mut at = spread(len, n);
+        at.extend(len.saturating_sub(16)..len);
+        at.sort_unstable();
+        at.dedup();
+        at
+    }
+
+    /// `bytes` cut short at each position, and with one bit flipped there.
+    fn each_damaged(bytes: &[u8], at: &[usize], mut f: impl FnMut(String, &[u8])) {
+        let mut flipped = bytes.to_vec();
+        for &i in at {
+            f(format!("cut at {i}"), &bytes[..i]);
+            flipped[i] ^= 1 << (i % 8);
+            f(format!("bit flipped at {i}"), &flipped);
+            flipped[i] = bytes[i];
+        }
+    }
+
+    const PACKINGS: [&str; 4] = ["none", "gzip", "bzip2", "xz"];
+
+    fn pack(stream: &[u8], how: &str) -> Vec<u8> {
+        use std::io::Write;
+        match how {
+            "gzip" => {
+                let mut e = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+                e.write_all(stream).expect("gzip");
+                e.finish().expect("gzip")
+            }
+            "bzip2" => {
+                let mut e = bzip2::write::BzEncoder::new(Vec::new(), bzip2::Compression::fast());
+                e.write_all(stream).expect("bzip2");
+                e.finish().expect("bzip2")
+            }
+            "xz" => {
+                let mut e = xz2::write::XzEncoder::new(Vec::new(), 0);
+                e.write_all(stream).expect("xz");
+                e.finish().expect("xz")
+            }
+            _ => stream.to_vec(),
+        }
+    }
+
+    /// A serialized stream written out by hand, for the shapes no fixture has.
+    struct Wire(Vec<u8>);
+
+    impl Wire {
+        /// One object, the way `saveRDS(compress = FALSE)` starts it.
+        fn rds() -> Self {
+            let mut w = Wire(b"X\n".to_vec());
+            w.int(2).int(0x0004_0400).int(0x0002_0300);
+            w
+        }
+        /// A saved image, whose objects are the cells of one pairlist.
+        fn image() -> Self {
+            let mut w = Wire(b"RDX2\nX\n".to_vec());
+            w.int(2).int(0x0004_0400).int(0x0002_0300);
+            w
+        }
+        fn int(&mut self, v: i32) -> &mut Self {
+            self.0.extend_from_slice(&v.to_be_bytes());
+            self
+        }
+        fn head(&mut self, ty: u8) -> &mut Self {
+            self.int(ty as i32)
+        }
+        fn nil(&mut self) -> &mut Self {
+            self.head(NILVALUE)
+        }
+        fn chars(&mut self, s: &[u8]) -> &mut Self {
+            self.head(CHARSXP).int(s.len() as i32);
+            self.0.extend_from_slice(s);
+            self
+        }
+        fn sym(&mut self, name: &str) -> &mut Self {
+            self.head(SYMSXP).chars(name.as_bytes())
+        }
+        fn ints(&mut self, v: &[i32]) -> &mut Self {
+            self.head(INTSXP).int(v.len() as i32);
+            for x in v {
+                self.int(*x);
+            }
+            self
+        }
+        fn reals(&mut self, v: &[f64]) -> &mut Self {
+            self.head(REALSXP).int(v.len() as i32);
+            for x in v {
+                self.0.extend_from_slice(&x.to_be_bytes());
+            }
+            self
+        }
+        /// A pairlist cell with a tag. Its value and the rest of the list follow.
+        fn tagged(&mut self, name: &str) -> &mut Self {
+            self.int(LISTSXP as i32 | 1 << 10).sym(name)
+        }
+        /// A pairlist cell without one.
+        fn untagged(&mut self) -> &mut Self {
+            self.head(LISTSXP)
+        }
+        /// A compact or wrapped vector of class `class`. Its state and its
+        /// attributes follow.
+        fn altrep(&mut self, class: &str) -> &mut Self {
+            self.head(ALTREP_SXP);
+            self.untagged()
+                .sym(class)
+                .untagged()
+                .sym("base")
+                .untagged()
+                .ints(&[INTSXP as i32])
+                .nil()
+        }
+    }
+
+    #[test]
+    fn every_fixture_reads_as_the_whole_buffer_reader_read_it() {
+        let mut seen = Agreed::default();
+        for (name, raw) in fixture_files() {
+            seen.add(&name, &raw);
+        }
+        assert!(
+            seen.read >= 100,
+            "the serialized fixtures read: {}",
+            seen.read
+        );
+        assert!(
+            seen.failed() >= 10,
+            "and the files that are not serialized do not"
+        );
+    }
+
+    /// Damage to the file itself, which is mostly damage the decoder reports.
+    #[test]
+    fn a_damaged_file_reads_as_the_whole_buffer_reader_read_it() {
+        let mut seen = Agreed::default();
+        for (name, raw) in fixture_files() {
+            let at = spread_and_tail(raw.len(), 96);
+            each_damaged(&raw, &at, |how, bytes| {
+                seen.add(&format!("{name} {how}"), bytes)
+            });
+        }
+        assert!(seen.read > 0, "some damage is harmless");
+        for text in [
+            "corrupt deflate stream",
+            "corrupt gzip stream does not have a matching checksum",
+            "invalid gzip header",
+            "unexpected end of file",
+            "truncated header",
+            "truncated stream",
+        ] {
+            assert!(
+                seen.saw(text),
+                "no damaged file gave {text:?}: {:?}",
+                seen.errors.keys()
+            );
+        }
+    }
+
+    /// Damage to the serialized stream under each compression, which the
+    /// decoder passes and the parse has to report.
+    #[test]
+    fn a_damaged_stream_reads_the_same_under_every_compression() {
+        let mut seen = Agreed::default();
+        for (name, stream) in fixture_streams() {
+            for how in PACKINGS {
+                let n = if how == "none" || how == "gzip" {
+                    32
+                } else {
+                    4
+                };
+                each_damaged(&stream, &spread(stream.len(), n), |what, bytes| {
+                    seen.add(&format!("{name} {what} then {how}"), &pack(bytes, how));
+                });
+            }
+        }
+        assert!(seen.read > 0, "some damage is harmless");
+        for text in [
+            "truncated header",
+            "truncated stream",
+            "unhandled SEXPTYPE",
+            "bad reference index",
+            "non-XDR encoding",
+            "negative length",
+        ] {
+            assert!(
+                seen.saw(text),
+                "no damaged stream gave {text:?}: {:?}",
+                seen.errors.keys()
+            );
+        }
+    }
+
+    /// A damaged compressed file is an error whatever its objects parse to.
+    #[test]
+    fn a_decoder_error_outranks_a_stream_that_parses() {
+        let stream = {
+            let mut w = Wire::rds();
+            w.ints(&[1, 2, 3]);
+            w.0
+        };
+        for how in ["gzip", "bzip2", "xz"] {
+            let packed = pack(&stream, how);
+            assert_eq!(agreed(how, &packed), Ok(1), "{how}: the file reads whole");
+            let mut seen = Agreed::default();
+            each_damaged(
+                &packed,
+                &spread(packed.len(), packed.len()),
+                |what, bytes| seen.add(&format!("{how} {what}"), bytes),
+            );
+            assert!(seen.failed() > seen.read, "{how}: most damage is an error");
+        }
+        // The last eight bytes of a gzip file are a checksum and a length. Every
+        // byte before them decodes and parses.
+        let mut gz = pack(&stream, "gzip");
+        let at = gz.len() - 6;
+        gz[at] ^= 0x10;
+        assert_eq!(
+            agreed("gzip checksum", &gz),
+            Err("corrupt gzip stream does not have a matching checksum".to_string())
+        );
+        // An xz file followed by bytes that are not one.
+        let mut xz = pack(&stream, "xz");
+        xz.extend_from_slice(&[0u8; 5]);
+        assert_eq!(
+            agreed("xz then padding", &xz),
+            Err("corrupt xz stream".to_string())
+        );
+    }
+
+    /// A saved image hands back its objects in the order it holds them, each
+    /// under its own name.
+    #[test]
+    fn an_image_gives_each_object_once_and_in_order() {
+        let mut w = Wire::image();
+        w.tagged("first").ints(&[1, 2, 3]);
+        w.tagged("second").reals(&[0.5, f64::NAN]);
+        w.untagged().chars(b"unnamed");
+        w.tagged("last").nil().nil();
+        for how in PACKINGS {
+            let raw = pack(&w.0, how);
+            assert_eq!(agreed(how, &raw), Ok(4));
+            let objs = read_bytes(&raw).expect("the image reads");
+            let labels: Vec<_> = objs
+                .iter()
+                .map(|(nm, _, fmt, ver, comp)| (nm.as_str(), fmt.as_str(), *ver, comp.as_str()))
+                .collect();
+            assert_eq!(
+                labels,
+                [
+                    ("first", "rda", 2, how),
+                    ("second", "rda", 2, how),
+                    ("", "rda", 2, how),
+                    ("last", "rda", 2, how)
+                ]
+            );
+            assert!(matches!(&objs[0].1.val, Val::Ints { vals, .. } if vals == &[1, 2, 3]));
+            assert!(matches!(&objs[2].1.val, Val::Char(Some(t)) if t == "unnamed"));
+            assert!(matches!(objs[3].1.val, Val::Nil));
+        }
+    }
+
+    /// A list that does not end in nil stops where the list stops, and a file
+    /// whose one object is not a list is that object.
+    #[test]
+    fn a_list_is_walked_to_its_end_and_no_further() {
+        let mut w = Wire::image();
+        w.tagged("a").ints(&[1]).tagged("b").ints(&[2]).ints(&[3]);
+        assert_eq!(agreed("a list ending in a vector", &w.0), Ok(2));
+
+        let mut w = Wire::rds();
+        w.ints(&[7, 8]);
+        assert_eq!(agreed("one vector", &w.0), Ok(1));
+        let objs = read_bytes(&w.0).expect("the vector reads");
+        assert_eq!((objs[0].0.as_str(), objs[0].2.as_str()), ("", "rds"));
+    }
+
+    /// A wrapper stands for the first element of its state, whether the state
+    /// is a list or a pairlist, and a state with no first element gives none.
+    #[test]
+    fn a_wrapped_vector_is_the_vector_it_wraps() {
+        let ints = |v: &[i32]| Node {
+            val: Val::Ints {
+                len: v.len(),
+                vals: v.to_vec(),
+                logical: false,
+            },
+            attr: None,
+        };
+        let nil = || Node {
+            val: Val::Nil,
+            attr: None,
+        };
+
+        let mut in_list = Node {
+            val: Val::Vec(vec![ints(&[4, 5]), ints(&[0, 0])]),
+            attr: None,
+        };
+        assert!(matches!(
+            first_element(&mut in_list),
+            Some(Val::Ints { vals, .. }) if vals == [4, 5]
+        ));
+
+        let mut in_pairlist = Node {
+            val: Val::List {
+                tag: Box::new(nil()),
+                car: Box::new(ints(&[6])),
+                cdr: Box::new(nil()),
+            },
+            attr: None,
+        };
+        assert!(matches!(
+            first_element(&mut in_pairlist),
+            Some(Val::Ints { vals, .. }) if vals == [6]
+        ));
+
+        let mut empty = Node {
+            val: Val::Vec(Vec::new()),
+            attr: None,
+        };
+        assert!(first_element(&mut empty).is_none());
+        assert!(first_element(&mut ints(&[9])).is_none());
+    }
+
+    /// Every way a compact or wrapped vector can be written, including the
+    /// ones R does not write: a state of the wrong shape and a class nobody
+    /// has heard of.
+    #[test]
+    fn a_compact_vector_reads_as_the_whole_buffer_reader_read_it() {
+        let mut cases: Vec<(&str, Wire)> = Vec::new();
+        let mut w = Wire::rds();
+        w.altrep("wrap_integer")
+            .head(VECSXP)
+            .int(2)
+            .ints(&[3, 1, 2])
+            .ints(&[0, 0])
+            .nil();
+        cases.push(("a wrapper over a list", w));
+        let mut w = Wire::rds();
+        w.altrep("wrap_real")
+            .untagged()
+            .reals(&[1.5, 2.5])
+            .untagged()
+            .ints(&[0, 0])
+            .nil()
+            .nil();
+        cases.push(("a wrapper over a pairlist", w));
+        let mut w = Wire::rds();
+        w.altrep("wrap_integer").head(VECSXP).int(0).nil();
+        cases.push(("a wrapper over an empty list", w));
+        let mut w = Wire::rds();
+        w.altrep("wrap_string").ints(&[1, 2]).nil();
+        cases.push(("a wrapper over a bare vector", w));
+        let mut w = Wire::rds();
+        w.altrep("compact_intseq").reals(&[4.0, 1.0, 1.0]).nil();
+        cases.push(("a sequence", w));
+        let mut w = Wire::rds();
+        w.altrep("compact_realseq").ints(&[3, 10, 2]).nil();
+        cases.push(("a sequence with an integer state", w));
+        let mut w = Wire::rds();
+        w.altrep("compact_intseq").reals(&[4.0]).nil();
+        cases.push(("a sequence with a short state", w));
+        let mut w = Wire::rds();
+        w.altrep("compact_intseq")
+            .reals(&[(CELL_CAP + 1) as f64, 1.0, 1.0])
+            .nil();
+        cases.push(("a sequence past the cell cap", w));
+        let mut w = Wire::rds();
+        w.altrep("deferred_string")
+            .head(STRSXP)
+            .int(2)
+            .chars(b"a")
+            .chars(b"b")
+            .nil();
+        cases.push(("an unknown class", w));
+        let mut w = Wire::rds();
+        w.altrep("wrap_integer").head(VECSXP).int(1).ints(&[1, 2]);
+        w.tagged("names")
+            .head(STRSXP)
+            .int(2)
+            .chars(b"x")
+            .chars(b"y")
+            .nil();
+        cases.push(("a wrapper with attributes", w));
+
+        for (what, w) in &cases {
+            assert_eq!(agreed(what, &w.0), Ok(1), "{what}");
+            each_damaged(&w.0, &spread(w.0.len(), w.0.len()), |how, bytes| {
+                let _ = agreed(&format!("{what} {how}"), bytes);
+            });
+        }
+        let read = |i: usize| read_bytes(&cases[i].1.0).expect("it reads").remove(0).1;
+        assert!(matches!(read(0).val, Val::Ints { vals, .. } if vals == [3, 1, 2]));
+        assert!(matches!(read(1).val, Val::Reals { vals, .. } if vals == [1.5, 2.5]));
+        assert!(matches!(read(2).val, Val::Vec(v) if v.is_empty()));
+        assert!(matches!(read(4).val, Val::Ints { vals, .. } if vals == [1, 2, 3, 4]));
+        assert!(matches!(read(6).val, Val::Reals { vals, .. } if vals == [4.0]));
+        assert!(matches!(read(8).val, Val::Str(v) if v.len() == 2));
+        assert!(
+            read(9).attr.is_some(),
+            "the attributes are the wrapper's own"
+        );
+    }
+
+    /// What a state carries beside its values is not the vector's. The
+    /// attributes of a compact or wrapped vector are the ones written after
+    /// its state, and one written with none has none, whatever its state or
+    /// the vector inside its state was written with.
+    #[test]
+    fn a_compact_vector_takes_no_attributes_from_its_state() {
+        /// The attributes a vector is written with: its names.
+        fn named(w: &mut Wire, names: &[&[u8]]) {
+            w.tagged("names").head(STRSXP).int(names.len() as i32);
+            for n in names {
+                w.chars(n);
+            }
+            w.nil();
+        }
+        const WITH_ATTRIBUTES: i32 = 1 << 9;
+        let mut cases: Vec<(&str, Wire)> = Vec::new();
+
+        let mut w = Wire::rds();
+        w.altrep("deferred_string")
+            .int(STRSXP as i32 | WITH_ATTRIBUTES)
+            .int(2)
+            .chars(b"a")
+            .chars(b"b");
+        named(&mut w, &[b"x", b"y"]);
+        w.nil();
+        cases.push(("a class the reader does not know", w));
+
+        let mut w = Wire::rds();
+        w.altrep("mmap_integer")
+            .int(INTSXP as i32 | WITH_ATTRIBUTES)
+            .int(2)
+            .int(7)
+            .int(8);
+        named(&mut w, &[b"x", b"y"]);
+        w.nil();
+        cases.push(("another, over integers", w));
+
+        let mut w = Wire::rds();
+        w.altrep("wrap_integer").head(VECSXP).int(2);
+        w.int(INTSXP as i32 | WITH_ATTRIBUTES).int(2).int(3).int(1);
+        named(&mut w, &[b"x", b"y"]);
+        w.ints(&[0, 0]).nil();
+        cases.push(("a wrapper whose vector has attributes", w));
+
+        let mut w = Wire::rds();
+        w.altrep("wrap_real")
+            .int(VECSXP as i32 | WITH_ATTRIBUTES)
+            .int(2)
+            .reals(&[1.5, 2.5])
+            .ints(&[0, 0]);
+        named(&mut w, &[b"x", b"y"]);
+        w.nil();
+        cases.push(("a wrapper whose state has attributes", w));
+
+        let mut w = Wire::rds();
+        w.altrep("wrap_real").int(LISTSXP as i32 | WITH_ATTRIBUTES);
+        named(&mut w, &[b"x"]);
+        w.reals(&[1.5, 2.5]).nil().nil();
+        cases.push(("a wrapper over a pairlist that has attributes", w));
+
+        let mut w = Wire::rds();
+        w.altrep("compact_intseq")
+            .int(REALSXP as i32 | WITH_ATTRIBUTES)
+            .int(3);
+        for x in [4.0f64, 1.0, 1.0] {
+            w.0.extend_from_slice(&x.to_be_bytes());
+        }
+        named(&mut w, &[b"n", b"from", b"by"]);
+        w.nil();
+        cases.push(("a sequence whose state has attributes", w));
+
+        for (what, w) in &cases {
+            assert_eq!(agreed(what, &w.0), Ok(1), "{what}");
+            let read = read_bytes(&w.0).expect("it reads").remove(0).1;
+            assert!(read.attr.is_none(), "{what}: attributes from the state");
+            each_damaged(&w.0, &spread(w.0.len(), w.0.len()), |how, bytes| {
+                let _ = agreed(&format!("{what} {how}"), bytes);
+            });
+        }
+        let read = |i: usize| read_bytes(&cases[i].1.0).expect("it reads").remove(0).1;
+        assert!(matches!(read(0).val, Val::Str(v) if v.len() == 2));
+        assert!(matches!(read(1).val, Val::Ints { vals, .. } if vals == [7, 8]));
+        assert!(matches!(read(2).val, Val::Ints { vals, .. } if vals == [3, 1]));
+        assert!(matches!(read(3).val, Val::Reals { vals, .. } if vals == [1.5, 2.5]));
+        assert!(matches!(read(4).val, Val::Reals { vals, .. } if vals == [1.5, 2.5]));
+        assert!(matches!(read(5).val, Val::Ints { vals, .. } if vals == [1, 2, 3, 4]));
+
+        // And the attributes written after a state are kept beside one that
+        // has its own.
+        let mut w = Wire::rds();
+        w.altrep("deferred_string")
+            .int(STRSXP as i32 | WITH_ATTRIBUTES)
+            .int(1)
+            .chars(b"a");
+        named(&mut w, &[b"of the state"]);
+        named(&mut w, &[b"of the vector"]);
+        assert_eq!(agreed("both have attributes", &w.0), Ok(1));
+        let read = read_bytes(&w.0).expect("it reads").remove(0).1;
+        let own = read.attr.expect("the vector's own attributes");
+        let Val::List { car, .. } = &own.val else {
+            panic!("attributes are a list")
+        };
+        assert!(
+            matches!(&car.val, Val::Str(v) if v == &[Some("of the vector".to_string())]),
+            "the names are the vector's"
+        );
+    }
+
+    /// What the windowed reader makes of a decoder, against what the
+    /// whole-buffer reader makes of the bytes that decoder hands over.
+    fn agreed_through(
+        what: &str,
+        from: Box<dyn std::io::Read + '_>,
+        stream: &[u8],
+    ) -> Result<usize, String> {
+        let new = read_stream(from, "none");
+        let old = whole_buffer::read_bytes(stream);
+        if let Some(d) = outcome_difference(&new, &old) {
+            panic!("{what}: {d}");
+        }
+        old.map(|objs| objs.len())
+    }
+
+    /// Hands over at most `step` bytes at a time.
+    struct Dribble<'a> {
+        left: &'a [u8],
+        step: usize,
+    }
+
+    impl std::io::Read for Dribble<'_> {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let n = self.step.min(buf.len()).min(self.left.len());
+            buf[..n].copy_from_slice(&self.left[..n]);
+            self.left = &self.left[n..];
+            Ok(n)
+        }
+    }
+
+    /// Hands over its bytes and then fails, and must not be asked again.
+    struct Failing<'a> {
+        left: &'a [u8],
+        failed: bool,
+    }
+
+    impl std::io::Read for Failing<'_> {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if self.left.is_empty() {
+                assert!(!self.failed, "a decoder that failed was read again");
+                self.failed = true;
+                return Err(std::io::Error::other("the decoder gave up"));
+            }
+            let n = buf.len().min(self.left.len());
+            buf[..n].copy_from_slice(&self.left[..n]);
+            self.left = &self.left[n..];
+            Ok(n)
+        }
+    }
+
+    /// Is interrupted before every read that hands anything over.
+    struct Interrupted<'a> {
+        left: &'a [u8],
+        ready: bool,
+    }
+
+    impl std::io::Read for Interrupted<'_> {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            self.ready = !self.ready;
+            if self.ready {
+                return Err(std::io::ErrorKind::Interrupted.into());
+            }
+            let n = buf.len().min(self.left.len());
+            buf[..n].copy_from_slice(&self.left[..n]);
+            self.left = &self.left[n..];
+            Ok(n)
+        }
+    }
+
+    /// Counts what is taken from it.
+    struct Counted<'a> {
+        left: &'a [u8],
+        taken: &'a std::cell::Cell<usize>,
+    }
+
+    impl std::io::Read for Counted<'_> {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let n = buf.len().min(self.left.len());
+            buf[..n].copy_from_slice(&self.left[..n]);
+            self.left = &self.left[n..];
+            self.taken.set(self.taken.get() + n);
+            Ok(n)
+        }
+    }
+
+    /// An image several windows long, laid out so that numbers, strings and
+    /// hashed spans all fall across the edge of a window.
+    fn long_stream() -> Vec<u8> {
+        let mut w = Wire::image();
+        // Three bytes, so nothing after them starts on a multiple of four.
+        w.tagged("odd").chars(b"abc");
+        let reals: Vec<f64> = (0..100_000).map(|i| i as f64 * 0.25 - 7.0).collect();
+        w.tagged("reals").reals(&reals);
+        let ints: Vec<i32> = (0..150_001).map(|i| i * 7 - 3).collect();
+        w.tagged("ints").ints(&ints);
+        // A string longer than two windows, not all of it valid UTF-8, once
+        // as UTF-8 and once marked Latin-1.
+        let mut text: Vec<u8> = (0..2 * WINDOW + 5).map(|i| b'a' + (i % 26) as u8).collect();
+        text[WINDOW - 1] = 0xe9;
+        text[WINDOW] = 0xff;
+        w.tagged("text").chars(&text);
+        w.tagged("latin")
+            .int(CHARSXP as i32 | LATIN1_MASK << 12)
+            .int(text.len() as i32);
+        w.0.extend_from_slice(&text);
+        w.tagged("strings").head(STRSXP).int(40_000);
+        for i in 0..40_000 {
+            w.chars(format!("s{i}").as_bytes());
+        }
+        // Raw and complex values are hashed and not kept.
+        let bytes: Vec<u8> = (0..1_000_003).map(|i| (i % 251) as u8).collect();
+        w.tagged("raw").head(RAWSXP).int(bytes.len() as i32);
+        w.0.extend_from_slice(&bytes);
+        w.tagged("complex").head(CPLXSXP).int(40_001);
+        w.0.extend_from_slice(&bytes[..16 * 40_001]);
+        // A builtin is its name, which is stepped over.
+        w.tagged("builtin")
+            .head(BUILTINSXP)
+            .int((WINDOW + 17) as i32);
+        w.0.extend_from_slice(&bytes[..WINDOW + 17]);
+        w.nil();
+        w.0
+    }
+
+    #[test]
+    fn a_stream_longer_than_the_window_reads_as_the_whole_buffer_reader_read_it() {
+        let stream = long_stream();
+        assert!(stream.len() > 16 * WINDOW, "the stream spans many windows");
+        let mut seen = Agreed::default();
+        for how in PACKINGS {
+            let packed = pack(&stream, how);
+            assert_eq!(agreed(how, &packed), Ok(9), "{how}");
+            each_damaged(
+                &packed,
+                &spread_and_tail(packed.len(), 24),
+                |what, bytes| seen.add(&format!("{how} {what}"), bytes),
+            );
+        }
+        // Damage at and beside the first few edges of the window.
+        let mut at = Vec::new();
+        for edge in (WINDOW..=4 * WINDOW).step_by(WINDOW) {
+            at.extend(edge - 5..edge + 5);
+        }
+        each_damaged(&stream, &at, |what, bytes| seen.add(&what, bytes));
+        assert!(seen.read > 0, "some damage is harmless");
+        assert!(seen.saw("truncated stream"));
+
+        let objs = read_bytes(&stream).expect("the long stream reads");
+        let text = |i: usize| match &objs[i].1.val {
+            Val::Char(Some(t)) => t.clone(),
+            _ => panic!("object {i} is not a string"),
+        };
+        assert_eq!(
+            text(3).chars().count(),
+            2 * WINDOW + 5,
+            "one mark for each bad byte"
+        );
+        assert!(text(3).contains('\u{fffd}'), "what is not UTF-8 is marked");
+        assert!(text(4).contains('\u{e9}'), "and Latin-1 is read as Latin-1");
+        assert!(matches!(
+            objs[6].1.val,
+            Val::Blob {
+                len: 1_000_003,
+                of: "raw",
+                digest: Some(_)
+            }
+        ));
+    }
+
+    /// A string longer than the window arrives in pieces, and a character
+    /// of several bytes can lie across two of them. It is one character all
+    /// the same: the string is put together before it is made text, and
+    /// text made a piece at a time would mark each half as a byte that is
+    /// not UTF-8.
+    #[test]
+    fn a_character_across_two_pieces_of_a_long_string_is_one_character() {
+        // Two, three and four bytes, nine to a round. With each of nine
+        // lengths of string before it, each character meets every edge of
+        // the window at each of its bytes.
+        let round = "\u{e9}\u{6f22}\u{1f600}";
+        assert_eq!(round.len(), 9);
+        let text = round.repeat((3 * WINDOW + 4096) / round.len());
+        assert!(text.len() > 3 * WINDOW);
+        // The same bytes marked Latin-1 are a character each.
+        let as_latin1: String = text.bytes().map(|b| b as char).collect();
+        let mut pieces = 0;
+        for lead in 0..round.len() {
+            let mut w = Wire::image();
+            w.tagged("lead").chars(&b"abcdefghi"[..lead]);
+            w.tagged("utf8").chars(text.as_bytes());
+            w.tagged("latin1")
+                .int(CHARSXP as i32 | LATIN1_MASK << 12)
+                .int(text.len() as i32);
+            w.0.extend_from_slice(text.as_bytes());
+            // One that fills a window exactly, and one a byte longer, which
+            // is the shortest that comes in pieces.
+            for (name, bytes) in [("full", WINDOW), ("over", WINDOW + 1)] {
+                let fill = "\u{6f22}".repeat(bytes / 3);
+                w.tagged(name).chars(fill.as_bytes());
+                w.0.extend_from_slice(&b"ab"[..bytes % 3]);
+                let at = w.0.len() - bytes - 4;
+                w.0[at..at + 4].copy_from_slice(&(bytes as i32).to_be_bytes());
+            }
+            w.nil();
+
+            let what = format!("{lead} bytes before");
+            assert_eq!(agreed(&what, &w.0), Ok(5), "{what}");
+            // In pieces of every size, the smallest of which split every
+            // character.
+            for step in [1, 2, 3, 5, 4096, WINDOW - 1] {
+                let from = Dribble { left: &w.0, step };
+                assert_eq!(agreed_through(&what, Box::new(from), &w.0), Ok(5), "{what}");
+                pieces += 1;
+            }
+            if lead == 0 || lead == 4 {
+                for how in ["gzip", "bzip2", "xz"] {
+                    assert_eq!(agreed(&what, &pack(&w.0, how)), Ok(5), "{what} {how}");
+                }
+            }
+            // And against the text itself, whatever the other reader says.
+            let objs = read_bytes(&w.0).expect("the strings read");
+            let read = |i: usize| match &objs[i].1.val {
+                Val::Char(Some(t)) => t.as_str(),
+                _ => panic!("object {i} is not a string"),
+            };
+            assert!(read(1) == text, "{what}: the UTF-8 string is not the text written");
+            assert!(read(2) == as_latin1, "{what}: the Latin-1 string is not a character a byte");
+            assert!(!read(3).contains('\u{fffd}') && !read(4).contains('\u{fffd}'), "{what}");
+            assert_eq!(read(3).len(), WINDOW, "{what}");
+            assert_eq!(read(4).len(), WINDOW + 1, "{what}");
+        }
+        assert_eq!(pieces, 54);
+    }
+
+    /// A decoder may hand over as little as it likes at a time.
+    #[test]
+    fn a_decoder_that_dribbles_changes_nothing() {
+        let long = long_stream();
+        for step in [1, 5, 8191, WINDOW - 3] {
+            let from = Dribble { left: &long, step };
+            assert_eq!(
+                agreed_through("the long stream", Box::new(from), &long),
+                Ok(9)
+            );
+        }
+        let mut read = 0;
+        for (name, stream) in fixture_streams() {
+            for step in [1, 3, 4096] {
+                let from = Dribble {
+                    left: &stream,
+                    step,
+                };
+                read += agreed_through(&name, Box::new(from), &stream).is_ok() as usize;
+                each_damaged(&stream, &spread(stream.len(), 6), |what, bytes| {
+                    let from = Dribble { left: bytes, step };
+                    let _ = agreed_through(&format!("{name} {what}"), Box::new(from), bytes);
+                });
+            }
+        }
+        assert!(read >= 300, "every fixture reads at every step: {read}");
+
+        let from = Interrupted {
+            left: &long,
+            ready: false,
+        };
+        assert_eq!(agreed_through("interrupted", Box::new(from), &long), Ok(9));
+    }
+
+    /// A decoder error is the outcome wherever in the stream it falls: before
+    /// the parse has what it needs, after the parse has failed for a reason of
+    /// its own, and after the parse is done.
+    #[test]
+    fn a_decoder_error_wins_wherever_it_falls() {
+        let long = long_stream();
+        let small = {
+            let mut w = Wire::rds();
+            w.ints(&[1, 2, 3]);
+            w.0
+        };
+        // Not a stream this reader takes, and it says so at the sixth byte.
+        let mut refused = b"RDX2\nA\n".to_vec();
+        refused.resize(3 * WINDOW, b'.');
+        for (what, stream) in [("long", &long), ("small", &small), ("refused", &refused)] {
+            let mut at = spread(stream.len(), 40);
+            at.push(stream.len());
+            for good in at {
+                let from = Failing {
+                    left: &stream[..good],
+                    failed: false,
+                };
+                assert_eq!(
+                    read_stream(Box::new(from), "none").err(),
+                    Some("the decoder gave up".to_string()),
+                    "{what}, failing after {good} bytes"
+                );
+            }
+        }
+    }
+
+    /// The stream is read to its end whatever the parse said and however
+    /// early it said it, since that is where a decoder checks its sums.
+    #[test]
+    fn a_stream_is_read_to_its_end_whatever_the_parse_said() {
+        let taken = std::cell::Cell::new(0);
+        let read = |stream: &[u8]| {
+            taken.set(0);
+            let from = Counted {
+                left: stream,
+                taken: &taken,
+            };
+            let out = read_stream(Box::new(from), "none").map(|objs| objs.len());
+            assert_eq!(taken.get(), stream.len(), "the whole stream was taken");
+            out
+        };
+        let mut refused = b"RDX2\nA\n".to_vec();
+        refused.resize(5 * WINDOW + 3, b'.');
+        assert_eq!(read(&refused), Err("non-XDR encoding 'A'".to_string()));
+
+        let mut w = Wire::rds();
+        w.ints(&[1, 2, 3]);
+        w.0.resize(3 * WINDOW + 1, 0xaa);
+        assert_eq!(read(&w.0), Ok(1), "what follows the object is not parsed");
+
+        assert_eq!(read(&long_stream()), Ok(9));
+        assert_eq!(read(b""), Err("truncated header".to_string()));
+    }
+
+    /// A file that runs out of budget part way still reports a fault its
+    /// decoder finds further on.
+    #[test]
+    fn a_file_past_the_item_budget_still_reports_what_its_decoder_found() {
+        let n = ITEM_BUDGET as usize + ITEM_BUDGET as usize / 4;
+        let mut w = Wire::rds();
+        w.head(VECSXP).int(n as i32);
+        // Eight markers that each read as nothing, in no repeating order, so
+        // that a damaged copy cannot decode to the same bytes.
+        let markers = [
+            NILVALUE,
+            GLOBALENV_SXP,
+            UNBOUNDVALUE_SXP,
+            MISSINGARG_SXP,
+            BASENAMESPACE_SXP,
+            EMPTYENV_SXP,
+            BASEENV_SXP,
+            0,
+        ];
+        let mut x = 1u32;
+        for _ in 0..n {
+            x = x.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            w.head(markers[(x >> 29) as usize]);
+        }
+        let over = Err("item budget exceeded".to_string());
+        assert_eq!(agreed("none", &w.0), over);
+        for how in ["gzip", "bzip2", "xz"] {
+            let packed = pack(&w.0, how);
+            assert_eq!(agreed(how, &packed), over, "{how}");
+            // Both faults are in the last tenth of the file, long after the
+            // budget has run out.
+            let late = packed.len() - packed.len() / 10;
+            let cut = agreed(&format!("{how} cut"), &packed[..late]);
+            assert!(cut.is_err() && cut != over, "{how} cut short: {cut:?}");
+            let mut flipped = packed.clone();
+            flipped[late] ^= 0x04;
+            let flip = agreed(&format!("{how} bit flipped"), &flipped);
+            assert!(
+                flip.is_err() && flip != over,
+                "{how} with a bit flipped: {flip:?}"
+            );
+        }
+    }
+
+    /// A vector past the cell cap is hashed in the pass that steps over it,
+    /// however many windows it fills.
+    #[test]
+    fn a_vector_past_the_cell_cap_is_hashed_as_it_goes_by() {
+        let n = CELL_CAP + 1;
+        let mut w = Wire::image();
+        w.tagged("big").head(INTSXP).int(n as i32);
+        let start = w.0.len();
+        w.0.extend((0..4 * n).map(|i| (i % 251) as u8));
+        let end = w.0.len();
+        w.tagged("after").ints(&[1, 2, 3]).nil();
+
+        for how in ["none", "gzip"] {
+            let packed = pack(&w.0, how);
+            assert_eq!(agreed(how, &packed), Ok(2), "{how}");
+            let objs = read_bytes(&packed).expect("the image reads");
+            let want = fnv(&w.0[start..end]);
+            assert!(matches!(
+                objs[0].1.val,
+                Val::Blob { len, of: "integer", digest: Some(d) } if len == n && d == want
+            ));
+            assert!(matches!(&objs[1].1.val, Val::Ints { vals, .. } if vals == &[1, 2, 3]));
+        }
+        let short = Err("truncated stream".to_string());
+        assert_eq!(
+            agreed("cut inside the vector", &w.0[..start + 2 * n]),
+            short
+        );
+        assert_eq!(agreed("cut at the end of the vector", &w.0[..end]), short);
+        let mut flipped = w.0.clone();
+        flipped[start + 3 * n] ^= 0x80;
+        assert_eq!(agreed("one bit of the vector flipped", &flipped), Ok(2));
+    }
+
+    /// The container's first line ends at its newline, however far off that
+    /// is, and every header too short to be one says so as it did.
+    #[test]
+    fn a_header_is_judged_as_the_whole_buffer_reader_judged_it() {
+        let object = {
+            let mut w = Wire::rds();
+            w.ints(&[1, 2, 3]);
+            w.0
+        };
+        let mut far = b"RDX2".to_vec();
+        far.resize(2 * WINDOW + 100, b'-');
+        far.push(b'\n');
+        far.extend_from_slice(&object);
+        let mut never = b"RDA2".to_vec();
+        never.resize(3 * WINDOW, b'-');
+        for how in PACKINGS {
+            assert_eq!(agreed(how, &pack(&far, how)), Ok(1), "{how}");
+            assert_eq!(
+                agreed(how, &pack(&never, how)),
+                Err("missing container magic newline".to_string()),
+                "{how}"
+            );
+        }
+
+        let mut seen = Agreed::default();
+        let heads: [&[u8]; 16] = [
+            b"",
+            b"R",
+            b"RDX",
+            b"RDX2",
+            b"RDX2\n",
+            b"RDX2\nX",
+            b"RDX2\nX\n",
+            b"RDX2\nA\n",
+            b"RDB2\nX\n\0\0",
+            b"RDX2X",
+            b"X",
+            b"X\n",
+            b"A\n",
+            b"1976",
+            b"1976\n",
+            b"1976 1",
+        ];
+        for head in heads {
+            for how in PACKINGS {
+                seen.add(&format!("{head:?} {how}"), &pack(head, how));
+                let mut whole = head.to_vec();
+                whole.extend_from_slice(&object[2..]);
+                seen.add(
+                    &format!("{head:?} and an object, {how}"),
+                    &pack(&whole, how),
+                );
+            }
+        }
+        assert!(seen.read > 0, "a header with an object after it reads");
+        for text in [
+            "truncated header",
+            "truncated stream",
+            "non-XDR encoding 'A'",
+            "missing container magic newline",
+            "truncated v1 stream",
+        ] {
+            assert!(
+                seen.saw(text),
+                "no header gave {text:?}: {:?}",
+                seen.errors.keys()
+            );
+        }
+    }
+
+    /// The format from before R 1.4.0 is not a stream, so it is still read
+    /// whole, across as many windows as it fills.
+    #[test]
+    fn the_old_text_format_is_read_whole_however_long_it_is() {
+        let text =
+            std::fs::read("tests/fixtures/pkg/data/v1_ascii_frame.rda").expect("the fixture");
+        assert!(text.starts_with(b"1976"));
+        let objects = agreed("as written", &text).expect("the fixture reads");
+        // Blank space between two tokens changes nothing but the length.
+        let mut long = text[..4].to_vec();
+        long.resize(4 + 2 * WINDOW + 11, b' ');
+        long.extend_from_slice(&text[4..]);
+        let mut seen = Agreed::default();
+        for how in PACKINGS {
+            let packed = pack(&long, how);
+            assert_eq!(agreed(how, &packed), Ok(objects), "{how}");
+            each_damaged(
+                &packed,
+                &spread_and_tail(packed.len(), 12),
+                |what, bytes| seen.add(&format!("{how} {what}"), bytes),
+            );
+        }
+        each_damaged(&long, &spread_and_tail(long.len(), 48), |what, bytes| {
+            seen.add(&what, bytes)
+        });
+        assert!(seen.saw("truncated v1 stream"), "{:?}", seen.errors.keys());
+    }
+
+    /// Bytes after the object, and bytes after the compressed stream, count
+    /// for what they counted for before.
+    #[test]
+    fn what_follows_the_stream_is_handled_as_it_was() {
+        let object = {
+            let mut w = Wire::rds();
+            w.reals(&[1.0, 2.0]);
+            w.0
+        };
+        let mut padded = object.clone();
+        padded.resize(2 * WINDOW + 7, 0x5a);
+        let mut seen = Agreed::default();
+        for how in PACKINGS {
+            assert_eq!(
+                agreed(how, &pack(&padded, how)),
+                Ok(1),
+                "{how}: bytes after the object"
+            );
+            let packed = pack(&object, how);
+            for (what, tail) in [
+                ("zeros", vec![0u8; 4]),
+                ("more zeros", vec![0u8; 2 * WINDOW]),
+                ("text", b"not a compressed stream".to_vec()),
+                ("itself again", packed.clone()),
+            ] {
+                let mut bytes = packed.clone();
+                bytes.extend_from_slice(&tail);
+                seen.add(&format!("{how} then {what}"), &bytes);
+            }
+        }
+        assert!(
+            seen.read > 0 && seen.failed() > 0,
+            "some tails matter and some do not"
+        );
+        assert!(seen.saw("corrupt xz stream"), "{:?}", seen.errors.keys());
+    }
+
+    /// `depth` lists, each the only element of the one before it.
+    fn nested(depth: usize) -> Vec<u8> {
+        let mut w = Wire::rds();
+        for _ in 0..depth {
+            w.head(VECSXP).int(1);
+        }
+        w.nil();
+        w.0
+    }
+
+    /// A damaged file was never parsed, so its bytes must not be followed
+    /// down as far as they nest: this is on a test thread's two megabytes.
+    #[test]
+    fn a_damaged_file_is_not_parsed_deep_before_its_decoder_has_passed_it() {
+        let stream = nested(200_000);
+        for how in ["gzip", "bzip2", "xz"] {
+            // The fault is in the last bytes, after every level has been
+            // handed over.
+            let mut packed = pack(&stream, how);
+            packed.truncate(packed.len() - 2);
+            let out = agreed(how, &packed);
+            assert!(out.is_err(), "{how}: {out:?}");
+            assert_ne!(
+                out,
+                Err("truncated stream".to_string()),
+                "{how}: the decoder's own error"
+            );
+        }
+        // The same when the decoder fails early and the parse runs on over
+        // what was already held.
+        let from = Failing {
+            left: &stream[..WINDOW],
+            failed: false,
+        };
+        assert_eq!(
+            read_stream(Box::new(from), "none").err(),
+            Some("the decoder gave up".to_string())
+        );
+    }
+
+    /// A file its decoder passes is read to the bottom, as it always was.
+    #[test]
+    fn a_deep_object_in_a_sound_file_is_read_to_the_bottom() {
+        let deep = std::thread::Builder::new().stack_size(512 << 20).spawn(|| {
+            let levels = 6_000;
+            let stream = nested(levels);
+            for how in PACKINGS {
+                let packed = pack(&stream, how);
+                assert_eq!(agreed(how, &packed), Ok(1), "{how}");
+                let objs = read_bytes(&packed).expect("the nested list reads");
+                let (mut at, mut seen) = (&objs[0].1, 0);
+                while let Val::Vec(inner) = &at.val {
+                    at = &inner[0];
+                    seen += 1;
+                }
+                assert_eq!(seen, levels, "{how}");
+            }
+            let cut = Err("truncated stream".to_string());
+            assert_eq!(agreed("cut short", &stream[..stream.len() - 4]), cut);
+        });
+        deep.expect("a thread")
+            .join()
+            .expect("the deep read finished");
+    }
+
+    /// What a decoder answers when it is read `step` bytes at a time: the
+    /// bytes it hands over, how many at each read, and the error it stops on.
+    type Reads = (Vec<u8>, Vec<usize>, Option<(std::io::ErrorKind, String)>);
+
+    fn reads(mut from: impl std::io::Read, step: usize) -> Reads {
+        let mut buf = vec![0; step];
+        let (mut out, mut sizes) = (Vec::new(), Vec::new());
+        let mut ended = false;
+        loop {
+            match from.read(&mut buf) {
+                // The end is asked for twice, and has to be the end both times.
+                Ok(0) if ended => return (out, sizes, None),
+                Ok(0) => ended = true,
+                Ok(n) => {
+                    out.extend_from_slice(&buf[..n]);
+                    sizes.push(n);
+                }
+                Err(e) => return (out, sizes, Some((e.kind(), e.to_string()))),
+            }
+        }
+    }
+
+    /// This crate's reader of one compression, and the library's own.
+    fn ours_and_theirs<'a>(
+        how: &str,
+        bytes: &'a [u8],
+    ) -> (Box<dyn std::io::Read + 'a>, Box<dyn std::io::Read + 'a>) {
+        match how {
+            "bzip2" => (
+                Box::new(Bzip2::over(bytes)),
+                Box::new(bzip2::read::BzDecoder::new(bytes)),
+            ),
+            "xz" => (
+                Box::new(Xz::over(bytes)),
+                Box::new(xz2::read::XzDecoder::new(bytes)),
+            ),
+            _ => panic!("no reader of {how} to compare"),
+        }
+    }
+
+    /// How a run of files ended, so a test can show it met every ending.
+    #[derive(Default)]
+    struct Ends {
+        whole: usize,
+        errors: std::collections::BTreeMap<String, usize>,
+    }
+
+    impl Ends {
+        fn saw(&self, text: &str) -> bool {
+            self.errors.contains_key(text)
+        }
+    }
+
+    /// Holds this crate's reader to the library's on one file, read for read:
+    /// the same bytes in the same pieces, and the same error of the same kind.
+    fn same_reads(what: &str, how: &str, bytes: &[u8], steps: &[usize], ends: &mut Ends) {
+        use std::io::Read;
+        let outcome = |r: std::io::Result<usize>| r.map_err(|e| (e.kind(), e.to_string()));
+        let (mut ours, mut theirs) = ours_and_theirs(how, bytes);
+        assert_eq!(
+            outcome(ours.read(&mut [])),
+            outcome(theirs.read(&mut [])),
+            "{how} {what}: a read into no room"
+        );
+        let mut last = None;
+        for &step in steps {
+            let (ours, theirs) = ours_and_theirs(how, bytes);
+            let (got, want) = (reads(ours, step), reads(theirs, step));
+            assert_eq!(got.2, want.2, "{how} {what}, {step} at a time: the error");
+            assert!(
+                got.1 == want.1,
+                "{how} {what}, {step} at a time: {} reads against {}",
+                got.1.len(),
+                want.1.len()
+            );
+            assert!(
+                got.0 == want.0,
+                "{how} {what}, {step} at a time: the bytes differ"
+            );
+            last = Some(want.2);
+        }
+        match last.expect("at least one step") {
+            None => ends.whole += 1,
+            Some((_, text)) => *ends.errors.entry(text).or_default() += 1,
+        }
+    }
+
+    /// One file whole, cut short and with a bit flipped at each position.
+    fn same_reads_damaged(
+        what: &str,
+        how: &str,
+        bytes: &[u8],
+        at: &[usize],
+        steps: &[usize],
+        ends: &mut Ends,
+    ) {
+        same_reads(what, how, bytes, steps, ends);
+        each_damaged(bytes, at, |damage, damaged| {
+            same_reads(&format!("{what} {damage}"), how, damaged, steps, ends)
+        });
+    }
+
+    /// Enough bytes to fill several blocks of a compressed stream: text that
+    /// packs well around a stretch that does not pack at all.
+    fn several_blocks() -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut x = 1u32;
+        for part in 0..3 {
+            for i in 0..3_000 {
+                out.extend_from_slice(format!("row {i} of part {part}\t{}\n", i * 37 % 1009).as_bytes());
+            }
+            for _ in 0..30_000 {
+                x = x.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                out.push((x >> 24) as u8);
+            }
+        }
+        out
+    }
+
+    /// The files both decoder tests read: the one fixture written under this
+    /// compression at every byte and bit, every serialized fixture packed
+    /// under it, a stream of several blocks at two block sizes, and a stream
+    /// with something after it.
+    fn each_compressed_file(how: &str, fixture: &str, strong: Vec<u8>, ends: &mut Ends) {
+        let raw = std::fs::read(fixture).expect("the fixture");
+        same_reads("the fixture", how, &raw, &[1, 7, WINDOW], ends);
+        for i in 0..raw.len() {
+            same_reads(&format!("the fixture cut at {i}"), how, &raw[..i], &[1, WINDOW], ends);
+            for bit in 0..8 {
+                let mut flipped = raw.clone();
+                flipped[i] ^= 1 << bit;
+                let what = format!("the fixture with bit {bit} of byte {i} flipped");
+                same_reads(&what, how, &flipped, &[1, WINDOW], ends);
+            }
+        }
+
+        for (name, stream) in fixture_streams() {
+            let packed = pack(&stream, how);
+            let small = stream.len() < WINDOW;
+            same_reads(&name, how, &packed, if small { &[1, 4096] } else { &[4096] }, ends);
+            let at = spread_and_tail(packed.len(), 8);
+            same_reads_damaged(&name, how, &packed, &at, &[WINDOW], ends);
+        }
+
+        let long = several_blocks();
+        for (level, packed) in [("fast", pack(&long, how)), ("strong", strong)] {
+            let what = format!("several blocks, {level}");
+            same_reads(&what, how, &packed, &[100, 4096, 8191], ends);
+            let at = spread_and_tail(packed.len(), 8);
+            same_reads_damaged(&what, how, &packed, &at, &[WINDOW], ends);
+        }
+
+        let packed = pack(b"one stream and no more", how);
+        for (what, tail) in [
+            ("zeros", vec![0u8; 4]),
+            ("many zeros", vec![0u8; 3 * 8192]),
+            ("text", b"not a compressed stream".to_vec()),
+            ("itself again", packed.clone()),
+        ] {
+            let mut bytes = packed.clone();
+            bytes.extend_from_slice(&tail);
+            same_reads(&format!("a stream then {what}"), how, &bytes, &[1, WINDOW], ends);
+        }
+        for head in 0..packed.len().min(12) {
+            same_reads(&format!("the first {head} bytes"), how, &packed[..head], &[1, WINDOW], ends);
+        }
+    }
+
+    /// The bzip2 reader is this crate's own, written after the library's so
+    /// that it can stop where the library reads on. The library's stays here
+    /// as the measure of it.
+    #[test]
+    fn a_bzip2_file_reads_as_the_library_reads_it() {
+        use std::io::Write;
+        let mut strong = bzip2::write::BzEncoder::new(Vec::new(), bzip2::Compression::best());
+        strong.write_all(&several_blocks()).expect("bzip2");
+        let strong = strong.finish().expect("bzip2");
+
+        let mut ends = Ends::default();
+        each_compressed_file(
+            "bzip2",
+            "tests/fixtures/pkg/data/txt_bz2.txt.bz2",
+            strong,
+            &mut ends,
+        );
+        assert!(ends.whole >= 100, "the sound files read: {}", ends.whole);
+        for text in [
+            "bzip2: invalid data",
+            "bzip2: bz2 header missing",
+            "decompression not finished but EOF reached",
+        ] {
+            assert!(
+                ends.saw(text),
+                "no damaged file gave {text:?}: {:?}",
+                ends.errors.keys()
+            );
+        }
+    }
+
+    #[test]
+    fn an_xz_file_reads_as_the_library_reads_it() {
+        use std::io::Write;
+        let mut strong = xz2::write::XzEncoder::new(Vec::new(), 6);
+        strong.write_all(&several_blocks()).expect("xz");
+        let strong = strong.finish().expect("xz");
+
+        let mut ends = Ends::default();
+        each_compressed_file(
+            "xz",
+            "tests/fixtures/pkg/data/txt_xz.txt.xz",
+            strong,
+            &mut ends,
+        );
+        assert!(ends.whole >= 100, "the sound files read: {}", ends.whole);
+        for text in [
+            "lzma data error",
+            "stream/file format not recognized",
+            "premature eof",
+            "corrupt xz stream",
+        ] {
+            assert!(
+                ends.saw(text),
+                "no damaged file gave {text:?}: {:?}",
+                ends.errors.keys()
+            );
+        }
+    }
+
+    /// Of everything a decoder can say, only that it has no memory ends the
+    /// run. Damage is still an error the reader reports.
+    #[test]
+    fn only_a_decoder_with_no_memory_is_told_apart() {
+        use xz2::stream::Error;
+        assert!(xz_has_no_memory(&Error::Mem.into()));
+        for other in [
+            Error::Data,
+            Error::Options,
+            Error::Format,
+            Error::MemLimit,
+            Error::Program,
+            Error::NoCheck,
+            Error::UnsupportedCheck,
+        ] {
+            assert!(!xz_has_no_memory(&other.clone().into()), "{other:?}");
+        }
+        assert!(!xz_has_no_memory(&std::io::Error::other(
+            "can't allocate memory"
+        )));
+        assert!(!xz_has_no_memory(&std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            bzip2::Error::Data
+        )));
+        assert!(!xz_has_no_memory(
+            &std::io::ErrorKind::UnexpectedEof.into()
+        ));
+    }
+
+    /// Fails every read the way the xz decoder does when it has no memory.
+    struct NoMemory;
+
+    impl std::io::Read for NoMemory {
+        fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+            Err(xz2::stream::Error::Mem.into())
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_xz_decoder_with_no_memory_ends_the_run() {
+        use crate::memory::child;
+        const ME: &str = "rds::tests::an_xz_decoder_with_no_memory_ends_the_run";
+        if child::is(ME) {
+            let got = std::io::Read::read(&mut Xz(NoMemory), &mut [0; 8]);
+            println!("the read came back: {got:?}");
+            return;
+        }
+        let said = child::aborted(ME);
+        assert!(
+            said.contains("memory allocation failed in the xz decoder"),
+            "{said}"
+        );
+    }
+
+    /// A table under each compression is the text it was, and a damaged one
+    /// is no table, as when the libraries' own readers decoded it.
+    #[test]
+    fn a_compressed_table_is_decoded_as_it_was() {
+        let was = |raw: &[u8]| {
+            whole_buffer::decompress(raw)
+                .ok()
+                .map(|(bytes, comp)| (String::from_utf8_lossy(&bytes).into_owned(), comp))
+        };
+        let (mut tables, mut refused) = (0, 0);
+        let mut same = |what: String, raw: &[u8]| match was(raw) {
+            None => {
+                assert_eq!(decompress_text(raw.to_vec()), None, "{what}");
+                refused += 1;
+            }
+            // A carriage return is folded afterwards, by a rule of its own.
+            Some((text, comp)) if text.contains('\r') => {
+                assert_eq!(decompress_text(raw.to_vec()).map(|t| t.1), Some(comp), "{what}");
+            }
+            Some(text) => {
+                assert_eq!(decompress_text(raw.to_vec()), Some(text), "{what}");
+                tables += 1;
+            }
+        };
+        for name in ["txt_gz.txt.gz", "txt_bz2.txt.bz2", "txt_xz.txt.xz"] {
+            let raw = std::fs::read(format!("tests/fixtures/pkg/data/{name}")).expect("the fixture");
+            same(name.to_string(), &raw);
+            for i in 0..raw.len() {
+                same(format!("{name} cut at {i}"), &raw[..i]);
+                for bit in 0..8 {
+                    let mut flipped = raw.clone();
+                    flipped[i] ^= 1 << bit;
+                    same(format!("{name} with bit {bit} of byte {i} flipped"), &flipped);
+                }
+            }
+        }
+        let long: String = (0..60_000)
+            .map(|i| format!("{i}\t{}\n", i * 37 % 1009))
+            .collect();
+        for how in ["gzip", "bzip2", "xz"] {
+            let packed = pack(long.as_bytes(), how);
+            same(format!("a long table, {how}"), &packed);
+            each_damaged(&packed, &spread_and_tail(packed.len(), 12), |what, bytes| {
+                same(format!("a long table, {how}, {what}"), bytes)
+            });
+        }
+        assert!(tables >= 6, "the sound tables read: {tables}");
+        assert!(refused >= 1000, "and the damaged ones do not: {refused}");
+    }
+
+    // ---- a text table, held to the reader that kept every row ----
+
+    type Table = (Vec<Node>, Vec<String>, usize);
+
+    /// Every separator a table is read under.
+    const SEPS: [char; 5] = [WS, ',', ';', '\t', '|'];
+
+    /// Where two readings of one table part, or nothing when they are the same.
+    fn table_difference(new: &Option<Table>, old: &Option<Table>) -> Option<String> {
+        match (new, old) {
+            (None, None) => None,
+            (Some(_), None) => Some("it is a table and it was refused".into()),
+            (None, Some(_)) => Some("it is refused and it was a table".into()),
+            (Some((c1, n1, r1)), Some((c2, n2, r2))) => {
+                if n1 != n2 {
+                    return Some(format!("the names are {n1:?} and were {n2:?}"));
+                }
+                if r1 != r2 {
+                    return Some(format!("{r1} rows against {r2}"));
+                }
+                if c1.len() != c2.len() {
+                    return Some(format!("{} columns against {}", c1.len(), c2.len()));
+                }
+                c1.iter()
+                    .zip(c2)
+                    .enumerate()
+                    .find_map(|(j, (a, b))| node_difference(a, b).map(|d| format!("column {j}{d}")))
+            }
+        }
+    }
+
+    /// One text under one separator, through both readers: the table, its
+    /// column count alone, and the table again when rows are too long for
+    /// their offsets. Returns what the reader that keeps every row made of it.
+    fn same_table(what: &str, text: &str, sep: char) -> Option<Table> {
+        let old = parse_table_by_row(text, sep);
+        let new = parse_table(text, sep);
+        if let Some(d) = table_difference(&new, &old) {
+            panic!("{what}, separator {sep:?}: {d}\n{text:?}");
+        }
+        assert_eq!(
+            table_ncol(text, sep),
+            old.as_ref().map(|t| t.1.len()),
+            "{what}, separator {sep:?}: the column count alone\n{text:?}"
+        );
+        for row_max in [0, 2, 7] {
+            let short = parse_table_within(text, sep, row_max);
+            if let Some(d) = table_difference(&short, &old) {
+                panic!("{what}, separator {sep:?}, rows of at most {row_max} bytes: {d}\n{text:?}");
+            }
+        }
+        // Its columns typed where they lie whatever its width, and listed
+        // first whatever its width.
+        for (how, in_place) in [("in place", usize::MAX), ("from a list", 0)] {
+            let typed = parse_table_typing(text, sep, ROW_MAX, in_place);
+            if let Some(d) = table_difference(&typed, &old) {
+                panic!("{what}, separator {sep:?}, columns typed {how}: {d}\n{text:?}");
+            }
+        }
+        old
+    }
+
+    /// How a run of comparisons came out, so a test can show it compared
+    /// tables of every kind and files that are not tables.
+    #[derive(Default)]
+    struct Tables {
+        read: usize,
+        refused: usize,
+        /// Tables of more than one column.
+        wide: usize,
+        whole: usize,
+        logical: usize,
+        real: usize,
+        text: usize,
+        missing: usize,
+    }
+
+    impl Tables {
+        fn add(&mut self, what: &str, text: &str) {
+            for sep in SEPS {
+                self.add_under(what, text, sep);
+            }
+        }
+        fn add_under(&mut self, what: &str, text: &str, sep: char) -> bool {
+            let Some((cols, _, _)) = same_table(what, text, sep) else {
+                self.refused += 1;
+                return false;
+            };
+            self.read += 1;
+            self.wide += (cols.len() > 1) as usize;
+            for col in &cols {
+                match &col.val {
+                    Val::Ints { vals, logical, .. } => {
+                        *if *logical { &mut self.logical } else { &mut self.whole } += 1;
+                        self.missing += vals.iter().filter(|v| **v == NA_INT).count();
+                    }
+                    Val::Reals { vals, .. } => {
+                        self.real += 1;
+                        self.missing += vals.iter().filter(|v| v.is_nan()).count();
+                    }
+                    Val::Str(vals) => {
+                        self.text += 1;
+                        self.missing += vals.iter().filter(|v| v.is_none()).count();
+                    }
+                    _ => panic!("{what}: a column of a type no text gives"),
+                }
+            }
+            true
+        }
+    }
+
+    /// The text of a file as it was made: copied whether or not its bytes
+    /// were valid, then folded.
+    fn text_by_copy(bytes: &[u8]) -> String {
+        let lossy = String::from_utf8_lossy(bytes);
+        if lossy.contains('\r') {
+            let folded = lossy.replace("\r\n", "\n");
+            if folded.contains('\n') { folded } else { folded.replace('\r', "\n") }
+        } else {
+            lossy.into_owned()
+        }
+    }
+
+    /// The text of bytes that are not compressed, which has to be the text
+    /// they gave before.
+    fn text_of(what: &str, bytes: &[u8]) -> String {
+        let (text, comp) = decompress_text(bytes.to_vec()).expect("plain bytes are text");
+        assert_eq!(comp, "none", "{what}");
+        assert_eq!(text, text_by_copy(bytes), "{what}");
+        text
+    }
+
+    #[test]
+    fn every_fixture_reads_as_the_table_by_row_read_it() {
+        let mut seen = Tables::default();
+        let mut files = 0;
+        for (name, raw) in fixture_files() {
+            // A serialized file is text as well, to a reader that is handed it.
+            let Some((text, _)) = decompress_text(raw) else { continue };
+            seen.add(&name, &text);
+            files += 1;
+        }
+        assert!(files >= 120, "the fixtures were read: {files}");
+        assert!(seen.read >= 300 && seen.wide >= 20, "the tables read: {} {}", seen.read, seen.wide);
+        assert!(seen.refused >= 200, "and what is not a table does not: {}", seen.refused);
+        // No fixture holds a column of TRUE and FALSE as text.
+        assert!(
+            seen.whole > 0 && seen.real > 0 && seen.text > 0 && seen.missing > 0,
+            "columns of numbers and of text, and missing values"
+        );
+    }
+
+    /// The lines of a table with `s` between its fields and `end` after each.
+    fn lines(of: &[&str], s: &str, end: &str) -> Vec<u8> {
+        of.iter()
+            .map(|l| l.replace("{s}", s) + end)
+            .collect::<String>()
+            .into_bytes()
+    }
+
+    /// One small table for each rule the reader has.
+    fn a_table_for_each_rule(s: &str) -> Vec<(&'static str, Vec<u8>)> {
+        const HEAD: &str = "id{s}name{s}val";
+        const BODY: [&str; 3] = ["1{s}x{s}1.5", "2{s}y{s}2.5", "3{s}z{s}3.5"];
+        let table = |first: &[&str], last: &[&str]| lines(&[first, &BODY[..], last].concat(), s, "\n");
+        let plain = table(&[HEAD], &[]);
+        let after = |first: &[u8]| [first, &plain[..]].concat();
+        let joined = |with: &str| [HEAD, BODY[0], BODY[1], BODY[2]].join(with).replace("{s}", s);
+        vec![
+            ("a short row", table(&[HEAD], &["4{s}w"])),
+            ("a long row", table(&[HEAD], &["4{s}w{s}4.5{s}extra"])),
+            ("a first row of the wrong width", lines(&[HEAD, "0{s}v{s}0.5{s}more{s}yet", BODY[0]], s, "\n")),
+            ("a header one field short", table(&["name{s}val"], &[])),
+            (
+                "separators inside quotes",
+                lines(&[HEAD, "1{s}\"a{s}b\"{s}1.5", "2{s}'c{s}d'{s}2.5", "3{s}\"e\"{s}3.5"], s, "\n"),
+            ),
+            (
+                "a quote that is not closed",
+                lines(&[HEAD, "1{s}it's{s}1.5", "2{s}\"open{s}2.5", "3{s}z{s}3.5"], s, "\n"),
+            ),
+            (
+                "a comment part way along a line",
+                lines(&[HEAD, "1{s}x{s}1.5 # trailing", "2{s}y{s}2.5#cut", "3{s}\"z#q\"{s}3.5"], s, "\n"),
+            ),
+            (
+                "a comment that shortens a row",
+                lines(&[HEAD, "1{s}x{s}1.5", "2{s}y # the rest is gone", "3{s}z{s}3.5"], s, "\n"),
+            ),
+            ("a comment as the first line", table(&["# a first line that reads as a comment", HEAD], &[])),
+            ("a header that starts as a comment", table(&["#id{s}name{s}val"], &[])),
+            ("lines that end in a carriage return", joined("\r").into_bytes()),
+            ("and a last one that does too", (joined("\r") + "\r").into_bytes()),
+            ("lines that end in both", (joined("\r\n") + "\r\n").into_bytes()),
+            (
+                "a carriage return before a line feed elsewhere",
+                (joined("\n").replacen('\n', "\r", 1) + "\n").into_bytes(),
+            ),
+            (
+                "a carriage return inside quotes",
+                lines(&[HEAD, "1{s}\"x\ry\"{s}1.5", "2{s}y{s}2.5", "3{s}z{s}3.5"], s, "\n"),
+            ),
+            ("blank first lines", after(b"\n  \n\t\n")),
+            ("first lines of spaces that do not break", after("\u{a0}\u{2003}\n\u{a0}\n".as_bytes())),
+            ("empty cells", lines(&[HEAD, "1{s}{s}1.5", "{s}y{s}", "3{s}z{s}3.5"], s, "\n")),
+            (
+                "every spelling of a missing value",
+                lines(
+                    &[
+                        "i{s}l{s}n{s}c",
+                        "0{s}NA{s}NA{s}NA",
+                        "1{s}na{s}na{s}na",
+                        "2{s}Na{s}Na{s}Na",
+                        "3{s}nA{s}nA{s}nA",
+                        "4{s}N/A{s}N/A{s}N/A",
+                        "5{s}.{s}.{s}.",
+                        "6{s}{s}{s}",
+                        "7{s}TRUE{s}1.5{s}txt",
+                        "8{s}FALSE{s}2{s}NA.",
+                    ],
+                    s,
+                    "\n",
+                ),
+            ),
+            (
+                "each column type",
+                lines(
+                    &[
+                        "int{s}lgl{s}num{s}chr{s}zero{s}exp{s}big{s}dot{s}tf{s}mix{s}minint",
+                        "1{s}TRUE{s}1.5{s}a{s}007{s}1e3{s}2147483647{s}1.{s}T{s}1{s}-2147483648",
+                        "2{s}F{s}inf{s}b{s}8{s}NaN{s}2147483648{s}2.{s}F{s}TRUE{s}5",
+                        "NA{s}NA{s}NA{s}NA{s}NA{s}NA{s}NA{s}NA{s}NA{s}NA{s}NA",
+                        "-3{s}true{s}-2{s}c{s}9{s}+4{s}-2147483648{s}3.{s}T{s}x{s}6",
+                    ],
+                    s,
+                    "\n",
+                ),
+            ),
+            (
+                "bytes that are not text",
+                [
+                    &lines(&[HEAD], s, "\n")[..],
+                    b"1",
+                    s.as_bytes(),
+                    b"caf\xe9",
+                    s.as_bytes(),
+                    b"1.5\n2",
+                    s.as_bytes(),
+                    b"\xff\xfe",
+                    s.as_bytes(),
+                    b"2.5\n",
+                ]
+                .concat(),
+            ),
+            ("a first line that is not text", after(b"\xff\n")),
+            ("a first line that is half a character", after(b"\xc2\n")),
+            ("a header and no row", lines(&[HEAD], s, "\n")),
+            ("nothing", Vec::new()),
+            ("only blank lines", b"\n \n\t\n".to_vec()),
+            ("one line with no line end", lines(&[HEAD], s, "")),
+            ("a header name that is empty", table(&["id{s}{s}val"], &[])),
+            ("header names that are rewritten", table(&["1st{s}_x{s}a-b.c"], &[])),
+            ("one column that another separator splits", b"a,b|c|d\n1,2|3|4\n5,6|7|8\n".to_vec()),
+        ]
+    }
+
+    #[test]
+    fn a_table_for_each_rule_reads_as_the_table_by_row_read_it() {
+        let mut seen = Tables::default();
+        let mut tables = 0;
+        for s in [",", ";", "\t", "|", " "] {
+            for (rule, bytes) in a_table_for_each_rule(s) {
+                let what = format!("{rule}, written with {s:?}");
+                seen.add(&what, &text_of(&what, &bytes));
+                tables += 1;
+            }
+        }
+        assert_eq!(tables, 150, "thirty rules under five separators");
+        assert!(seen.read >= 500 && seen.wide >= 100, "the tables read: {} {}", seen.read, seen.wide);
+        assert!(seen.refused >= 100, "and the rest do not: {}", seen.refused);
+        assert!(
+            seen.whole >= 100 && seen.logical >= 10 && seen.real >= 100 && seen.text >= 500,
+            "columns of every type"
+        );
+        assert!(seen.missing >= 100, "and missing values: {}", seen.missing);
+    }
+
+    /// What some of those rules come to, said outright.
+    #[test]
+    fn the_rules_of_a_table_are_the_ones_it_had() {
+        let read = |text: &str| parse_table(text, ',');
+        let strs = |col: &Node| match &col.val {
+            Val::Str(v) => v.clone(),
+            _ => panic!("not a text column"),
+        };
+        let ints = |col: &Node| match &col.val {
+            Val::Ints { vals, logical: false, .. } => vals.clone(),
+            _ => panic!("not a whole number column"),
+        };
+
+        // A header one field short: the first field of a row names the row.
+        let (cols, names, nrow) = read("name,val\n1,x,1.5\n2,y,2.5\n").expect("named rows");
+        assert_eq!((names, nrow, cols.len()), (vec!["name".to_string(), "val".into()], 2, 2));
+        assert_eq!(strs(&cols[0]), [Some("x".to_string()), Some("y".into())]);
+
+        // A first line that starts with # holds no field, so the first row
+        // of data is taken for the header.
+        let (cols, names, nrow) = read("#id,name,val\n1,x,1.5\n2,y,2.5\n3,z,3.5\n").expect("a table");
+        assert_eq!(names, ["X1", "x", "X1.5"]);
+        assert_eq!((nrow, ints(&cols[0])), (2, vec![2, 3]));
+
+        // Rows of different widths are no table, wherever the odd one is.
+        assert!(read("a,b\n1,2\n3\n").is_none());
+        assert!(read("a,b\n1\n2,3\n").is_none());
+        assert!(read("a,b\n1,2,3\n4,5\n").is_none());
+        assert!(read("a,b\n1,2,3\n4,5,6,7\n").is_none());
+        assert!(read("a,b\n1,2,3,4\n5,6,7,8\n").is_none());
+
+        // A separator inside quotes is part of the cell.
+        let (cols, _, _) = read("k,v\n1,\"a,b\"\n2,'c,d'\n").expect("quoted cells");
+        assert_eq!(strs(&cols[1]), [Some("a,b".to_string()), Some("c,d".into())]);
+
+        // A missing value is missing in a column of any type.
+        let (cols, _, _) = read("i,c\n1,x\nNA,N/A\n3,.\n").expect("missing values");
+        assert_eq!(ints(&cols[0]), [1, NA_INT, 3]);
+        assert_eq!(strs(&cols[1]), [Some("x".to_string()), None, None]);
+
+        // A file data() reads as one column, and the separators that split it.
+        assert_eq!(table_ncol("a,b|c|d\n1,2|3|4\n5,6|7|8\n", ';'), Some(1));
+        assert_eq!(table_ncol("a,b|c|d\n1,2|3|4\n5,6|7|8\n", ','), Some(2));
+        assert_eq!(table_ncol("a,b|c|d\n1,2|3|4\n5,6|7|8\n", '|'), Some(3));
+        assert_eq!(table_ncol("a,b|c|d\n1,2|3|4\n5,6|7|8\n", '\t'), Some(1));
+        // The count is of the header's fields, whether or not rows are named.
+        assert_eq!(table_ncol("name,val\n1,x,1.5\n", ','), Some(2));
+        assert_eq!(table_ncol("a,b\n", ','), None);
+        assert_eq!(table_ncol("a,b\n1,2\n3\n", ','), None);
+    }
+
+    /// A fixed run of numbers, so that a table that fails can be made again.
+    struct Dice(u64);
+
+    impl Dice {
+        fn roll(&mut self) -> u64 {
+            self.0 = self.0.wrapping_add(0x9e37_79b9_7f4a_7c15);
+            let mut z = self.0;
+            z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+            z ^ (z >> 31)
+        }
+        fn below(&mut self, n: usize) -> usize {
+            (self.roll() % n as u64) as usize
+        }
+        fn one_in(&mut self, n: usize) -> bool {
+            self.below(n) == 0
+        }
+        fn pick<'a>(&mut self, of: &[&'a [u8]]) -> &'a [u8] {
+            of[self.below(of.len())]
+        }
+    }
+
+    /// A table put together at random from what the rules are about: rows of
+    /// the wrong width, quotes closed and left open, separators inside
+    /// quotes, comments, each line ending, empty cells, each spelling of a
+    /// missing value, each column type, and bytes that are not text. Also
+    /// says whether its rows are named.
+    fn a_table(dice: &mut Dice) -> (Vec<u8>, bool) {
+        const BETWEEN: [&[u8]; 7] = [b",", b";", b"\t", b"|", b" ", b"  ", b" \t"];
+        const ENDS: [&[u8]; 3] = [b"\n", b"\r\n", b"\r"];
+        const NAMES: [&[u8]; 12] = [
+            b"id", b"name", b"val", b"1st", b"_x", b"a-b.c", b"", b"\"two words\"",
+            b"caf\xc3\xa9", b"V2", b".5", b"'q'",
+        ];
+        const MISSING: [&[u8]; 6] = [b"NA", b"na", b"N/A", b".", b"", b"Na"];
+        const WHOLE: [&[u8]; 6] = [b"1", b"-3", b"007", b"2147483647", b"-2147483648", b"+4"];
+        const LOGICAL: [&[u8]; 6] = [b"TRUE", b"FALSE", b"T", b"F", b"true", b"false"];
+        const REAL: [&[u8]; 8] = [b"1.5", b"-2", b"1e3", b"inf", b"NaN", b"1.", b"2147483648", b".5"];
+        const WORD: [&[u8]; 14] = [
+            b"a", b"b c", b"\"q,s\"", b"'q;s'", b"\"t\tu|v\"", b"it's", b"\"open", b"x#cut",
+            b"caf\xc3\xa9", b"\xc2\xa0", b"\"x\ry\"", b"\xff\xfe", b"\"\"", b" pad ",
+        ];
+        const ROW_NAMES: [&[u8]; 4] = [b"r1", b"r2", b"7", b"\"a row\""];
+        // A line that holds no row.
+        const STRAY: [&[u8]; 6] = [b"", b"  ", b"\t", b"# a comment", b"\xc2\xa0\xe2\x80\x83", b" # another"];
+
+        let between = dice.pick(&BETWEEN);
+        let end = dice.pick(&ENDS);
+        let mixed_ends = dice.one_in(8);
+        let ncol = 1 + dice.below(5);
+        let nrow = dice.below(7);
+        let kinds: Vec<usize> = (0..ncol).map(|_| dice.below(5)).collect();
+        let named_rows = dice.one_in(5);
+        // In some tables one row is a field short or a field long.
+        let odd_row = if nrow > 0 && dice.one_in(6) {
+            Some((dice.below(nrow), dice.one_in(2)))
+        } else {
+            None
+        };
+
+        let mut out = Vec::new();
+        let mut line = |dice: &mut Dice, fields: &[&[u8]], last: bool| {
+            if dice.one_in(6) {
+                out.extend_from_slice(dice.pick(&STRAY));
+                out.extend_from_slice(if mixed_ends { dice.pick(&ENDS) } else { end });
+            }
+            out.extend_from_slice(&fields.join(between));
+            if dice.one_in(10) {
+                out.extend_from_slice(b" # and a comment");
+            }
+            if !(last && dice.one_in(5)) {
+                out.extend_from_slice(if mixed_ends { dice.pick(&ENDS) } else { end });
+            }
+        };
+
+        let mut header: Vec<&[u8]> = (0..ncol).map(|_| dice.pick(&NAMES)).collect();
+        if dice.one_in(12) {
+            header[0] = b"#id";
+        }
+        line(dice, &header, nrow == 0);
+        for i in 0..nrow {
+            let mut row: Vec<&[u8]> = Vec::new();
+            if named_rows {
+                row.push(dice.pick(&ROW_NAMES));
+            }
+            for kind in &kinds {
+                row.push(if dice.one_in(6) {
+                    dice.pick(&MISSING)
+                } else {
+                    match kind {
+                        0 => dice.pick(&WHOLE),
+                        1 => dice.pick(&LOGICAL),
+                        2 => dice.pick(&REAL),
+                        3 => dice.pick(&WORD),
+                        _ => dice.pick(&[&WHOLE[..], &LOGICAL[..], &REAL[..], &WORD[..]].concat()),
+                    }
+                });
+            }
+            match odd_row {
+                Some((at, true)) if at == i => row.push(b"more"),
+                Some((at, false)) if at == i => {
+                    row.pop();
+                }
+                _ => {}
+            }
+            line(dice, &row, i + 1 == nrow);
+        }
+        (out, named_rows)
+    }
+
+    #[test]
+    fn a_generated_table_reads_as_the_table_by_row_read_it() {
+        let mut dice = Dice(20260);
+        let mut seen = Tables::default();
+        let (mut named, mut not_text, mut returns) = (0, 0, 0);
+        for i in 0..20_000 {
+            let (bytes, named_rows) = a_table(&mut dice);
+            let what = format!("table {i}");
+            let text = text_of(&what, &bytes);
+            not_text += std::str::from_utf8(&bytes).is_err() as usize;
+            returns += bytes.contains(&b'\r') as usize;
+            let mut read = false;
+            for sep in SEPS {
+                read |= seen.add_under(&what, &text, sep);
+            }
+            named += (read && named_rows) as usize;
+        }
+        assert!(seen.read >= 20_000 && seen.wide >= 5_000, "the tables read: {} {}", seen.read, seen.wide);
+        assert!(seen.refused >= 20_000, "and the rest do not: {}", seen.refused);
+        assert!(
+            seen.whole >= 2_000 && seen.logical >= 2_000 && seen.real >= 2_000 && seen.text >= 2_000,
+            "columns of every type: {} {} {} {}",
+            seen.whole,
+            seen.logical,
+            seen.real,
+            seen.text
+        );
+        assert!(seen.missing >= 5_000, "missing values: {}", seen.missing);
+        assert!(named >= 500, "tables whose rows are named: {named}");
+        assert!(not_text >= 500, "tables with bytes that are not text: {not_text}");
+        assert!(returns >= 5_000, "tables with a carriage return: {returns}");
+    }
+
+    /// The cells go into one run of bytes, a row after a row, and what is
+    /// kept beside them is where each one ends.
+    #[test]
+    fn the_cells_of_a_table_are_kept_once() {
+        let mut cells = Cells::new(ROW_MAX);
+        let (header, nrow) = table_shape("k,v\nr1,ab,c\n\nr2,,def\n", ',', |row| cells.push_row(row))
+            .expect("a table");
+        assert_eq!((header, nrow), (vec!["k".to_string(), "v".into()], 2));
+        // The field that names a row is not a cell.
+        assert_eq!(cells.bytes, "abcdef");
+        // An end is counted from where its row starts, and takes four bytes.
+        assert_eq!(cells.ends, [2u32, 3, 0, 3]);
+        assert_eq!(cells.rows, [0, 3]);
+        assert!(!cells.over);
+        assert_eq!(cells.column(0).collect::<Vec<_>>(), ["ab", ""]);
+        assert_eq!(cells.column(1).collect::<Vec<_>>(), ["c", "def"]);
+    }
+
+    /// An offset of four bytes cannot say where a cell ends in a row longer
+    /// than it counts. Such a table is read by keeping every row.
+    #[test]
+    fn a_row_too_long_for_its_offsets_is_read_by_row() {
+        assert_eq!(ROW_MAX, u32::MAX as usize, "as far as four bytes count");
+        let text = "a,b\n1,2\n333,4444\n5,6\n";
+        let fits = |row_max| {
+            let mut cells = Cells::new(row_max);
+            table_shape(text, ',', |row| cells.push_row(row)).expect("a table");
+            // What was kept of a table that does not fit is let go.
+            assert_eq!(cells.over, cells.bytes.is_empty() && cells.ends.is_empty() && cells.rows.is_empty());
+            !cells.over
+        };
+        assert!(fits(7), "the longest row is seven bytes");
+        assert!(!fits(6));
+        let by_row = parse_table_by_row(text, ',');
+        assert!(by_row.is_some());
+        for row_max in [6, 7] {
+            let read = parse_table_within(text, ',', row_max);
+            assert_eq!(table_difference(&read, &by_row), None, "rows of at most {row_max} bytes");
+        }
+    }
+
+    /// The row that settles a file is no table is the last one looked at, so
+    /// no row after it is handed on to be kept.
+    #[test]
+    fn no_row_is_kept_past_the_first_of_the_wrong_width() {
+        let handed = |text: &str| {
+            let mut rows = 0;
+            assert!(table_shape(text, ',', |_| rows += 1).is_none(), "{text:?}");
+            rows
+        };
+        assert_eq!(handed("a,b\n1,2\n3,4\n5\n6,7\n8,9\n"), 2);
+        assert_eq!(handed("a,b\nr,1,2\ns,3,4\n5,6\nt,7,8\n"), 2);
+        // A first row that fits neither the header nor a header and a name.
+        assert_eq!(handed("a,b\n1,2,3,4\n5,6\n7,8\n"), 0);
+        assert_eq!(handed("a,b\n1\n5,6\n7,8\n"), 0);
+        // A header and nothing under it is found out at the end.
+        assert_eq!(handed("a,b\n\n# only this\n"), 0);
+    }
+
+    /// Bytes that are valid text become the text. They are not copied.
+    #[test]
+    fn text_that_is_valid_is_taken_as_it_is() {
+        let raw = b"a,b\n1,2\n".to_vec();
+        let at = raw.as_ptr();
+        let (text, comp) = decompress_text(raw).expect("a text");
+        assert_eq!((text.as_str(), comp), ("a,b\n1,2\n", "none"));
+        assert_eq!(text.as_ptr(), at, "the bytes that were read are the text");
+        // Bytes that are not valid are replaced as they were.
+        assert_eq!(text_of("not text", b"a,b\n\xff,caf\xe9\n"), "a,b\n\u{fffd},caf\u{fffd}\n");
+        assert_eq!(text_of("both line ends", b"a\r\nb\rc\n"), "a\nb\rc\n");
+        assert_eq!(text_of("carriage returns alone", b"a\rb\xff\r"), "a\nb\u{fffd}\n");
+    }
+
+    // ---- the row sketch, held to the one made from a hash for every cell ----
+
+    thread_local! {
+        /// How many profiles this thread has had their sketch checked.
+        static SKETCHES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    /// The row sketch as it was made: a hash for every cell of every column,
+    /// all of them held until the last column was done, and folded then.
+    fn sketch_by_cell(cols: &[&Node]) -> Vec<String> {
+        let n = cols.iter().map(|c| col_len(c)).min().unwrap_or(0);
+        let mut cell_hashes: Vec<Vec<u64>> = Vec::with_capacity(cols.len());
+        let mut buf = Vec::new();
+        for col in cols {
+            let (_, is_factor, _) = base_type(col);
+            let pairs = attr_pairs(col);
+            let levels: Vec<Option<String>> = if is_factor {
+                attr(&pairs, "levels").map(opt_str_vec).unwrap_or_default()
+            } else {
+                Vec::new()
+            };
+            let mut ch = Vec::with_capacity(n);
+            for i in 0..n {
+                buf.clear();
+                push_cell(&mut buf, col, i, if is_factor { Some(&levels) } else { None });
+                ch.push(fnv(&buf));
+            }
+            cell_hashes.push(ch);
+        }
+        let mut row_hashes: Vec<u64> = Vec::with_capacity(n);
+        for i in 0..n {
+            let mut h = FNV_OFFSET;
+            for col in &cell_hashes {
+                h ^= col[i];
+                h = h.wrapping_mul(FNV_PRIME);
+            }
+            row_hashes.push(h);
+        }
+        row_hashes.sort_unstable();
+        row_hashes.dedup();
+        row_hashes.truncate(SKETCH_K);
+        row_hashes.iter().map(|h| format!("{h:016x}")).collect()
+    }
+
+    /// Every profile made while a test runs is handed over here, so each one
+    /// is held to the sketch its cell hashes give, whichever test asked for it.
+    pub(super) fn sketch_made(cols: &[&Node], sketch: &[String]) {
+        assert_eq!(sketch, sketch_by_cell(cols), "the row sketch of {} columns", cols.len());
+        SKETCHES.with(|n| n.set(n.get() + 1));
+    }
+
+    fn sketches_checked() -> usize {
+        SKETCHES.with(|n| n.get())
+    }
+
+    #[test]
+    fn every_fixture_has_the_sketch_its_cell_hashes_give() {
+        let before = sketches_checked();
+        let recs = records();
+        let checked = sketches_checked() - before;
+        let sketched = recs
+            .iter()
+            .filter(|r| r["row_sketch"].as_array().is_some_and(|s| !s.is_empty()))
+            .count();
+        assert_eq!(sketched, 81, "the fixtures that carry a sketch");
+        assert!(checked >= sketched, "and each was checked: {checked}");
+    }
+
+    /// The sketch of one fixture, as it was made from a hash for every cell.
+    const NA_AND_NAN: [&str; 12] = [
+        "1a546808ac0fe3d1", "264352cca17fad11", "2dd237e8ededc6ad", "43cc90c1ad50b617",
+        "4415fb36025ff4e7", "4c5f6c73520d796a", "5905c096881acf57", "5ddc4dcf14291d43",
+        "611dfd9518ad13b9", "d26fb7ff9826d4bb", "d45ec69fd21738a3", "e98e47dd461006b8",
+    ];
+
+    /// One hash over the sketch of every fixture, made the same way.
+    const EVERY_FIXTURE_SKETCH: &str =
+        "d34353c4260f1f5736954c52df10cb6c68a8377ba2ba181eff492f9b48624420";
+
+    /// The sketches of the fixtures are the ones they had, to the last digit.
+    #[test]
+    fn the_sketch_of_a_fixture_is_the_one_it_had() {
+        let recs = records();
+        let sketch = |name: &str| -> Vec<String> {
+            let r = recs.iter().find(|r| r["name"] == name).expect("the fixture");
+            let s = r["row_sketch"].as_array().expect("a sketch");
+            s.iter().map(|h| h.as_str().expect("a hash").to_string()).collect()
+        };
+        // Four columns, two of them with values missing.
+        assert_eq!(sketch("na_and_nan"), NA_AND_NAN);
+        // A hundred rows, of which the 32 smallest hashes are kept.
+        assert_eq!(sketch("real_datatable").len(), SKETCH_K);
+        // A hundred rows and seven different ones.
+        assert_eq!(sketch("shape_kinds").len(), 7);
+        let mut all = blake3::Hasher::new();
+        for r in &recs {
+            if let Some(s) = r["row_sketch"].as_array() {
+                all.update(r["name"].as_str().unwrap_or_default().as_bytes());
+                for h in s {
+                    all.update(h.as_str().expect("a hash").as_bytes());
+                }
+                all.update(b"\n");
+            }
+        }
+        assert_eq!(all.finalize().to_hex().as_str(), EVERY_FIXTURE_SKETCH);
+    }
+
+    /// Frames no fixture has: no rows, one row, rows that repeat, a factor,
+    /// a column of each type with values missing, and a column longer than
+    /// the frame is tall.
+    #[test]
+    fn a_frame_built_by_hand_has_the_sketch_its_cell_hashes_give() {
+        let ints = |v: &[i32]| Node { val: Val::Ints { len: v.len(), vals: v.to_vec(), logical: false }, attr: None };
+        let reals = |v: &[f64]| Node { val: Val::Reals { len: v.len(), vals: v.to_vec() }, attr: None };
+        let strs = |v: &[Option<&str>]| Node {
+            val: Val::Str(v.iter().map(|s| s.map(str::to_string)).collect()),
+            attr: None,
+        };
+        let name = |j: usize| format!("c{j}");
+        let profiled = |cols: &[Node]| -> Vec<String> {
+            let refs: Vec<&Node> = cols.iter().collect();
+            let names: Vec<String> = (0..cols.len()).map(name).collect();
+            let before = sketches_checked();
+            let p = profile_columns(&refs, &names).expect("a profile");
+            assert_eq!(sketches_checked(), before + 1, "the sketch was checked");
+            p.row_sketch
+        };
+
+        assert!(profiled(&[ints(&[]), strs(&[])]).is_empty(), "no rows, no sketch");
+        assert_eq!(profiled(&[ints(&[7])]).len(), 1);
+        // Rows that are the same hash the same, and are kept once.
+        let twice = [ints(&[1, 2, 1, 2, 1]), strs(&[Some("a"), Some("b"), Some("a"), Some("b"), Some("a")])];
+        assert_eq!(profiled(&twice).len(), 2);
+        // The same cells in other columns are other rows.
+        let a = profiled(&[ints(&[1, 2]), ints(&[3, 4])]);
+        let b = profiled(&[ints(&[3, 4]), ints(&[1, 2])]);
+        assert_ne!(a, b, "the order of the columns is part of a row");
+        // A missing value in each type, a NaN, and both zeros.
+        let gaps = [
+            ints(&[1, NA_INT, 3, 4]),
+            reals(&[0.0, -0.0, f64::NAN, 2.5]),
+            strs(&[Some("x"), None, Some(""), Some("y")]),
+        ];
+        assert_eq!(profiled(&gaps).len(), 4);
+        // A column of six cells in a frame of three rows.
+        let tall = [ints(&[1, 2, 3]), reals(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0])];
+        assert_eq!(profiled(&tall).len(), 3);
+        // More rows than the sketch keeps.
+        let long: Vec<i32> = (0..500).collect();
+        let halves: Vec<f64> = long.iter().map(|v| *v as f64 / 2.0).collect();
+        assert_eq!(profiled(&[ints(&long), reals(&halves)]).len(), SKETCH_K);
+    }
+
+    /// Tables made at random, each profiled under every separator it reads
+    /// under, which checks the sketch of each.
+    #[test]
+    fn a_generated_table_has_the_sketch_its_cell_hashes_give() {
+        let mut dice = Dice(1954);
+        let before = sketches_checked();
+        let mut rows = 0;
+        for _ in 0..4_000 {
+            let (bytes, _) = a_table(&mut dice);
+            let text = text_by_copy(&bytes);
+            for sep in SEPS {
+                let Some((cols, names, nrow)) = parse_table(&text, sep) else { continue };
+                let refs: Vec<&Node> = cols.iter().collect();
+                let p = profile_columns(&refs, &names).expect("a table profiles");
+                assert!(p.row_sketch.len() <= nrow.min(SKETCH_K));
+                rows += nrow;
+            }
+        }
+        let checked = sketches_checked() - before;
+        assert!(checked >= 10_000, "the tables profiled: {checked}");
+        assert!(rows >= 30_000, "and their rows: {rows}");
+    }
+
+    /// The scan as it was made: every record of the package held until the
+    /// last file was read, and handed back together.
+    fn scan_package_held(root: &Path, excluded: &BTreeSet<String>) -> Vec<Value> {
+        let mut out = Vec::new();
+        let mut targets: Vec<(std::path::PathBuf, bool)> = Vec::new();
+        let docs = rd_dataset_docs(root, excluded);
+        if let Ok(rd) = crate::memory::read_dir(root.join("data")) {
+            let mut paths: Vec<_> = rd.flatten().map(|e| e.path()).collect();
+            paths.sort();
+            let mut best: std::collections::BTreeMap<String, (usize, std::path::PathBuf)> =
+                Default::default();
+            for p in paths {
+                let fname = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                if excluded.contains(&rel_path(root, &p)) {
+                    continue;
+                }
+                let Some(rank) = data_ext_rank(fname) else { continue };
+                let name = dataset_name(fname);
+                match best.get(&name) {
+                    Some((r, _)) if *r <= rank => {}
+                    _ => {
+                        best.insert(name, (rank, p));
+                    }
+                }
+            }
+            for (_, (_, p)) in best {
+                targets.push((p, false));
+            }
+        }
+        let sys = root.join("R").join("sysdata.rda");
+        if sys.exists() && !excluded.contains("R/sysdata.rda") {
+            targets.push((sys, true));
+        }
+        let n_loadable = targets.len();
+        let mut extra: Vec<std::path::PathBuf> = Vec::new();
+        let ext_root = {
+            let src = root.join("inst").join("extdata");
+            if src.is_dir() { src } else { root.join("extdata") }
+        };
+        walk_extdata(root, excluded, &ext_root, EXTDATA_DEPTH, &mut extra);
+        for p in extra {
+            targets.push((p, false));
+        }
+
+        for (i, (path, internal)) in targets.into_iter().enumerate() {
+            let fname = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            let lower = fname.to_lowercase();
+            let from_extdata = i >= n_loadable;
+            let origin_dir = if from_extdata {
+                "extdata"
+            } else if internal {
+                "sysdata"
+            } else {
+                "data"
+            };
+            let rel = if from_extdata {
+                let tail = path
+                    .strip_prefix(&ext_root)
+                    .map(|r| r.to_string_lossy().replace('\\', "/"))
+                    .unwrap_or_else(|_| fname.to_string());
+                format!("inst/extdata/{tail}")
+            } else {
+                format!("{}/{}", if internal { "R" } else { "data" }, fname)
+            };
+            let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+            let name = dataset_name(fname);
+
+            let is_rbin = lower.ends_with(".rda") || lower.ends_with(".rdata");
+            let is_script = lower.ends_with(".r");
+            let is_text = !is_rbin && text_data_sep(fname).is_some();
+
+            let (is_rbin, is_script, is_text) = if from_extdata {
+                if size > EXTDATA_PARSE_LIMIT {
+                    continue;
+                }
+                if !extdata_is_readable(&lower) {
+                    continue;
+                }
+                let bin = lower.ends_with(".rds") || lower.ends_with(".rda") || lower.ends_with(".rdata");
+                let txt = !bin;
+                (bin, false, txt)
+            } else {
+                (is_rbin, is_script, is_text)
+            };
+
+            let before = out.len();
+            if is_rbin {
+                match read_file(&path) {
+                    Ok(recs) => {
+                        for (nm, node, fmt, ver, comp) in recs {
+                            let nm = if nm.is_empty() { name.clone() } else { nm };
+                            out.push(describe(&nm, &rel, &node, &fmt, ver, &comp, internal, size));
+                        }
+                    }
+                    Err(e) => out.push(json!({
+                        "rec": "dataset", "name": name, "file": rel,
+                        "internal": internal, "compressed_bytes": size,
+                        "confidence": "degraded", "notes": e
+                    })),
+                }
+            } else if is_script {
+                out.push(json!({
+                    "rec": "dataset", "name": name, "file": rel, "format": "script",
+                    "internal": internal, "compressed_bytes": size,
+                    "confidence": "needs_r", "notes": "R script data (requires R)"
+                }));
+            } else if is_text {
+                let read = if from_extdata { read_text_free(&path) } else { read_text(&path, fname) };
+                match read {
+                    Some((cols, names, nrow, fmt, comp, alt)) => {
+                        let refs: Vec<&Node> = cols.iter().collect();
+                        let mut rec = json!({
+                            "rec": "dataset", "name": name, "file": rel, "format": fmt,
+                            "compression": comp, "compressed_bytes": size, "internal": internal,
+                            "class": "data.frame", "kind": "table", "nrow": nrow,
+                            "ncol": names.len(), "confidence": "degraded",
+                            "notes": "text: column types inferred"
+                        });
+                        if let Some((c, n)) = alt {
+                            rec["delimiter_looks_like"] =
+                                json!(if c == '\t' { "tab".to_string() } else { c.to_string() });
+                            rec["delimiter_would_give_ncol"] = json!(n as i64);
+                        }
+                        if let Some(p) = profile_columns(&refs, &names) {
+                            attach_profile(&mut rec, p, &refs);
+                        }
+                        out.push(rec);
+                    }
+                    None => out.push(json!({
+                        "rec": "dataset", "name": name, "file": rel,
+                        "internal": internal, "compressed_bytes": size,
+                        "confidence": "degraded", "notes": "text: data() cannot load this file"
+                    })),
+                }
+            }
+            for r in out[before..].iter_mut() {
+                r["origin_dir"] = json!(origin_dir);
+                let doc = r.get("name").and_then(|n| n.as_str()).and_then(|n| docs.get(n));
+                if let Some(t) = doc.and_then(|d| d.title.as_ref()) {
+                    r["title"] = json!(t);
+                }
+                let loadable = origin_dir == "data";
+                r["dataset_doc_source"] = json!(doc.filter(|_| loadable).and_then(|d| d.source.clone()));
+                r["dataset_doc_format"] = json!(doc.filter(|_| loadable).map(|d| d.has_format as i64));
+            }
+        }
+        out
+    }
+
+    /// A package tree under the temp directory, removed when dropped.
+    struct TempPackage(std::path::PathBuf);
+
+    impl TempPackage {
+        fn new(tag: &str) -> TempPackage {
+            let root = std::env::temp_dir().join(format!("rpkg-each-{tag}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&root);
+            std::fs::create_dir_all(&root).expect("make the package");
+            TempPackage(root)
+        }
+        fn write(&self, rel: &str, bytes: &[u8]) {
+            let p = self.0.join(rel);
+            std::fs::create_dir_all(p.parent().expect("a parent")).expect("make its directory");
+            std::fs::write(p, bytes).expect("write a file");
+        }
+        /// A file of the fixture package, under another path here.
+        fn fixture(&self, from: &str, to: &str) {
+            let bytes = std::fs::read(Path::new("tests/fixtures/pkg").join(from)).expect("read a fixture");
+            self.write(to, &bytes);
+        }
+    }
+
+    impl Drop for TempPackage {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// Some of the fixtures as an installed package keeps them, with what the
+    /// fixture package lacks: internal data, a data script and a file cut short.
+    fn rearranged_package() -> TempPackage {
+        let t = TempPackage::new("rearranged");
+        for f in ["v1_ascii_frame.rda", "plain_frame.rda", "altrep_frame.rda", "csv_comma.csv", "ws_ragged.tab"] {
+            t.fixture(&format!("data/{f}"), &format!("data/{f}"));
+        }
+        t.fixture("data/notdata.rds", "data/notdata.rds");
+        t.write("data/made.R", b"made <- data.frame(x = 1)\n");
+        let cut = std::fs::read("tests/fixtures/pkg/data/mixed_compiled.rda").expect("read a fixture");
+        t.write("data/cut_short.rda", &cut[..cut.len() / 2]);
+        t.fixture("data/mixed_builtin.rda", "R/sysdata.rda");
+        t.fixture("man/altrep_frame.Rd", "man/altrep_frame.Rd");
+        for f in ["ext_comma.csv", "ext_ignored.xlsx", "ext_object.rds", "ext_tabbed.tsv", "nested/ext_nested.csv"] {
+            t.fixture(&format!("inst/extdata/{f}"), &format!("extdata/{f}"));
+        }
+        t
+    }
+
+    fn left_out(files: &[&str]) -> BTreeSet<String> {
+        files.iter().map(|f| f.to_string()).collect()
+    }
+
+    fn printed(recs: &[Value]) -> Vec<String> {
+        recs.iter().map(Value::to_string).collect()
+    }
+
+    /// The records handed over a file at a time are the records the scan held
+    /// to its end, in the same order, and collected they are the same again.
+    #[test]
+    fn each_file_hands_over_what_the_whole_scan_held() {
+        let rearranged = rearranged_package();
+        let empty = TempPackage::new("empty");
+        let fixture = Path::new("tests/fixtures/pkg");
+        let cases: [(&str, &Path, BTreeSet<String>, usize); 6] = [
+            ("the fixtures", fixture, left_out(&[]), 127),
+            (
+                "the fixtures with files left out",
+                fixture,
+                left_out(&[
+                    "data/one_per_name.rda",
+                    "data/altrep_frame.rda",
+                    "man/altrep_frame.Rd",
+                    "inst/extdata/ext_comma.csv",
+                ]),
+                125,
+            ),
+            ("an installed tree", &rearranged.0, left_out(&[]), 15),
+            (
+                "an installed tree with files left out",
+                &rearranged.0,
+                left_out(&["R/sysdata.rda", "data/plain_frame.rda", "extdata/nested/ext_nested.csv"]),
+                11,
+            ),
+            ("a package with no data", &empty.0, left_out(&[]), 0),
+            ("a directory that is not there", Path::new("tests/fixtures/pkg/absent"), left_out(&[]), 0),
+        ];
+        for (what, root, excluded, n) in cases {
+            let held = scan_package_held(root, &excluded);
+            assert_eq!(held.len(), n, "{what}: records");
+            let mut handed = Vec::new();
+            scan_package_each(root, &excluded, &mut |rec| handed.push(rec));
+            assert_eq!(printed(&handed), printed(&held), "{what}: handed over");
+            assert_eq!(printed(&scan_package(root, &excluded)), printed(&held), "{what}: collected");
+        }
+        // What the installed tree adds is there to be compared.
+        let recs = scan_package_held(&rearranged.0, &left_out(&[]));
+        let of = |file: &str| -> Vec<&Value> { recs.iter().filter(|r| r["file"] == file).collect() };
+        assert_eq!(of("data/v1_ascii_frame.rda").len(), 3, "a file of several objects");
+        assert_eq!(of("R/sysdata.rda").len(), 2);
+        assert!(of("R/sysdata.rda").iter().all(|r| r["origin_dir"] == "sysdata" && r["internal"] == true));
+        assert_eq!(of("data/made.R")[0]["format"], "script");
+        assert_eq!(of("data/cut_short.rda")[0]["confidence"], "degraded");
+        assert_eq!(of("data/ws_ragged.tab")[0]["notes"], "text: data() cannot load this file");
+        assert_eq!(of("data/plain_frame.rda")[0]["title"], "Readings from the `example` instrument");
+        assert_eq!(recs.iter().filter(|r| r["origin_dir"] == "extdata").count(), 4);
+    }
+
+    /// A file's records are handed over before the next file is opened: a
+    /// file changed while the one before it is handed over is read as changed.
+    #[test]
+    fn a_file_is_handed_over_before_the_next_is_read() {
+        let t = TempPackage::new("in-turn");
+        t.fixture("data/v1_ascii_frame.rda", "data/a_first.rda");
+        t.write("data/b_second.csv", b"x;y\n1;2\n");
+        t.write("extdata/c_third.csv", b"x,y\n1,2\n");
+        let mut handed: Vec<Value> = Vec::new();
+        scan_package_each(&t.0, &BTreeSet::new(), &mut |rec| {
+            let next = match rec["file"].as_str() {
+                Some("data/a_first.rda") => Some(("data/b_second.csv", "3;4\n")),
+                Some("data/b_second.csv") => Some(("extdata/c_third.csv", "3,4\n")),
+                _ => None,
+            };
+            if let Some((next, row)) = next {
+                // One row longer each time a record of the file before it arrives.
+                let grown = std::fs::read_to_string(t.0.join(next)).expect("read the next file") + row;
+                t.write(next, grown.as_bytes());
+            }
+            handed.push(rec);
+        });
+        let files: Vec<&str> = handed.iter().map(|r| r["file"].as_str().unwrap()).collect();
+        assert_eq!(
+            files,
+            ["data/a_first.rda", "data/a_first.rda", "data/a_first.rda", "data/b_second.csv", "inst/extdata/c_third.csv"]
+        );
+        assert_eq!(handed[3]["nrow"], 4, "all three objects of the first file came before the second was read");
+        assert_eq!(handed[4]["nrow"], 2, "and the one record of the second before the third was");
+        // Held to the end, the same scan reads every file as it was first written.
+        let t = TempPackage::new("in-turn-held");
+        t.fixture("data/v1_ascii_frame.rda", "data/a_first.rda");
+        t.write("data/b_second.csv", b"x;y\n1;2\n");
+        t.write("extdata/c_third.csv", b"x,y\n1,2\n");
+        let held = scan_package_held(&t.0, &BTreeSet::new());
+        assert_eq!((held[3]["nrow"].clone(), held[4]["nrow"].clone()), (json!(1), json!(1)));
+    }
+
+    /// What `read` keeps, counted on a thread of its own, where nothing else
+    /// has been read.
+    fn kept_reading(read: impl FnOnce() + Send + 'static) -> Kept {
+        std::thread::spawn(move || {
+            read();
+            kept()
+        })
+        .join()
+        .expect("the read")
+    }
+
+    /// glibc gives a block eight bytes more than was asked, rounded up to
+    /// sixteen, and never under 32. The other 24 are the string's place in
+    /// its vector.
+    #[test]
+    fn a_string_is_counted_at_the_block_it_is_given() {
+        for (n, block) in [(0, 32), (1, 32), (24, 32), (25, 48), (40, 48), (41, 64), (1000, 1008)] {
+            assert_eq!(string_kept(n), 24 + block, "{n} bytes");
+        }
+    }
+
+    #[test]
+    fn a_serialized_file_is_counted_as_it_is_read() {
+        // A list of three integers, two reals and two strings, one missing:
+        // six objects.
+        let mut w = Wire::rds();
+        w.head(VECSXP).int(3).ints(&[1, 2, 3]).reals(&[1.0, 2.0]);
+        w.head(STRSXP).int(2).chars(b"a").head(CHARSXP).int(-1);
+        let want = 6 * 48 + 3 * 4 + 2 * 8 + string_kept(1);
+        for how in PACKINGS {
+            let packed = pack(&w.0, how);
+            let counted = kept_reading(move || assert_eq!(read_bytes(&packed).map(|o| o.len()), Ok(1)));
+            assert_eq!(counted, Kept { max: want, over: 0 }, "{how}");
+        }
+        // A string is counted as the text it became, which in Latin-1 is longer.
+        let mut w = Wire::rds();
+        w.int(CHARSXP as i32 | LATIN1_MASK << 12).int(30);
+        w.0.extend_from_slice(&[0xe8; 30]);
+        let latin1 = w.0;
+        let counted = kept_reading(move || assert!(read_bytes(&latin1).is_ok()));
+        assert_eq!(counted.max, 48 + string_kept(60));
+    }
+
+    /// The count is of what is kept. A vector past the cell cap is hashed and
+    /// gone, and one at the cap is held.
+    #[test]
+    fn a_vector_the_cap_passes_over_is_not_counted() {
+        let ints = |n: usize| {
+            let mut w = Wire::rds();
+            w.head(INTSXP).int(n as i32);
+            w.0.resize(w.0.len() + 4 * n, 0);
+            w.0
+        };
+        let reals = |n: usize| {
+            let mut w = Wire::rds();
+            w.head(REALSXP).int(n as i32);
+            w.0.resize(w.0.len() + 8 * n, 0);
+            w.0
+        };
+        for (what, stream, want) in [
+            ("integers at the cap", ints(CELL_CAP), 48 + 4 * CELL_CAP as u64),
+            ("integers past it", ints(CELL_CAP + 1), 48),
+            ("reals at the cap", reals(CELL_CAP), 48 + 8 * CELL_CAP as u64),
+            ("reals past it", reals(CELL_CAP + 1), 48),
+        ] {
+            let counted = kept_reading(move || assert!(read_bytes(&stream).is_ok()));
+            assert_eq!(counted, Kept { max: want, over: 0 }, "{what}");
+        }
+    }
+
+    /// A sequence is three numbers in the file and a vector once it is read.
+    #[test]
+    fn a_compact_sequence_is_counted_as_the_vector_it_becomes() {
+        let seq = |class: &str, n: usize| {
+            let mut w = Wire::rds();
+            w.altrep(class).reals(&[n as f64, 1.0, 1.0]).nil();
+            let stream = w.0;
+            kept_reading(move || assert!(read_bytes(&stream).is_ok())).max
+        };
+        for (class, cell) in [("compact_intseq", 4), ("compact_realseq", 8)] {
+            let none = seq(class, 0);
+            assert!(none > 0, "{class}");
+            assert_eq!(seq(class, 1000) - none, 1000 * cell, "{class}");
+            assert_eq!(seq(class, CELL_CAP) - none, CELL_CAP as u64 * cell, "{class} at the cap");
+            assert_eq!(seq(class, CELL_CAP + 1), none, "{class} past the cap keeps no cell");
+        }
+    }
+
+    /// A file that is refused kept what it kept up to there.
+    #[test]
+    fn a_read_that_fails_is_still_counted() {
+        // A list of one object more than the budget allows.
+        let mut w = Wire::rds();
+        w.head(VECSXP).int(ITEM_BUDGET as i32);
+        let empty = (NILVALUE as i32).to_be_bytes().repeat(ITEM_BUDGET as usize);
+        w.0.extend_from_slice(&empty);
+        let stream = w.0;
+        let counted = kept_reading(move || {
+            assert_eq!(read_bytes(&stream).err().as_deref(), Some("item budget exceeded"));
+        });
+        assert_eq!(counted, Kept { max: 48 * ITEM_BUDGET as u64, over: 0 });
+        // A vector that ends early was given its room before that was known.
+        let mut w = Wire::rds();
+        w.ints(&[1, 2, 3]);
+        w.0.truncate(w.0.len() - 4);
+        let stream = w.0;
+        let counted = kept_reading(move || {
+            assert_eq!(read_bytes(&stream).err().as_deref(), Some("truncated stream"));
+        });
+        assert_eq!(counted.max, 48 + 3 * 4);
+    }
+
+    /// The format from before R 1.4.0 is counted once its objects are built,
+    /// at the same sizes.
+    #[test]
+    fn the_old_text_format_is_counted_when_it_is_built() {
+        let ints = Node { val: Val::Ints { len: 3, vals: vec![1, 2, 3], logical: false }, attr: None };
+        let reals = Node { val: Val::Reals { len: 2, vals: vec![1.0, 2.0] }, attr: None };
+        let text = Node { val: Val::Str(vec![Some("ab".into()), None]), attr: None };
+        let names = Node { val: Val::Str(vec![Some("x".into()), Some("y".into()), Some("z".into())]), attr: None };
+        let frame = Node { val: Val::Vec(vec![ints, reals, text]), attr: Some(Box::new(names)) };
+        let want = 48
+            + (48 + 3 * 4)
+            + (48 + 2 * 8)
+            + (48 + (48 + string_kept(2)) + 48)
+            + (48 + 3 * (48 + string_kept(1)));
+        assert_eq!(node_kept(&frame), want);
+        let symbol = Node { val: Val::Sym("name".into()), attr: None };
+        let nothing = || Box::new(Node { val: Val::Nil, attr: None });
+        assert_eq!(node_kept(&symbol), 48 + string_kept(4));
+        let cell = Node { val: Val::List { tag: Box::new(symbol), car: nothing(), cdr: nothing() }, attr: None };
+        assert_eq!(node_kept(&cell), 48 + (48 + string_kept(4)) + 48 + 48);
+
+        let raw = std::fs::read("tests/fixtures/pkg/data/v1_ascii_frame.rda").expect("the fixture");
+        let objects = read_bytes(&raw).expect("the fixture reads");
+        let want: u64 = objects.iter().map(|(_, node, ..)| node_kept(node)).sum();
+        assert!(want > 48 * objects.len() as u64, "{want}");
+        let counted = kept_reading(move || assert!(read_bytes(&raw).is_ok()));
+        assert_eq!(counted, Kept { max: want, over: 0 });
+    }
+
+    /// A table read from text is its typed columns and sixteen bytes a row,
+    /// or thirty-two where a column's cells are listed to type it.
+    #[test]
+    fn a_text_table_is_counted_by_its_columns_and_its_rows() {
+        let (cols, names, nrow) = parse_table("a;bb;c\n1;x;1.5\n2;;2.5\n", ';').expect("a table");
+        // An object and a name a column, then two integers, a string and a
+        // missing one, and two reals.
+        let columns = 3 * 48 + 2 * string_kept(1) + string_kept(2);
+        let cells = 2 * 4 + (string_kept(1) + 24) + 2 * 8;
+        assert_eq!(table_kept(&cols, &names, nrow), columns + cells + 2 * 16);
+
+        let wide = |ncol: usize| {
+            let row = vec!["7"; ncol].join(";");
+            let header = (0..ncol).map(|j| format!("v{j}")).collect::<Vec<_>>().join(";");
+            let (cols, names, nrow) = parse_table(&format!("{header}\n{row}\n{row}\n"), ';').expect("a table");
+            table_kept(&cols, &names, nrow)
+        };
+        let a_column = 48 + string_kept(3) + 2 * 4;
+        assert_eq!(wide(IN_PLACE), IN_PLACE as u64 * a_column + 2 * 16);
+        assert_eq!(wide(IN_PLACE + 1), (IN_PLACE as u64 + 1) * a_column + 2 * 32);
+    }
+
+    /// The scan counts each file once, and the figure is the largest file's
+    /// and not the sum. A text file that is no table kept nothing.
+    #[test]
+    fn a_run_counts_its_largest_file() {
+        let t = TempPackage::new("kept");
+        t.write("data/small.csv", b"a;b\n1;2\n");
+        t.write("data/large.csv", b"a;b\n1;2\n3;4\n5;6\n");
+        t.write("data/ragged.csv", b"a;b\n1;2\n3\n");
+        t.write("inst/extdata/free.csv", b"a,b\n1,2\n3,4\n");
+        let a_table = |rows: u64| 2 * (48 + string_kept(1) + 4 * rows) + 16 * rows;
+        let scanned = |root: &Path, records: usize| {
+            let root = root.to_path_buf();
+            kept_reading(move || {
+                let mut handed = 0;
+                scan_package_each(&root, &BTreeSet::new(), &mut |_| handed += 1);
+                assert_eq!(handed, records);
+            })
+        };
+        assert_eq!(scanned(&t.0, 4), Kept { max: a_table(3), over: 0 });
+        // A file outside data/ is read by other rules and counted the same.
+        t.write("inst/extdata/free.csv", b"a,b\n1,2\n3,4\n5,6\n7,8\n");
+        assert_eq!(scanned(&t.0, 4), Kept { max: a_table(4), over: 0 });
+
+        let alone = TempPackage::new("kept-alone");
+        alone.write("data/ragged.csv", b"a;b\n1;2\n3\n");
+        assert_eq!(scanned(&alone.0, 1), Kept::default());
+
+        let serialized = TempPackage::new("kept-serialized");
+        serialized.fixture("data/plain_frame.rda", "data/plain_frame.rda");
+        serialized.write("data/small.csv", b"a;b\n1;2\n");
+        let counted = scanned(&serialized.0, 2);
+        assert!(counted.max > a_table(1), "{counted:?}");
+        assert_eq!(counted.over, 0);
+    }
+
+    /// A file is over at one byte past 1,536 MiB, a text table at one row
+    /// past eight million, and a file that is both is one file.
+    #[test]
+    fn a_file_past_a_line_is_counted_as_over_once() {
+        assert_eq!(KEPT_BUDGET, 1_610_612_736);
+        assert_eq!(ROW_BUDGET, 8_000_000);
+        // The README gives the two lines as these numbers.
+        let readme = std::fs::read_to_string("README.md").expect("read README.md");
+        for line in ["1,610,612,736 bytes", "8,000,000 rows"] {
+            assert!(readme.contains(line), "the README does not say {line}");
+        }
+        let counted = kept_reading(|| {
+            file_kept(KEPT_BUDGET, 0);
+            file_kept(7, ROW_BUDGET);
+        });
+        assert_eq!(counted, Kept { max: KEPT_BUDGET, over: 0 });
+        let counted = kept_reading(|| {
+            file_kept(KEPT_BUDGET + 1, 0);
+            file_kept(7, ROW_BUDGET + 1);
+            file_kept(KEPT_BUDGET + 2, ROW_BUDGET + 1);
+            file_kept(9, 9);
+        });
+        assert_eq!(counted, Kept { max: KEPT_BUDGET + 2, over: 3 });
+        // Nothing read, nothing counted.
+        assert_eq!(kept_reading(|| {}), Kept::default());
     }
 }

@@ -22,13 +22,17 @@ directory is a built release (a CRAN tarball, or the github.com/cran mirror of o
 means it is a git branch that R CMD build has not filtered yet (a Bioconductor release branch).
 A missing flag, or any other value, exits with status 2, a usage line on stderr and no records.
 
+A run that cannot get the memory it asks for stops there. It ends with a status that is not 0, in most cases 134 (aborted), and writes no statistics line, so the records printed before it stopped are not a whole result.
+
+A run has 64 MiB of stack whatever stack limit it is started under, and reserves the address space for it before it reads anything. That is 64 MiB more address space than the data needs and no more resident memory, since the stack is only touched as far as an object nests. Under an address-space limit with no room for it the run is aborted before it prints anything. The data reader goes one call deeper for each level of a nested object, so the stack is what bounds the depth it reads, and how much a level takes depends on the platform and the compiler. As measured, a list nested about 49,900 deep, a saved image of as many objects and a compiled call of about 232,900 arguments are read on Linux aarch64, and about 74,900 and 322,600 on macOS arm64. A file nested deeper aborts the run with the message of a stack that ran out.
+
 ## Environment
 
 None of these changes a record. Each is read only in the analysis mode, and an older build ignores it.
 
 | Variable | Effect |
 |---|---|
-| `RPKG_ANALYZER_STATS=<file>` | After the last record, append one JSON line to the file: `build`, `ms` (the whole run), `ms_compiled`, `ms_r`, `ms_tests`, `ms_data`, `ms_other`, then `compiled`, `r`, `tests` and `data`, each `{"files": n, "hits": n}`, then `cache_errors` and `verify_mismatch`. Unset or empty writes nothing, and a file that cannot be written is ignored. |
+| `RPKG_ANALYZER_STATS=<file>` | After the last record, append one JSON line to the file: `build`, `ms` (the whole run), `ms_compiled`, `ms_r`, `ms_tests`, `ms_data`, `ms_other`, then `compiled`, `r`, `tests` and `data`, each `{"files": n, "hits": n}`, then `cache_errors` and `verify_mismatch`, then `peak_rss_kb` and `peak_vm_kb`, the most memory the run had resident and the most address space it had, in kB, as Linux reports them in `VmHWM` and `VmPeak`, and null on a system that keeps no such figures, then `data_kept_max` and `data_over_budget`. The reader counts what each data file keeps as it reads it: 48 bytes an object, 4 or 8 a cell of a vector it holds, a string at the block glibc would give it plus 24, and for a table read from text its typed columns and 16 bytes a row, or 32 past 32 columns. `data_kept_max` is the largest count of any one file in bytes, and `data_over_budget` the number of files that kept more than 1,610,612,736 bytes or were a text table of more than 8,000,000 rows. Neither stops a read or changes a record. Unset or empty writes nothing, and a file that cannot be written is ignored. |
 | `RPKG_ANALYZER_CACHE_DIR=<dir>` | Keep what each compiled file under `src/` yields (counts, names, call-graph nodes) in `<dir>/src/`, keyed by the file's bytes and extension, so a later run that meets the same bytes reads them instead of parsing. Files under 2,048 bytes skip it. An entry written by another build, or damaged, is a miss; a directory that cannot be read or written only misses. Unset or empty means no cache. |
 | `RPKG_ANALYZER_CACHE_VERIFY=1` | With a cache, parse on every hit as well, use the parsed result, and count each disagreement in `verify_mismatch`. |
 
@@ -45,7 +49,7 @@ One `summary` record per run, followed by intermediate records:
 | `call_edge` | one call-graph edge | `graph` (`r`/`native`/`c`/`rust`/`fortran`), `from`, `to` |
 | `dcf` | package version | every DESCRIPTION field verbatim (the catch-all) |
 | `release_notes` | package version, only when its NEWS has a section for it | `package_version`, `news_file`, `release_notes_source` (`news_md`, `news_rd`, `news_plain`), `release_notes` (at most 16,384 bytes, cut at a character boundary), `release_notes_truncated` |
-| `dataset` | object shipped under `data/`, `R/sysdata.rda`, or `inst/extdata` | `name`, `file`, `origin_dir`, `format`, `compression`, `class`, `kind`, `nrow`, `ncol`, `column_detail`, `columns[]`, `schema_fp`, `shape_fp`, `content_fp`, `row_sketch`, `confidence`; see [Dataset records](#dataset-records) |
+| `dataset` | object provided under `data/`, `R/sysdata.rda`, or `inst/extdata` | `name`, `file`, `origin_dir`, `format`, `compression`, `class`, `kind`, `nrow`, `ncol`, `column_detail`, `columns[]`, `schema_fp`, `shape_fp`, `content_fp`, `row_sketch`, `confidence`; see [Dataset records](#dataset-records) |
 
 The summary record also carries `analyzer_version`, the build that wrote it. A consumer storing these results needs it to tell rows it has already collected from rows a newer build would describe differently, which is what makes a rescan decidable rather than a guess.
 
@@ -112,13 +116,13 @@ and are skipped; NULL on `release` input or without a `.Rbuildignore`.
 
 ## Dataset records
 
-One `dataset` record per object a package ships. The values are read straight out of R's serialization format (`.rda`, `.rds`, `.RData`) or out of delimited text, with no R runtime and no evaluation of package code, so a version pulled from an archive reads the same way a current release does.
+One `dataset` record per object a package provides. The values are read straight out of R's serialization format (`.rda`, `.rds`, `.RData`) or out of delimited text, with no R runtime and no evaluation of package code, so a version pulled from an archive reads the same way a current release does.
 
 ### Where they come from
 
 Three places, and `origin_dir` says which one a record came from.
 
-`data/` is the loadable catalogue, so only the extensions `data()` itself dispatches on are opened, in `data()`'s own precedence order. A package that ships one name twice (`mtcars.rda` beside `mtcars.csv`) gets one record, for the file `data()` would actually load, because the other copy is not reachable by that name. An `.rds` here is not opened at all: `data()` cannot load one, and in an installed tree `data/Rdata.rds` is the lazy-load index rather than a dataset, which once put a fingerprinted dataset called `Rdata` in the catalogue for every package.
+`data/` is the loadable catalogue, so only the extensions `data()` itself dispatches on are opened, in `data()`'s own precedence order. A package that provides one name twice (`mtcars.rda` beside `mtcars.csv`) gets one record, for the file `data()` would actually load, because the other copy is not reachable by that name. An `.rds` here is not opened at all: `data()` cannot load one, and in an installed tree `data/Rdata.rds` is the lazy-load index rather than a dataset, which once put a fingerprinted dataset called `Rdata` in the catalogue for every package.
 
 A `.tsv` or a `.dat` under `data/` gets no record at all, for the same reason: `data()` does not dispatch on those extensions, so a row for one would put a dataset in the catalogue that nobody can reach. Of the text formats it does dispatch on, `.csv` is read with a semicolon and `.tab` and `.txt` with whitespace, which is what `data()` itself does and not what the extension usually means elsewhere.
 
@@ -136,7 +140,7 @@ Every record carries `confidence`, and this is the whole vocabulary:
 - `degraded`: something is described, but not everything. A class with no reader of its own arrives as its class name plus whatever its attributes give up; a delimited text file has its column types inferred rather than declared; an object holding a vector past the cell cap keeps its structure and drops the value pass; a file that would not parse carries the reader's own message. `notes` says which of these happened.
 - `needs_r`: an `.R` script under `data/`. Only R can evaluate one, so nothing but the file itself is described.
 
-A `degraded` record is not a failure to be filtered out. It is the difference between what was measured and what exists, stated on the row, and a consumer that treats it as missing data throws away most of what Bioconductor ships.
+A `degraded` record is not a failure to be filtered out. It is the difference between what was measured and what exists, stated on the row, and a consumer that treats it as missing data throws away most of what Bioconductor provides.
 
 ### What a record carries
 

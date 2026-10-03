@@ -1,9 +1,9 @@
 #![recursion_limit = "2048"]
 // rpkg-analyzer: a pure function of one extracted R package source tree.
 // Reads a directory, emits newline-delimited JSON metric records on stdout.
-// This first cut covers the structure, DESCRIPTION (DCF), and NAMESPACE groups,
-// which map one-to-one onto the current pipeline's structure.R / parse_dcf /
-// parse_namespace.
+// Its records cover a package's structure, DESCRIPTION (DCF) and NAMESPACE,
+// documentation, functions, call graphs and datasets, all read from the files
+// alone, with no R runtime.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -15,6 +15,7 @@ mod build_id;
 mod cache;
 mod citation;
 mod cli;
+mod memory;
 mod news;
 mod rd_pages;
 mod rds;
@@ -23,6 +24,58 @@ mod repo_practices;
 mod test_suite;
 mod vignettes;
 
+#[global_allocator]
+static ALLOCATOR: memory::EndsRun = memory::EndsRun;
+
+// ---- regexes ----------------------------------------------------------------
+
+/// The regex of a pattern written out in the source, compiled the first time
+/// the line is reached and kept for the rest of the run.
+macro_rules! regex {
+    ($pattern:expr) => {{
+        static RE: std::sync::LazyLock<regex::Regex> =
+            std::sync::LazyLock::new(|| regex::Regex::new($pattern).unwrap());
+        &*RE
+    }};
+}
+
+/// The same for a pattern with look-around, which takes the other engine.
+macro_rules! fancy_regex {
+    ($pattern:expr) => {{
+        static RE: std::sync::LazyLock<fancy_regex::Regex> =
+            std::sync::LazyLock::new(|| fancy_regex::Regex::new($pattern).unwrap());
+        &*RE
+    }};
+}
+
+/// How many regexes `kept_regex` keeps.
+const KEPT_REGEXES: usize = 64;
+
+/// Regexes by the text of their pattern. A pattern past `KEPT_REGEXES` is
+/// compiled for the call that asked and not kept, so text that came out of a
+/// package cannot make the list grow.
+struct KeptRegexes(BTreeMap<String, std::sync::Arc<regex::Regex>>);
+
+impl KeptRegexes {
+    fn get(&mut self, pattern: &str) -> Result<std::sync::Arc<regex::Regex>, regex::Error> {
+        if let Some(re) = self.0.get(pattern) {
+            return Ok(re.clone());
+        }
+        let re = std::sync::Arc::new(regex::Regex::new(pattern)?);
+        if self.0.len() < KEPT_REGEXES {
+            self.0.insert(pattern.to_string(), re.clone());
+        }
+        Ok(re)
+    }
+}
+
+/// The regex of a pattern the program puts together from its own fixed parts,
+/// compiled the first time the text is asked for.
+fn kept_regex(pattern: &str) -> Result<std::sync::Arc<regex::Regex>, regex::Error> {
+    static KEPT: std::sync::Mutex<KeptRegexes> = std::sync::Mutex::new(KeptRegexes(BTreeMap::new()));
+    KEPT.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get(pattern)
+}
+
 // ---- file walking -----------------------------------------------------------
 
 /// All files under `root`, relative to it, excluding the .git directory.
@@ -30,7 +83,7 @@ mod vignettes;
 fn list_files(root: &Path) -> Vec<String> {
     let mut out = Vec::new();
     fn rec(dir: &Path, root: &Path, out: &mut Vec<String>) {
-        let Ok(rd) = std::fs::read_dir(dir) else { return };
+        let Ok(rd) = memory::read_dir(dir) else { return };
         for e in rd.flatten() {
             let name = e.file_name();
             if name == ".git" {
@@ -50,7 +103,7 @@ fn list_files(root: &Path) -> Vec<String> {
     out
 }
 
-/// Binary / non-code extensions excluded from LOC (carried from structure.R).
+/// Binary / non-code extensions excluded from LOC.
 fn is_noncode(path: &str) -> bool {
     let lower = path.to_ascii_lowercase();
     if lower == "md5" || lower.ends_with("/md5") {
@@ -131,7 +184,7 @@ fn is_vendored_src(path: &str) -> bool {
     VENDORED_SRC.is_match(path)
 }
 
-/// the is_src: src/ files with a compiled-language extension only (structure.R).
+/// Source files: src/ files with a compiled-language extension only.
 /// Excludes Makevars, configure, .in, etc.
 fn is_src_file(path: &str) -> bool {
     if !path.starts_with("src/") || is_vendored_src(path) {
@@ -288,8 +341,8 @@ fn legal_tokenize(lic: &str) -> Vec<String> {
     if lic.trim().is_empty() {
         return vec![];
     }
-    let ws = regex::Regex::new(r"[ \t]+").unwrap();
-    let strip = regex::Regex::new(r"\s*\+\s*file\s+LICEN[SC]E\s*$").unwrap();
+    let ws = regex!(r"[ \t]+");
+    let strip = regex!(r"\s*\+\s*file\s+LICEN[SC]E\s*$");
     lic.split('|')
         .filter_map(|part| {
             let norm = ws.replace_all(part, " ");
@@ -322,8 +375,8 @@ fn is_license_placeholder(v: &str) -> bool {
 fn license_template_complete(content: &str) -> bool {
     let content = content.strip_prefix('\u{feff}').unwrap_or(content);
     // Only spaces and tabs after the colon, so an empty value never takes the next line.
-    let year_re = regex::Regex::new(r"(?m)^\s*YEAR:[ \t]*(.*)$").unwrap();
-    let holder_re = regex::Regex::new(r"(?m)^\s*COPYRIGHT HOLDER:[ \t]*(.*)$").unwrap();
+    let year_re = regex!(r"(?m)^\s*YEAR:[ \t]*(.*)$");
+    let holder_re = regex!(r"(?m)^\s*COPYRIGHT HOLDER:[ \t]*(.*)$");
     let year = year_re.captures(content).map(|c| c[1].to_string());
     let holder = holder_re.captures(content).map(|c| c[1].to_string());
     match (year, holder) {
@@ -346,7 +399,7 @@ fn metrics_legal(desc: &BTreeMap<String, String>, root: &Path, files: &[String])
 
     let has_file_ref = license
         .as_deref()
-        .map(|l| regex::Regex::new(r"\bfile\s+LICEN[SC]E\b").unwrap().is_match(l))
+        .map(|l| regex!(r"\bfile\s+LICEN[SC]E\b").is_match(l))
         .unwrap_or(false);
     let license_file_completeness = if license.is_none() || !has_file_ref {
         None
@@ -387,7 +440,7 @@ struct Port {
 }
 
 fn find_files<'a>(files: &'a [String], pat: &str) -> Vec<&'a str> {
-    let re = regex::Regex::new(pat).unwrap();
+    let re = kept_regex(pat).unwrap();
     files.iter().filter(|f| re.is_match(f)).map(|s| s.as_str()).collect()
 }
 
@@ -398,7 +451,7 @@ fn metrics_portability(desc: &BTreeMap<String, String>, root: &Path, files: &[St
         .map(|s| s.trim())
         .filter(|s| !s.is_empty())
         .and_then(|sr| {
-            let re = regex::Regex::new(r"[,]|\band\b").unwrap();
+            let re = regex!(r"[,]|\band\b");
             let mut seen = std::collections::HashSet::new();
             let n = re
                 .split(sr)
@@ -411,9 +464,9 @@ fn metrics_portability(desc: &BTreeMap<String, String>, root: &Path, files: &[St
 
     // cxx_standard_required + nonportable flags: scan src/Makevars(.win)
     let bad_flags = ["-march=native", "-O3", "-funroll-loops", "-ffast-math"];
-    let cxx_re = regex::Regex::new(r"^\s*CXX_STD\s*=\s*CXX(\d+)").unwrap();
-    let abs_re = regex::Regex::new(r"-[IL]/\S+").unwrap();
-    let comment_re = regex::Regex::new(r"^\s*#").unwrap();
+    let cxx_re = regex!(r"^\s*CXX_STD\s*=\s*CXX(\d+)");
+    let abs_re = regex!(r"-[IL]/\S+");
+    let comment_re = regex!(r"^\s*#");
     let mut cxx_standard_required: Option<String> = None;
     let mut found_flags: Vec<String> = Vec::new();
     for mf in find_files(files, r"^src/Makevars(\.win)?$") {
@@ -448,7 +501,7 @@ fn metrics_portability(desc: &BTreeMap<String, String>, root: &Path, files: &[St
         .map(|s| s.trim())
         .filter(|s| !s.is_empty())
         .and_then(|dep| {
-            let re = regex::Regex::new(r"\bR\s*\(\s*>=\s*([0-9]+\.[0-9]+(?:\.[0-9]+)?)\s*\)").unwrap();
+            let re = regex!(r"\bR\s*\(\s*>=\s*([0-9]+\.[0-9]+(?:\.[0-9]+)?)\s*\)");
             re.captures(dep).map(|c| c[1].to_string())
         });
 
@@ -476,7 +529,7 @@ fn yaml_inline_array(content: &str, key: &str) -> Vec<String> {
     if content.is_empty() {
         return vec![];
     }
-    let re = regex::Regex::new(&format!(r"(?m)^\s+{key}:\s*\[([^\]]+)\]")).unwrap();
+    let re = kept_regex(&format!(r"(?m)^\s+{key}:\s*\[([^\]]+)\]")).unwrap();
     let mut vals = Vec::new();
     for cap in re.captures_iter(content) {
         for part in cap[1].split(',') {
@@ -496,9 +549,9 @@ fn gha_matrix_breadth(root: &Path, ci_yml: &[&str]) -> i64 {
     if ci_yml.is_empty() {
         return 0;
     }
-    let pair_re = regex::Regex::new(r"\{[^}\n]*\bos:\s*[^}\n]+\}").unwrap();
-    let os_re = regex::Regex::new(r#"\bos:\s*['"]?([^,'"{}\s]+)"#).unwrap();
-    let r_re = regex::Regex::new(r#"\br(?:-version)?:\s*['"]?([^,'"{}\s]+)"#).unwrap();
+    let pair_re = regex!(r"\{[^}\n]*\bos:\s*[^}\n]+\}");
+    let os_re = regex!(r#"\bos:\s*['"]?([^,'"{}\s]+)"#);
+    let r_re = regex!(r#"\br(?:-version)?:\s*['"]?([^,'"{}\s]+)"#);
     let mut max_b = 0i64;
     for f in ci_yml {
         let Some(content) = read(root, f) else { continue };
@@ -560,8 +613,8 @@ fn metrics_tests(
         .and_then(|s| s.parse::<i64>().ok());
 
     let test_r_files = find_files(files, r"^tests/.*\.[Rr]$");
-    let snap_re = regex::Regex::new(r"expect_snapshot\s*\(").unwrap();
-    let snapf_re = regex::Regex::new(r"expect_snapshot_file\s*\(").unwrap();
+    let snap_re = regex!(r"expect_snapshot\s*\(");
+    let snapf_re = regex!(r"expect_snapshot_file\s*\(");
     let mut snap_calls = 0i64;
     for f in &test_r_files {
         if let Some(c) = read(root, f) {
@@ -582,11 +635,11 @@ fn metrics_tests(
         let pat = format!(
             r#"\b{lib}::|library\(\s*['"]?{lib}['"]?\s*\)|require\(\s*['"]?{lib}['"]?\s*\)"#
         );
-        if regex::Regex::new(&pat).unwrap().is_match(&test_content) {
+        if kept_regex(&pat).unwrap().is_match(&test_content) {
             test_isolation_libs.push(lib.to_string());
         }
     }
-    if regex::Regex::new(r"\blocal_mocked_bindings\s*\(").unwrap().is_match(&test_content) {
+    if regex!(r"\blocal_mocked_bindings\s*\(").is_match(&test_content) {
         test_isolation_libs.push("local_mocked_bindings".to_string());
     }
 
@@ -606,8 +659,8 @@ fn metrics_tests(
         Some(n as f64 / real_exports.len() as f64)
     };
 
-    let stoch_re = regex::Regex::new(r"\b(?:sample|runif|rnorm|rbinom)\s*\(").unwrap();
-    let seed_re = regex::Regex::new(r"\bset\.seed\s*\(").unwrap();
+    let stoch_re = regex!(r"\b(?:sample|runif|rnorm|rbinom)\s*\(");
+    let seed_re = regex!(r"\bset\.seed\s*\(");
     let stoch_files: Vec<&&str> = test_r_files
         .iter()
         .filter(|f| read(root, f).map(|c| stoch_re.is_match(&c)).unwrap_or(false))
@@ -647,7 +700,7 @@ struct Functions {
 /// Top-level R/ function definitions via the regex; first occurrence wins.
 /// Returns (name, file, 1-based line) in discovery order.
 fn build_fn_lookup(root: &Path, r_files: &[&str]) -> Vec<(String, String, usize)> {
-    let re = regex::Regex::new(r"^([A-Za-z.][A-Za-z0-9_.]*)\s*(?:<<?-|=)\s*function\s*\(").unwrap();
+    let re = regex!(r"^([A-Za-z.][A-Za-z0-9_.]*)\s*(?:<<?-|=)\s*function\s*\(");
     let mut lookup = Vec::new();
     let mut seen = std::collections::HashSet::new();
     for f in r_files {
@@ -719,8 +772,7 @@ fn metrics_functions(root: &Path, files: &[String], ns: &Namespace, has_ns: bool
     let n_exp_in_r = r_fn_names.iter().filter(|nm| is_exported(nm)).count() as i64;
     let n_internal = Some(r_fn_names.len() as i64 - n_exp_in_r);
 
-    let nse_re =
-        regex::Regex::new(r"\b(eval|substitute|quote|bquote|match\.call|sys\.call)\s*\(").unwrap();
+    let nse_re = regex!(r"\b(eval|substitute|quote|bquote|match\.call|sys\.call)\s*\(");
     let (nse_surface_n, nse_surface_frac) = if !has_ns {
         (None, None)
     } else {
@@ -753,8 +805,7 @@ fn metrics_functions(root: &Path, files: &[String], ns: &Namespace, has_ns: bool
 
     let all_content: String =
         r_files.iter().filter_map(|f| read(root, f)).collect::<Vec<_>>().join("\n");
-    let tc_re =
-        regex::Regex::new(r"([A-Za-z.][A-Za-z0-9.]*):::([A-Za-z.][A-Za-z0-9._]*)").unwrap();
+    let tc_re = regex!(r"([A-Za-z.][A-Za-z0-9.]*):::([A-Za-z.][A-Za-z0-9._]*)");
     let mut triple_colon_count = 0i64;
     let mut ext_pkgs = std::collections::HashSet::new();
     for c in tc_re.captures_iter(&all_content) {
@@ -792,7 +843,7 @@ struct Docs {
 /// Brace-balanced content starting right after a known opening '{' at byte
 /// offset `after_open` in `text`. Handles Rd escapes \{ and \}.
 /// Returns (content, end) where end = byte offset of the closing '}', or
-/// None when braces are unbalanced. Port of docs.R's `.bc`.
+/// None when braces are unbalanced.
 fn rd_brace_content(text: &str, after_open: usize) -> Option<(String, usize)> {
     let bytes = text.as_bytes();
     if after_open >= bytes.len() {
@@ -845,41 +896,41 @@ fn strip_rd_comments(text: &str) -> String {
     out
 }
 
-/// First \cmd{...} block in text. Port of docs.R's `.fb`.
+/// First \cmd{...} block in text.
 fn rd_first_block(text: &str, cmd: &str) -> Option<(String, usize)> {
     let pat = format!(r"\\{}\s*\{{", regex::escape(cmd));
-    let re = regex::Regex::new(&pat).ok()?;
+    let re = kept_regex(&pat).ok()?;
     let m = re.find(text)?;
     rd_brace_content(text, m.end())
 }
 
-/// All \cmd{...} block contents in text (only successful parses). Port of docs.R's `.ab`.
+/// All \cmd{...} block contents in text (only successful parses).
 fn rd_all_blocks(text: &str, cmd: &str) -> Vec<String> {
     let pat = format!(r"\\{}\s*\{{", regex::escape(cmd));
-    let Ok(re) = regex::Regex::new(&pat) else { return vec![] };
+    let Ok(re) = kept_regex(&pat) else { return vec![] };
     re.find_iter(text)
         .filter_map(|m| rd_brace_content(text, m.end()).map(|(c, _)| c))
         .collect()
 }
 
-/// Whether text contains at least one \cmd{ marker. Port of docs.R's `.hc`.
+/// Whether text contains at least one \cmd{ marker.
 fn rd_has_block(text: &str, cmd: &str) -> bool {
     let pat = format!(r"\\{}\s*\{{", regex::escape(cmd));
-    regex::Regex::new(&pat).map(|re| re.is_match(text)).unwrap_or(false)
+    kept_regex(&pat).map(|re| re.is_match(text)).unwrap_or(false)
 }
 
-/// Extract parameter names from \usage block content (approximate).
-/// Port of docs.R's `.uparams`.
+/// Extract parameter names from \usage block content (approximate):
+/// each call's top-level arguments, defaults removed, first seen kept.
 fn rd_usage_params(u: &str) -> Vec<String> {
     if u.trim().is_empty() {
         return vec![];
     }
-    let comment_re = regex::Regex::new(r"%[^\n]*").unwrap();
+    let comment_re = regex!(r"%[^\n]*");
     let u = comment_re.replace_all(u, "");
-    let dots_re = regex::Regex::new(r"\\dots|\\ldots").unwrap();
+    let dots_re = regex!(r"\\dots|\\ldots");
     let u = dots_re.replace_all(&u, "...");
-    let sig_re = regex::Regex::new(r"[A-Za-z_.][A-Za-z0-9_.]*\s*\(").unwrap();
-    let eq_re = regex::Regex::new(r"\s*=.*$").unwrap();
+    let sig_re = regex!(r"[A-Za-z_.][A-Za-z0-9_.]*\s*\(");
+    let eq_re = regex!(r"\s*=.*$");
 
     let mut params: Vec<String> = Vec::new();
     for m in sig_re.find_iter(&u) {
@@ -950,10 +1001,10 @@ fn rd_usage_params(u: &str) -> Vec<String> {
     params
 }
 
-/// Parameter names documented via \item{name}{} in \arguments content.
-/// Port of docs.R's `.inames`.
+/// Parameter names documented via \item{name}{} in \arguments content,
+/// each item's name as written, trimmed.
 fn rd_arg_names(args_text: &str) -> Vec<String> {
-    let re = regex::Regex::new(r"\\item\s*\{([^{}]*)\}").unwrap();
+    let re = regex!(r"\\item\s*\{([^{}]*)\}");
     re.captures_iter(args_text)
         .map(|c| c[1].trim().to_string())
         .collect()
@@ -1032,7 +1083,7 @@ fn metrics_docs(
         if n_ex == 0 {
             None
         } else {
-            let dontrun_re = regex::Regex::new(r"^\\don(trun|ttest)\s*\{").unwrap();
+            let dontrun_re = regex!(r"^\\don(trun|ttest)\s*\{");
             let n_wrap = rd_ex
                 .iter()
                 .filter(|f| {
@@ -1131,9 +1182,9 @@ fn metrics_docs(
             if text.is_empty() {
                 0i64
             } else {
-                let fence_re = regex::Regex::new(r"(?s)```[^\n]*\n.*?```").unwrap();
+                let fence_re = regex!(r"(?s)```[^\n]*\n.*?```");
                 let stripped = fence_re.replace_all(&text, "");
-                let badge_re = regex::Regex::new(r"^\s*(\[!\[|<img\s|\[\[img)").unwrap();
+                let badge_re = regex!(r"^\s*(\[!\[|<img\s|\[\[img)");
                 let text2: String = stripped
                     .lines()
                     .filter(|l| !badge_re.is_match(l))
@@ -1159,23 +1210,22 @@ fn metrics_docs(
                 let lns: Vec<&str> = text.lines().collect();
                 let mut n_met = 0i64;
 
-                let ver_hd_re = regex::Regex::new(
-                    r"^(#{1,4}\s[^\n]*\d+\.\d+|[Vv]ersion\s+\d+\.\d+|[Cc]hanges?\s+(in|for)\s+(version\s+)?\d+\.\d+|\d+\.\d+(?:\.\d+)?\s*([-_(]|$))",
-                )
-                .unwrap();
+                let ver_hd_re = regex!(
+                    r"^(#{1,4}\s[^\n]*\d+\.\d+|[Vv]ersion\s+\d+\.\d+|[Cc]hanges?\s+(in|for)\s+(version\s+)?\d+\.\d+|\d+\.\d+(?:\.\d+)?\s*([-_(]|$))"
+                );
                 let hd_lines: Vec<&str> =
                     lns.iter().filter(|l| ver_hd_re.is_match(l)).cloned().collect();
                 if !hd_lines.is_empty() {
                     n_met += 1;
                 }
 
-                let bullet_re = regex::Regex::new(r"^\s*[-*+]\s+\S").unwrap();
+                let bullet_re = regex!(r"^\s*[-*+]\s+\S");
                 if lns.iter().any(|l| bullet_re.is_match(l)) {
                     n_met += 1;
                 }
 
                 if hd_lines.len() >= 2 {
-                    let ver_num_re = regex::Regex::new(r"\d+\.\d+(?:\.\d+)*").unwrap();
+                    let ver_num_re = regex!(r"\d+\.\d+(?:\.\d+)*");
                     let ver_strs: Vec<&str> = hd_lines
                         .iter()
                         .flat_map(|l| ver_num_re.find_iter(l).map(|m| m.as_str()))
@@ -1247,9 +1297,9 @@ fn n_close(s: &str) -> i64 {
 /// '{', handling multi-line argument lists. Nested function bodies are
 /// absorbed into the enclosing body and are NOT separately extracted. This
 /// is a conservative heuristic (rare false positives/negatives possible),
-/// ported faithfully from extract_function_bodies() in health.R.
+/// kept exactly as it is because stored records depend on it.
 fn extract_function_bodies(lines: &[String]) -> Vec<Vec<String>> {
-    let fn_re = regex::Regex::new(r"\bfunction\s*\(").unwrap();
+    let fn_re = regex!(r"\bfunction\s*\(");
     let stripped: Vec<String> = lines.iter().map(|l| strip_comment_line(l)).collect();
     let n = stripped.len();
     let mut bodies: Vec<Vec<String>> = Vec::new();
@@ -1340,9 +1390,10 @@ fn metrics_health(_desc: &BTreeMap<String, String>, root: &Path, files: &[String
     // ---- on_exit_coverage_rate ----
     // Fraction of R/ function bodies that both mutate global/shared state AND
     // call on.exit(). None when no function mutates state (denominator = 0).
-    let mutator_res: Vec<regex::Regex> =
-        MUTATOR_PATS.iter().map(|p| regex::Regex::new(p).unwrap()).collect();
-    let on_exit_re = regex::Regex::new(r"\bon\.exit\s*\(").unwrap();
+    static MUTATORS: std::sync::LazyLock<Vec<regex::Regex>> =
+        std::sync::LazyLock::new(|| MUTATOR_PATS.iter().map(|p| regex::Regex::new(p).unwrap()).collect());
+    let mutator_res: &[regex::Regex] = &MUTATORS;
+    let on_exit_re = regex!(r"\bon\.exit\s*\(");
 
     let mut n_mutating: i64 = 0;
     let mut n_on_exit: i64 = 0;
@@ -1351,9 +1402,9 @@ fn metrics_health(_desc: &BTreeMap<String, String>, root: &Path, files: &[String
             continue;
         }
         for body in extract_function_bodies(lns) {
-            if body_has_mutator(&body, &mutator_res) {
+            if body_has_mutator(&body, mutator_res) {
                 n_mutating += 1;
-                if body_has_on_exit(&body, &on_exit_re) {
+                if body_has_on_exit(&body, on_exit_re) {
                     n_on_exit += 1;
                 }
             }
@@ -1365,13 +1416,10 @@ fn metrics_health(_desc: &BTreeMap<String, String>, root: &Path, files: &[String
     // ---- global_state_write_density ----
     // Per KLOC of R/: <<-, assign()-to-global, options() setters, Sys.setenv().
     // Each grepl() sum below counts matching LINES (not total occurrences).
-    let superassign_re = regex::Regex::new("<<-").unwrap();
-    let assign_global_re = regex::Regex::new(
-        r"\bassign\s*\([^)]*(?:\.GlobalEnv|globalenv\s*\(|baseenv\s*\()",
-    )
-    .unwrap();
-    let options_setter_re = regex::Regex::new(r"\boptions\s*\([^)]*=").unwrap();
-    let sys_setenv_re = regex::Regex::new(r"\bSys\.setenv\s*\(").unwrap();
+    let superassign_re = regex!("<<-");
+    let assign_global_re = regex!(r"\bassign\s*\([^)]*(?:\.GlobalEnv|globalenv\s*\(|baseenv\s*\()");
+    let options_setter_re = regex!(r"\boptions\s*\([^)]*=");
+    let sys_setenv_re = regex!(r"\bSys\.setenv\s*\(");
 
     let global_state_write_density = (r_loc != 0).then(|| {
         let mut cnt: i64 = 0;
@@ -1389,12 +1437,11 @@ fn metrics_health(_desc: &BTreeMap<String, String>, root: &Path, files: &[String
     // Per KLOC of R/: bare T/F, 1:length/nrow/ncol, require()/library() inside
     // function bodies (indentation heuristic), .Internal(). Line-count based,
     // like above. The bare T/F pattern needs lookaround -> fancy_regex.
-    let bare_tf_re =
-        fancy_regex::Regex::new(r"(?<![A-Za-z0-9_.])[TF](?![A-Za-z0-9_.=])").unwrap();
-    let seq_re = regex::Regex::new(r"\b1:(?:length|nrow|ncol)\s*\(").unwrap();
-    let indent_re = regex::Regex::new(r"^[ \t]{2,}").unwrap();
-    let req_lib_re = regex::Regex::new(r"\b(?:require|library)\s*\(").unwrap();
-    let internal_re = regex::Regex::new(r"\.Internal\s*\(").unwrap();
+    let bare_tf_re = fancy_regex!(r"(?<![A-Za-z0-9_.])[TF](?![A-Za-z0-9_.=])");
+    let seq_re = regex!(r"\b1:(?:length|nrow|ncol)\s*\(");
+    let indent_re = regex!(r"^[ \t]{2,}");
+    let req_lib_re = regex!(r"\b(?:require|library)\s*\(");
+    let internal_re = regex!(r"\.Internal\s*\(");
 
     let deprecated_idiom_density = (r_loc != 0).then(|| {
         let mut cnt: i64 = 0;
@@ -1418,9 +1465,9 @@ fn metrics_health(_desc: &BTreeMap<String, String>, root: &Path, files: &[String
     // Per KLOC of R/ (test files live in tests/, not R/). Detects browser()
     // and stray print()/cat() at statement position; lines that also contain
     // message()/warning()/stop() are excluded (intentional output contexts).
-    let browser_re = regex::Regex::new(r"^\s*browser\s*\(\s*\)").unwrap();
-    let warn_ctx_re = regex::Regex::new(r"\b(?:message|warning|stop)\s*\(").unwrap();
-    let print_cat_re = regex::Regex::new(r"^\s*(?:print|cat)\s*\(").unwrap();
+    let browser_re = regex!(r"^\s*browser\s*\(\s*\)");
+    let warn_ctx_re = regex!(r"\b(?:message|warning|stop)\s*\(");
+    let print_cat_re = regex!(r"^\s*(?:print|cat)\s*\(");
 
     let debug_artifact_density = (r_loc != 0).then(|| {
         let mut cnt: i64 = 0;
@@ -1472,7 +1519,7 @@ fn meta_person_inners(text: &str) -> Vec<String> {
     if t.is_empty() {
         return Vec::new();
     }
-    let person_re = regex::Regex::new(r"\bperson\s*\(").unwrap();
+    let person_re = regex!(r"\bperson\s*\(");
     let mut result = Vec::new();
     let mut remaining: Vec<char> = t.chars().collect();
     loop {
@@ -1521,7 +1568,7 @@ fn cap1(re: &regex::Regex, text: &str) -> Option<String> {
 /// All quoted (single- or double-) string contents in `text`, outer quotes
 /// stripped (port of .extract_quoted).
 fn extract_quoted(text: &str) -> Vec<String> {
-    let re = regex::Regex::new(r#""[^"]*"|'[^']*'"#).unwrap();
+    let re = regex!(r#""[^"]*"|'[^']*'"#);
     re.find_iter(text)
         .map(|m| {
             let s = m.as_str();
@@ -1537,37 +1584,37 @@ fn meta_parse_person(inner: &str) -> Person {
     let mut family: Option<String> = None;
     let mut roles: Vec<String> = Vec::new();
 
-    let gd_re = regex::Regex::new(r#"(?:given|first)\s*=\s*"([^"]*)""#).unwrap();
-    let gs_re = regex::Regex::new(r"(?:given|first)\s*=\s*'([^']*)'").unwrap();
-    if let Some(g) = cap1(&gd_re, inner).or_else(|| cap1(&gs_re, inner)) {
+    let gd_re = regex!(r#"(?:given|first)\s*=\s*"([^"]*)""#);
+    let gs_re = regex!(r"(?:given|first)\s*=\s*'([^']*)'");
+    if let Some(g) = cap1(gd_re, inner).or_else(|| cap1(gs_re, inner)) {
         given = Some(g);
     }
 
-    let fd_re = regex::Regex::new(r#"(?:family|last)\s*=\s*"([^"]*)""#).unwrap();
-    let fs_re = regex::Regex::new(r"(?:family|last)\s*=\s*'([^']*)'").unwrap();
-    if let Some(f) = cap1(&fd_re, inner).or_else(|| cap1(&fs_re, inner)) {
+    let fd_re = regex!(r#"(?:family|last)\s*=\s*"([^"]*)""#);
+    let fs_re = regex!(r"(?:family|last)\s*=\s*'([^']*)'");
+    if let Some(f) = cap1(fd_re, inner).or_else(|| cap1(fs_re, inner)) {
         family = Some(f);
     }
 
-    let role_c_re = regex::Regex::new(r"role\s*=\s*c\(([^)]*)\)").unwrap();
+    let role_c_re = regex!(r"role\s*=\s*c\(([^)]*)\)");
     if let Some(c) = role_c_re.captures(inner) {
         let role_content = c.get(1).map(|m| m.as_str()).unwrap_or("");
         roles = extract_quoted(role_content);
     } else {
-        let rd_re = regex::Regex::new(r#"role\s*=\s*"([^"]*)""#).unwrap();
-        let rs_re = regex::Regex::new(r"role\s*=\s*'([^']*)'").unwrap();
-        if let Some(r) = cap1(&rd_re, inner).or_else(|| cap1(&rs_re, inner)) {
+        let rd_re = regex!(r#"role\s*=\s*"([^"]*)""#);
+        let rs_re = regex!(r"role\s*=\s*'([^']*)'");
+        if let Some(r) = cap1(rd_re, inner).or_else(|| cap1(rs_re, inner)) {
             roles = vec![r];
         }
     }
 
-    let named_c_re = regex::Regex::new(r"[A-Za-z_.][A-Za-z0-9_.]*\s*=\s*c\([^)]*\)").unwrap();
-    let named_val_re = regex::Regex::new(r#"[A-Za-z_.][A-Za-z0-9_.]*\s*=\s*(?:"[^"]*"|'[^']*')"#).unwrap();
+    let named_c_re = regex!(r"[A-Za-z_.][A-Za-z0-9_.]*\s*=\s*c\([^)]*\)");
+    let named_val_re = regex!(r#"[A-Za-z_.][A-Za-z0-9_.]*\s*=\s*(?:"[^"]*"|'[^']*')"#);
 
     // comment = c(ORCID = "...", ROR = "...", "free text"), or comment = "free text". A
     // parenthesis inside a quoted part does not end the c(...).
-    let comment_c_re = regex::Regex::new(r#"comment\s*=\s*c\(((?:"[^"]*"|'[^']*'|[^)"'])*)\)"#).unwrap();
-    let comment_s_re = regex::Regex::new(r#"comment\s*=\s*(?:"([^"]*)"|'([^']*)')"#).unwrap();
+    let comment_c_re = regex!(r#"comment\s*=\s*c\(((?:"[^"]*"|'[^']*'|[^)"'])*)\)"#);
+    let comment_s_re = regex!(r#"comment\s*=\s*(?:"([^"]*)"|'([^']*)')"#);
     let (mut orcid, mut ror, mut free) = (None, None, Vec::new());
     let mut comment_text = String::new();
     if let Some(c) = comment_c_re.captures(inner) {
@@ -1620,7 +1667,7 @@ fn meta_parse_author_text(text: &str) -> Vec<Person> {
         return Vec::new();
     }
     // Some Author fields hold person() calls; those read as Authors@R.
-    if regex::Regex::new(r"\bperson\s*\(").unwrap().is_match(t) {
+    if regex!(r"\bperson\s*\(").is_match(t) {
         let persons: Vec<Person> = meta_person_inners(t).iter().map(|inner| meta_parse_person(inner)).collect();
         // Prose such as "person(s)" parses to no name, so that text is split as prose instead.
         if persons.iter().any(|p| p.given.is_some() || p.family.is_some()) {
@@ -1629,10 +1676,9 @@ fn meta_parse_author_text(text: &str) -> Vec<Person> {
     }
 
     // ORCIDs come out first so the split cannot cut them; each leaves a marker.
-    let orcid_re = regex::Regex::new(
-        r"(?i)<\s*https?://orcid\.org/([0-9X-]{16,19})\s*>|\(\s*ORCID:?\s*(?:<?\s*https?://orcid\.org/)?([0-9X-]{16,19})\s*>?\s*\)",
-    )
-    .unwrap();
+    let orcid_re = regex!(
+        r"(?i)<\s*https?://orcid\.org/([0-9X-]{16,19})\s*>|\(\s*ORCID:?\s*(?:<?\s*https?://orcid\.org/)?([0-9X-]{16,19})\s*>?\s*\)"
+    );
     let mut ids: Vec<Option<String>> = Vec::new();
     let marked = orcid_re
         .replace_all(t, |c: &regex::Captures| {
@@ -1642,7 +1688,7 @@ fn meta_parse_author_text(text: &str) -> Vec<Person> {
         })
         .into_owned();
     // Separators inside [...] and (...) belong to one entry.
-    let group_re = regex::Regex::new(r"\[[^\]]*\]|\([^)]*\)").unwrap();
+    let group_re = regex!(r"\[[^\]]*\]|\([^)]*\)");
     let mut groups: Vec<String> = Vec::new();
     let protected = group_re
         .replace_all(&marked, |c: &regex::Captures| {
@@ -1651,18 +1697,18 @@ fn meta_parse_author_text(text: &str) -> Vec<Person> {
         })
         .into_owned();
 
-    let split_re = regex::Regex::new(r"(?i)\s*[,;]\s*|\s+and\s+|\s+&\s+|\s+with\s+contributions\s+from\s+").unwrap();
-    let restore_re = regex::Regex::new(r"\u{3}(\d+)\u{3}").unwrap();
-    let marker_re = regex::Regex::new(r"\u{2}(\d+)\u{2}").unwrap();
-    let lead_and_re = regex::Regex::new(r"(?i)^(?:and|&)\s+").unwrap();
-    let email_re = regex::Regex::new(r"\s*<[^>]*>").unwrap();
-    let rd_email_re = regex::Regex::new(r"\\email\{[^}]*\}").unwrap();
-    let role_re = regex::Regex::new(r"\[([^\]]+)\]").unwrap();
-    let bracket_strip_re = regex::Regex::new(r"\s*\[[^\]]*\]").unwrap();
-    let paren_re = regex::Regex::new(r"\(([^)]*)\)").unwrap();
-    let label_re = regex::Regex::new(r"(?i)^(?:authors?|contributors?|maintainer)\s*:\s*").unwrap();
-    let preamble_re = regex::Regex::new(r"(?i)^(.+?\bby)\s+(\S.*)$").unwrap();
-    let ws_re = regex::Regex::new(r"\s+").unwrap();
+    let split_re = regex!(r"(?i)\s*[,;]\s*|\s+and\s+|\s+&\s+|\s+with\s+contributions\s+from\s+");
+    let restore_re = regex!(r"\u{3}(\d+)\u{3}");
+    let marker_re = regex!(r"\u{2}(\d+)\u{2}");
+    let lead_and_re = regex!(r"(?i)^(?:and|&)\s+");
+    let email_re = regex!(r"\s*<[^>]*>");
+    let rd_email_re = regex!(r"\\email\{[^}]*\}");
+    let role_re = regex!(r"\[([^\]]+)\]");
+    let bracket_strip_re = regex!(r"\s*\[[^\]]*\]");
+    let paren_re = regex!(r"\(([^)]*)\)");
+    let label_re = regex!(r"(?i)^(?:authors?|contributors?|maintainer)\s*:\s*");
+    let preamble_re = regex!(r"(?i)^(.+?\bby)\s+(\S.*)$");
+    let ws_re = regex!(r"\s+");
 
     split_re
         .split(&protected)
@@ -1752,10 +1798,10 @@ fn metrics_meta(desc: &BTreeMap<String, String>, _root: &Path, _files: &[String]
     let (maintainer, maintainer_email) = if maint_raw.is_empty() {
         (None, None)
     } else {
-        let email_re = regex::Regex::new(r"<([^>]+)>").unwrap();
+        let email_re = regex!(r"<([^>]+)>");
         if let Some(c) = email_re.captures(maint_raw) {
             let email = c.get(1).unwrap().as_str().to_string();
-            let strip_re = regex::Regex::new(r"\s*<[^>]*>.*").unwrap();
+            let strip_re = regex!(r"\s*<[^>]*>.*");
             let name_part = strip_re.replace(maint_raw, "").trim().to_string();
             let maintainer = if name_part.is_empty() { None } else { Some(name_part) };
             (maintainer, Some(email))
@@ -1841,24 +1887,22 @@ fn metrics_security(desc: &BTreeMap<String, String>, root: &Path, files: &[Strin
     let r_files = find_files(files, r"^R/.*\.R$");
 
     // shared regexes for (1) unsafe_pattern_score and (2) install-time surface
-    let eval_parse_re = regex::Regex::new(r"eval\s*\(\s*parse\s*\(\s*text\s*=").unwrap();
-    let system_paste_re = regex::Regex::new(r"system\s*\(\s*paste\s*\(").unwrap();
-    let system2_paste_re = regex::Regex::new(r"system2\s*\([^\n]*paste\s*\(").unwrap();
-    let setenv_re = regex::Regex::new(r"Sys\.setenv\s*\(").unwrap();
-    let sq_re = regex::Regex::new(r"'[^']*'").unwrap();
-    let dq_re = regex::Regex::new(r#""[^"]*""#).unwrap();
-    let assign_re = regex::Regex::new(r"=\s*[A-Za-z_.][A-Za-z0-9_.]*").unwrap();
-    let onload_re = regex::Regex::new(r"\.on(?:Load|Attach)\s*<-\s*function").unwrap();
+    let eval_parse_re = regex!(r"eval\s*\(\s*parse\s*\(\s*text\s*=");
+    let system_paste_re = regex!(r"system\s*\(\s*paste\s*\(");
+    let system2_paste_re = regex!(r"system2\s*\([^\n]*paste\s*\(");
+    let setenv_re = regex!(r"Sys\.setenv\s*\(");
+    let sq_re = regex!(r"'[^']*'");
+    let dq_re = regex!(r#""[^"]*""#);
+    let assign_re = regex!(r"=\s*[A-Za-z_.][A-Za-z0-9_.]*");
+    let onload_re = regex!(r"\.on(?:Load|Attach)\s*<-\s*function");
     // narrow network pattern used for the score (weight 2)
-    let net_pat_re = regex::Regex::new(r"download\.file\s*\(|\burl\s*\(|\bcurl\s*\(").unwrap();
+    let net_pat_re = regex!(r"download\.file\s*\(|\burl\s*\(|\bcurl\s*\(");
     // file-write pattern needs a negative lookbehind (bare file(...) but not tempfile(...) etc)
-    let file_write_re = fancy_regex::Regex::new(
-        r"writeLines?\s*\(|writeBin\s*\(|\bcat\s*\(\s*[^)]*,\s*(?:file|con)\s*=|(?<![A-Za-z0-9_.])file\s*\(|\bsink\s*\(|write\.csv\s*\(|write\.table\s*\(",
-    )
-    .unwrap();
+    let file_write_re = fancy_regex!(
+        r"writeLines?\s*\(|writeBin\s*\(|\bcat\s*\(\s*[^)]*,\s*(?:file|con)\s*=|(?<![A-Za-z0-9_.])file\s*\(|\bsink\s*\(|write\.csv\s*\(|write\.table\s*\("
+    );
     // broader network pattern (adds httr::/RCurl::/curl::) used for the side-effect surface
-    let network_re =
-        regex::Regex::new(r"download\.file\s*\(|\burl\s*\(|\bcurl\s*\(|httr::|RCurl::|curl::").unwrap();
+    let network_re = regex!(r"download\.file\s*\(|\burl\s*\(|\bcurl\s*\(|httr::|RCurl::|curl::");
 
     let mut unsafe_pattern_score: i64 = 0;
     let mut onload_file_write = false;
@@ -1931,7 +1975,7 @@ fn metrics_security(desc: &BTreeMap<String, String>, root: &Path, files: &[Strin
     dep_entries.extend(parse_dep_entries(desc.get("Depends")));
     dep_entries.retain(|s| !s.is_empty());
 
-    let paren_re = regex::Regex::new(r"\s*\(.*").unwrap();
+    let paren_re = regex!(r"\s*\(.*");
     let mut qualifying: Vec<String> = Vec::new();
     for e in &dep_entries {
         let name = paren_re.replace(e, "").trim().to_string();
@@ -1967,21 +2011,18 @@ fn metrics_security(desc: &BTreeMap<String, String>, root: &Path, files: &[Strin
     };
 
     // 5. secret_pattern_count
-    let nonbinary_re = regex::Regex::new(
-        r"(?i)\.(rda|rdata|rds|pdf|png|jpg|jpeg|gif|bmp|svg|ico|woff|woff2|eot|ttf|otf|gz|zip|tar|bz2|xz|7z|dll|so|dylib|o|a|lib|pyd|class|jar|pyc|xlsx|xls|docx|doc|pptx|ppt|mp3|mp4|ogg|wav|avi|mov|sam|bam|bai|cram|fasta|fa|fastq|fq|vcf|bcf|bed|wig|bedgraph|bigwig|bw|bigbed|bb)$",
-    )
-    .unwrap();
-    let md5_re = regex::Regex::new(r"(^|/)MD5$").unwrap();
-    let akia_re = regex::Regex::new(r"AKIA[0-9A-Z]{16}").unwrap();
-    let gh_re = regex::Regex::new(r"gh[pous]_[A-Za-z0-9_]{36,}|github_pat_[A-Za-z0-9_]{36,}").unwrap();
-    let api_key_re = regex::Regex::new(
-        r#"(?i)(api[_-]?key|api[_-]?secret|secret[_-]?key|access[_-]?token)\s*[=:]\s*["'][A-Za-z0-9+/=_-]{16,}["']"#,
-    )
-    .unwrap();
-    let b64_re = regex::Regex::new(
-        r#"(?i)(password|passwd|api_?key|auth_?token|secret)\s*=\s*["'][A-Za-z0-9+/]{40,}={0,2}["']"#,
-    )
-    .unwrap();
+    let nonbinary_re = regex!(
+        r"(?i)\.(rda|rdata|rds|pdf|png|jpg|jpeg|gif|bmp|svg|ico|woff|woff2|eot|ttf|otf|gz|zip|tar|bz2|xz|7z|dll|so|dylib|o|a|lib|pyd|class|jar|pyc|xlsx|xls|docx|doc|pptx|ppt|mp3|mp4|ogg|wav|avi|mov|sam|bam|bai|cram|fasta|fa|fastq|fq|vcf|bcf|bed|wig|bedgraph|bigwig|bw|bigbed|bb)$"
+    );
+    let md5_re = regex!(r"(^|/)MD5$");
+    let akia_re = regex!(r"AKIA[0-9A-Z]{16}");
+    let gh_re = regex!(r"gh[pous]_[A-Za-z0-9_]{36,}|github_pat_[A-Za-z0-9_]{36,}");
+    let api_key_re = regex!(
+        r#"(?i)(api[_-]?key|api[_-]?secret|secret[_-]?key|access[_-]?token)\s*[=:]\s*["'][A-Za-z0-9+/=_-]{16,}["']"#
+    );
+    let b64_re = regex!(
+        r#"(?i)(password|passwd|api_?key|auth_?token|secret)\s*=\s*["'][A-Za-z0-9+/]{40,}={0,2}["']"#
+    );
 
     let mut secret_pattern_count: i64 = 0;
     for f in files {
@@ -2008,8 +2049,8 @@ fn metrics_security(desc: &BTreeMap<String, String>, root: &Path, files: &[Strin
         "configure.ac",
         "configure.in",
     ];
-    let flag_re = regex::Regex::new(r"-l[A-Za-z][A-Za-z0-9_-]*").unwrap();
-    let ac_re = regex::Regex::new(r"AC_CHECK_LIB\s*\(\s*([A-Za-z][A-Za-z0-9_-]*)").unwrap();
+    let flag_re = regex!(r"-l[A-Za-z][A-Za-z0-9_-]*");
+    let ac_re = regex!(r"AC_CHECK_LIB\s*\(\s*([A-Za-z][A-Za-z0-9_-]*)");
     let mut all_libs: Vec<String> = Vec::new();
     for f in src_cfg_files {
         if !exists(files, f) {
@@ -2037,7 +2078,7 @@ fn metrics_security(desc: &BTreeMap<String, String>, root: &Path, files: &[Strin
         "stb_image_write.h", "nanosvg.h", "nanosvgrast.h", "xxhash.h", "xxhash.c",
         "tinyxml2.cpp", "tinyxml2.h", "pugixml.cpp", "pugixml.hpp",
     ];
-    let license_re = regex::Regex::new(r"^src/.+/(LICENSE|COPYING)(\.[A-Za-z]+)?$").unwrap();
+    let license_re = regex!(r"^src/.+/(LICENSE|COPYING)(\.[A-Za-z]+)?$");
     let mut found: Vec<String> = Vec::new();
     for f in files {
         if !(f.starts_with("src/") || f.starts_with("inst/")) {
@@ -2146,7 +2187,7 @@ fn metrics_extra(desc: &BTreeMap<String, String>, root: &Path, files: &[String],
     let news_up_to_date = news_file
         .and_then(|p| read(root, p))
         .map(|news| {
-            let ver_re = regex::Regex::new(r"\d+\.\d+(?:[.-]\d+)*").unwrap();
+            let ver_re = regex!(r"\d+\.\d+(?:[.-]\d+)*");
             let latest = ver_re.find(&news).map(|m| m.as_str().to_string());
             let pkg_ver = desc.get("Version").map(|s| s.trim().to_string());
             latest.is_some() && latest == pkg_ver
@@ -2463,8 +2504,7 @@ fn metrics_native_graph(
     c_functions: &std::collections::HashSet<String>,
 ) -> NativeGraph {
     // Registration table: {"rname", (DL_FUNC) &cfunc, n} across the *MethodDef arrays.
-    let reg_re =
-        regex::Regex::new(r#"\{\s*"([^"]+)"\s*,\s*\(DL_FUNC\)\s*&?\s*(\w+)"#).unwrap();
+    let reg_re = regex!(r#"\{\s*"([^"]+)"\s*,\s*\(DL_FUNC\)\s*&?\s*(\w+)"#);
     let mut reg: std::collections::HashMap<String, String> = std::collections::HashMap::new();
     for f in files {
         if !is_src_file(f) {
@@ -3289,11 +3329,28 @@ struct RunStats {
     hits_compiled: u64,
     cache_errors: u64,
     verify_mismatch: u64,
+    data_kept: rds::Kept,
 }
 
 /// Milliseconds since `t`, to the microsecond.
 fn ms_since(t: std::time::Instant) -> f64 {
     (t.elapsed().as_secs_f64() * 1e6).round() / 1e3
+}
+
+/// The figure in kB on the line of a process status that starts with `key`.
+fn status_kb(status: &str, key: &str) -> Option<u64> {
+    let rest = status.lines().find_map(|l| l.strip_prefix(key))?;
+    rest.split_whitespace().next()?.parse().ok()
+}
+
+/// The most memory this process has had resident and the most address space
+/// it has had, in kB, where the system keeps both: Linux does, in a file. The
+/// file is the process's, whichever thread reads it.
+fn peak_memory_kb() -> (Option<u64>, Option<u64>) {
+    match std::fs::read_to_string("/proc/self/status") {
+        Ok(status) => (status_kb(&status, "VmHWM:"), status_kb(&status, "VmPeak:")),
+        Err(_) => (None, None),
+    }
 }
 
 /// Appends one JSON line to the file RPKG_ANALYZER_STATS names, after the records.
@@ -3303,6 +3360,7 @@ fn write_run_stats(s: &RunStats, total_ms: f64) {
         return;
     };
     let other = total_ms - s.ms_compiled - s.ms_r - s.ms_tests - s.ms_data;
+    let (peak_rss_kb, peak_vm_kb) = peak_memory_kb();
     let line = serde_json::json!({
         "build": ANALYZER_VERSION,
         "ms": total_ms,
@@ -3317,6 +3375,12 @@ fn write_run_stats(s: &RunStats, total_ms: f64) {
         "data": {"files": s.files_data, "hits": 0},
         "cache_errors": s.cache_errors,
         "verify_mismatch": s.verify_mismatch,
+        // Null where the system keeps no such figure, so the keys are the
+        // same everywhere.
+        "peak_rss_kb": peak_rss_kb,
+        "peak_vm_kb": peak_vm_kb,
+        "data_kept_max": s.data_kept.max,
+        "data_over_budget": s.data_kept.over,
     });
     let appended = std::fs::OpenOptions::new().create(true).append(true).open(path);
     if let Ok(mut f) = appended {
@@ -3388,6 +3452,11 @@ fn explain(dir: &str, kind: cli::InputKind) {
 }
 
 fn main() {
+    memory::on_a_deep_stack(run);
+}
+
+/// One run of the analyzer, from its arguments to its last record.
+fn run() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mode = match cli::parse_args(&args) {
         Ok(mode) => mode,
@@ -3505,7 +3574,7 @@ fn main() {
     // --- DESCRIPTION ---
     let get = |k: &str| desc.get(k).cloned().unwrap_or_default();
     let mut deps: Vec<String> = Vec::new();
-    // the meta.R rule combines c(Imports, Depends) in that order.
+    // Imports first, then Depends.
     for field in ["Imports", "Depends"] {
         deps.extend(dep_names(&get(field)));
     }
@@ -3560,12 +3629,12 @@ fn main() {
     // and counted with that framework's unit; the framework set is also reported.
     let tf_test_files =
         find_files(&files, r"^(?:tests|inst/tinytest|inst/unitTests)/.*\.[Rr]$");
-    let re_testthat = regex::Regex::new(r"\b(?:test_that|describe|it)\s*\(").unwrap();
-    let re_expect = regex::Regex::new(r"\bexpect_\w+\s*\(").unwrap();
-    let re_unittest = regex::Regex::new(r"\bok(?:_group)?\s*\(").unwrap();
-    let re_runit_fn = regex::Regex::new(r"(?m)^\s*test[.\w]*\s*(?:<-|=)\s*function").unwrap();
-    let re_runit_check = regex::Regex::new(r"\bcheck(?:Equals|True|Identical|Exception)\w*\s*\(").unwrap();
-    let re_testit = regex::Regex::new(r"\bassert\s*\(").unwrap();
+    let re_testthat = regex!(r"\b(?:test_that|describe|it)\s*\(");
+    let re_expect = regex!(r"\bexpect_\w+\s*\(");
+    let re_unittest = regex!(r"\bok(?:_group)?\s*\(");
+    let re_runit_fn = regex!(r"(?m)^\s*test[.\w]*\s*(?:<-|=)\s*function");
+    let re_runit_check = regex!(r"\bcheck(?:Equals|True|Identical|Exception)\w*\s*\(");
+    let re_testit = regex!(r"\bassert\s*\(");
     let mut n_test_cases = 0i64;
     let mut testing_frameworks: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     for f in &tf_test_files {
@@ -3732,10 +3801,10 @@ fn main() {
 
     // Static-check-style signals over R source (native interface, library() in
     // package code, .Internal, super-assignment).
-    let native_re = regex::Regex::new(r"\.(Call|C|Fortran|External2?)\s*\(").unwrap();
-    let library_re = regex::Regex::new(r"\b(?:library|require)\s*\(").unwrap();
-    let internal_re = regex::Regex::new(r"\.Internal\s*\(").unwrap();
-    let ga_re = regex::Regex::new(r"<<-").unwrap();
+    let native_re = regex!(r"\.(Call|C|Fortran|External2?)\s*\(");
+    let library_re = regex!(r"\b(?:library|require)\s*\(");
+    let internal_re = regex!(r"\.Internal\s*\(");
+    let ga_re = regex!(r"<<-");
     let (mut n_native_calls, mut n_library_calls, mut n_internal_calls, mut n_global_assign) =
         (0i64, 0i64, 0i64, 0i64);
     for f in &find_files(&files, r"^R/.*\.[Rr]$") {
@@ -3810,7 +3879,7 @@ fn main() {
     // Author role counts from Authors@R.
     let authors_r = desc.get("Authors@R").cloned().unwrap_or_default();
     let role_count = |role: &str| {
-        regex::Regex::new(&format!(r#"["']{role}["']"#))
+        kept_regex(&format!(r#"["']{role}["']"#))
             .unwrap()
             .find_iter(&authors_r)
             .count() as i64
@@ -4151,9 +4220,8 @@ fn main() {
     // runtime.
     let t_data = std::time::Instant::now();
     if content_known {
-        for rec in rds::scan_package(&root, &excluded) {
-            println!("{rec}");
-        }
+        rds::scan_package_each(&root, &excluded, &mut |rec| println!("{rec}"));
+        stats.data_kept = rds::kept();
     }
     stats.ms_data += ms_since(t_data);
     stats.files_data = num_data_files as u64;
@@ -4166,6 +4234,31 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_peak_is_read_off_its_line_of_the_process_status() {
+        let status = "Name:\trpkg-analyzer\nVmPeak:\t   71520 kB\nVmSize:\t   71456 kB\nVmHWM:\t    3984 kB\nVmRSS:\t    3984 kB\n";
+        assert_eq!(status_kb(status, "VmHWM:"), Some(3984));
+        assert_eq!(status_kb(status, "VmPeak:"), Some(71520));
+        // A kernel thread has neither line, and a line may not hold a number.
+        assert_eq!(status_kb("Name:\tkthreadd\nState:\tS (sleeping)\n", "VmHWM:"), None);
+        assert_eq!(status_kb("VmHWM:\n", "VmHWM:"), None);
+        assert_eq!(status_kb("VmHWM:\tmany kB\n", "VmHWM:"), None);
+        assert_eq!(status_kb("", "VmPeak:"), None);
+    }
+
+    /// Both or neither, and what was resident was never more than the address
+    /// space there was.
+    #[test]
+    fn the_peaks_are_the_systems_or_absent() {
+        let (rss, vm) = peak_memory_kb();
+        if cfg!(target_os = "linux") {
+            let (rss, vm) = (rss.expect("VmHWM"), vm.expect("VmPeak"));
+            assert!(rss > 0 && vm >= rss, "{rss} kB resident, {vm} kB of address space");
+        } else if !Path::new("/proc/self/status").exists() {
+            assert_eq!((rss, vm), (None, None));
+        }
+    }
 
     /// Rule J: a name the viewer treats as junk.
     fn is_junk(p: &Person) -> bool {
@@ -4574,5 +4667,52 @@ mod tests {
             assert_scan_matches_the_old_passes(&root);
             let _ = std::fs::remove_dir_all(&root);
         }
+    }
+
+    /// A pattern gets the regex compiled for it the first time, a pattern that
+    /// does not compile is kept out, and the list stops at its limit.
+    #[test]
+    fn a_kept_regex_is_compiled_once_and_the_list_stops_at_its_limit() {
+        use std::sync::Arc;
+        let mut kept = KeptRegexes(BTreeMap::new());
+        let dirs = kept.get(r"^R/").expect("a pattern");
+        assert!(Arc::ptr_eq(&dirs, &kept.get(r"^R/").expect("the same pattern")), "one regex a pattern");
+        assert!(dirs.is_match("R/a.R") && !dirs.is_match("man/R/a.R"));
+        // Another pattern is another regex, however alike the two are.
+        let tests = kept.get(r"^tests/").expect("a pattern");
+        assert!(tests.is_match("tests/a.R") && !tests.is_match("R/a.R"));
+        assert_eq!(kept.0.len(), 2);
+        assert!(kept.get("(").is_err() && kept.get("(").is_err(), "an error each time it is asked for");
+        assert_eq!(kept.0.len(), 2);
+        for i in 2..KEPT_REGEXES {
+            let re = kept.get(&format!("^made{i}$")).expect("a pattern");
+            assert!(re.is_match(&format!("made{i}")) && !re.is_match("made"), "pattern {i}");
+        }
+        assert_eq!(kept.0.len(), KEPT_REGEXES);
+        // Past the limit a pattern still gets its regex, compiled for each call.
+        let late = kept.get("^late$").expect("a pattern");
+        assert!(late.is_match("late") && !late.is_match("later"));
+        assert!(!Arc::ptr_eq(&late, &kept.get("^late$").expect("the same pattern")), "not kept");
+        assert_eq!(kept.0.len(), KEPT_REGEXES);
+        assert!(kept.0.keys().all(|p| p != "^late$" && p != "("));
+        assert!(Arc::ptr_eq(&dirs, &kept.get(r"^R/").expect("the first pattern")), "the first is still kept");
+    }
+
+    /// The program's own patterns, about thirty, are well inside the limit, so
+    /// each is compiled once in a run: the help-page helpers, which put the
+    /// same pattern together on every call, are handed one regex.
+    #[test]
+    fn a_pattern_put_together_twice_is_one_regex() {
+        let text = "\\name{a}\n\\alias{a}\n\\alias{b}\n\\usage{a(x)}\n";
+        assert_eq!(rd_all_blocks(text, "alias"), ["a", "b"]);
+        assert_eq!(rd_first_block(text, "usage").map(|(body, _)| body).as_deref(), Some("a(x)"));
+        assert!(rd_has_block(text, "name") && !rd_has_block(text, "value"));
+        let pattern = |cmd: &str| format!(r"\\{}\s*\{{", regex::escape(cmd));
+        for cmd in ["alias", "usage", "name", "value"] {
+            let first = kept_regex(&pattern(cmd)).expect("a pattern");
+            assert!(std::sync::Arc::ptr_eq(&first, &kept_regex(&pattern(cmd)).expect("the same pattern")), "{cmd}");
+        }
+        assert_eq!(find_files(&["R/a.R".to_string(), "man/a.Rd".to_string()], r"^R/"), ["R/a.R"]);
+        assert!(std::sync::Arc::ptr_eq(&kept_regex(r"^R/").unwrap(), &kept_regex(r"^R/").unwrap()));
     }
 }
