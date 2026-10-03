@@ -1,9 +1,9 @@
 #![recursion_limit = "2048"]
 // rpkg-analyzer: a pure function of one extracted R package source tree.
 // Reads a directory, emits newline-delimited JSON metric records on stdout.
-// This first cut covers the structure, DESCRIPTION (DCF), and NAMESPACE groups,
-// which map one-to-one onto the current pipeline's structure.R / parse_dcf /
-// parse_namespace.
+// Its records cover a package's structure, DESCRIPTION (DCF) and NAMESPACE,
+// documentation, functions, call graphs and datasets, all read from the files
+// alone, with no R runtime.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -103,7 +103,7 @@ fn list_files(root: &Path) -> Vec<String> {
     out
 }
 
-/// Binary / non-code extensions excluded from LOC (carried from structure.R).
+/// Binary / non-code extensions excluded from LOC.
 fn is_noncode(path: &str) -> bool {
     let lower = path.to_ascii_lowercase();
     if lower == "md5" || lower.ends_with("/md5") {
@@ -184,7 +184,7 @@ fn is_vendored_src(path: &str) -> bool {
     VENDORED_SRC.is_match(path)
 }
 
-/// the is_src: src/ files with a compiled-language extension only (structure.R).
+/// Source files: src/ files with a compiled-language extension only.
 /// Excludes Makevars, configure, .in, etc.
 fn is_src_file(path: &str) -> bool {
     if !path.starts_with("src/") || is_vendored_src(path) {
@@ -843,7 +843,7 @@ struct Docs {
 /// Brace-balanced content starting right after a known opening '{' at byte
 /// offset `after_open` in `text`. Handles Rd escapes \{ and \}.
 /// Returns (content, end) where end = byte offset of the closing '}', or
-/// None when braces are unbalanced. Port of docs.R's `.bc`.
+/// None when braces are unbalanced.
 fn rd_brace_content(text: &str, after_open: usize) -> Option<(String, usize)> {
     let bytes = text.as_bytes();
     if after_open >= bytes.len() {
@@ -896,7 +896,7 @@ fn strip_rd_comments(text: &str) -> String {
     out
 }
 
-/// First \cmd{...} block in text. Port of docs.R's `.fb`.
+/// First \cmd{...} block in text.
 fn rd_first_block(text: &str, cmd: &str) -> Option<(String, usize)> {
     let pat = format!(r"\\{}\s*\{{", regex::escape(cmd));
     let re = kept_regex(&pat).ok()?;
@@ -904,7 +904,7 @@ fn rd_first_block(text: &str, cmd: &str) -> Option<(String, usize)> {
     rd_brace_content(text, m.end())
 }
 
-/// All \cmd{...} block contents in text (only successful parses). Port of docs.R's `.ab`.
+/// All \cmd{...} block contents in text (only successful parses).
 fn rd_all_blocks(text: &str, cmd: &str) -> Vec<String> {
     let pat = format!(r"\\{}\s*\{{", regex::escape(cmd));
     let Ok(re) = kept_regex(&pat) else { return vec![] };
@@ -913,14 +913,14 @@ fn rd_all_blocks(text: &str, cmd: &str) -> Vec<String> {
         .collect()
 }
 
-/// Whether text contains at least one \cmd{ marker. Port of docs.R's `.hc`.
+/// Whether text contains at least one \cmd{ marker.
 fn rd_has_block(text: &str, cmd: &str) -> bool {
     let pat = format!(r"\\{}\s*\{{", regex::escape(cmd));
     kept_regex(&pat).map(|re| re.is_match(text)).unwrap_or(false)
 }
 
-/// Extract parameter names from \usage block content (approximate).
-/// Port of docs.R's `.uparams`.
+/// Extract parameter names from \usage block content (approximate):
+/// each call's top-level arguments, defaults removed, first seen kept.
 fn rd_usage_params(u: &str) -> Vec<String> {
     if u.trim().is_empty() {
         return vec![];
@@ -1001,8 +1001,8 @@ fn rd_usage_params(u: &str) -> Vec<String> {
     params
 }
 
-/// Parameter names documented via \item{name}{} in \arguments content.
-/// Port of docs.R's `.inames`.
+/// Parameter names documented via \item{name}{} in \arguments content,
+/// each item's name as written, trimmed.
 fn rd_arg_names(args_text: &str) -> Vec<String> {
     let re = regex!(r"\\item\s*\{([^{}]*)\}");
     re.captures_iter(args_text)
@@ -1297,7 +1297,7 @@ fn n_close(s: &str) -> i64 {
 /// '{', handling multi-line argument lists. Nested function bodies are
 /// absorbed into the enclosing body and are NOT separately extracted. This
 /// is a conservative heuristic (rare false positives/negatives possible),
-/// ported faithfully from extract_function_bodies() in health.R.
+/// kept exactly as it is because stored records depend on it.
 fn extract_function_bodies(lines: &[String]) -> Vec<Vec<String>> {
     let fn_re = regex!(r"\bfunction\s*\(");
     let stripped: Vec<String> = lines.iter().map(|l| strip_comment_line(l)).collect();
@@ -3574,7 +3574,7 @@ fn run() {
     // --- DESCRIPTION ---
     let get = |k: &str| desc.get(k).cloned().unwrap_or_default();
     let mut deps: Vec<String> = Vec::new();
-    // the meta.R rule combines c(Imports, Depends) in that order.
+    // Imports first, then Depends.
     for field in ["Imports", "Depends"] {
         deps.extend(dep_names(&get(field)));
     }

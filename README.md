@@ -49,7 +49,7 @@ One `summary` record per run, followed by intermediate records:
 | `call_edge` | one call-graph edge | `graph` (`r`/`native`/`c`/`rust`/`fortran`), `from`, `to` |
 | `dcf` | package version | every DESCRIPTION field verbatim (the catch-all) |
 | `release_notes` | package version, only when its NEWS has a section for it | `package_version`, `news_file`, `release_notes_source` (`news_md`, `news_rd`, `news_plain`), `release_notes` (at most 16,384 bytes, cut at a character boundary), `release_notes_truncated` |
-| `dataset` | object shipped under `data/`, `R/sysdata.rda`, or `inst/extdata` | `name`, `file`, `origin_dir`, `format`, `compression`, `class`, `kind`, `nrow`, `ncol`, `column_detail`, `columns[]`, `schema_fp`, `shape_fp`, `content_fp`, `row_sketch`, `confidence`; see [Dataset records](#dataset-records) |
+| `dataset` | object provided under `data/`, `R/sysdata.rda`, or `inst/extdata` | `name`, `file`, `origin_dir`, `format`, `compression`, `class`, `kind`, `nrow`, `ncol`, `column_detail`, `columns[]`, `schema_fp`, `shape_fp`, `content_fp`, `row_sketch`, `confidence`; see [Dataset records](#dataset-records) |
 
 The summary record also carries `analyzer_version`, the build that wrote it. A consumer storing these results needs it to tell rows it has already collected from rows a newer build would describe differently, which is what makes a rescan decidable rather than a guess.
 
@@ -116,13 +116,13 @@ and are skipped; NULL on `release` input or without a `.Rbuildignore`.
 
 ## Dataset records
 
-One `dataset` record per object a package ships. The values are read straight out of R's serialization format (`.rda`, `.rds`, `.RData`) or out of delimited text, with no R runtime and no evaluation of package code, so a version pulled from an archive reads the same way a current release does.
+One `dataset` record per object a package provides. The values are read straight out of R's serialization format (`.rda`, `.rds`, `.RData`) or out of delimited text, with no R runtime and no evaluation of package code, so a version pulled from an archive reads the same way a current release does.
 
 ### Where they come from
 
 Three places, and `origin_dir` says which one a record came from.
 
-`data/` is the loadable catalogue, so only the extensions `data()` itself dispatches on are opened, in `data()`'s own precedence order. A package that ships one name twice (`mtcars.rda` beside `mtcars.csv`) gets one record, for the file `data()` would actually load, because the other copy is not reachable by that name. An `.rds` here is not opened at all: `data()` cannot load one, and in an installed tree `data/Rdata.rds` is the lazy-load index rather than a dataset, which once put a fingerprinted dataset called `Rdata` in the catalogue for every package.
+`data/` is the loadable catalogue, so only the extensions `data()` itself dispatches on are opened, in `data()`'s own precedence order. A package that provides one name twice (`mtcars.rda` beside `mtcars.csv`) gets one record, for the file `data()` would actually load, because the other copy is not reachable by that name. An `.rds` here is not opened at all: `data()` cannot load one, and in an installed tree `data/Rdata.rds` is the lazy-load index rather than a dataset, which once put a fingerprinted dataset called `Rdata` in the catalogue for every package.
 
 A `.tsv` or a `.dat` under `data/` gets no record at all, for the same reason: `data()` does not dispatch on those extensions, so a row for one would put a dataset in the catalogue that nobody can reach. Of the text formats it does dispatch on, `.csv` is read with a semicolon and `.tab` and `.txt` with whitespace, which is what `data()` itself does and not what the extension usually means elsewhere.
 
@@ -140,7 +140,7 @@ Every record carries `confidence`, and this is the whole vocabulary:
 - `degraded`: something is described, but not everything. A class with no reader of its own arrives as its class name plus whatever its attributes give up; a delimited text file has its column types inferred rather than declared; an object holding a vector past the cell cap keeps its structure and drops the value pass; a file that would not parse carries the reader's own message. `notes` says which of these happened.
 - `needs_r`: an `.R` script under `data/`. Only R can evaluate one, so nothing but the file itself is described.
 
-A `degraded` record is not a failure to be filtered out. It is the difference between what was measured and what exists, stated on the row, and a consumer that treats it as missing data throws away most of what Bioconductor ships.
+A `degraded` record is not a failure to be filtered out. It is the difference between what was measured and what exists, stated on the row, and a consumer that treats it as missing data throws away most of what Bioconductor provides.
 
 ### What a record carries
 
